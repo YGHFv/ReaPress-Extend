@@ -438,10 +438,11 @@ data class ExpressHomeSection(
 /** 一个取件地点下的包裹。 */
 data class ExpressStationGroup(
     /**
-     * 驿站名，**已经过 [ExpressStationName] 归一化**：品牌前缀（`菜鸟驿站`）、外层括号、
-     * 空白都被剥掉了，而且取的是同类写法里最长的那个（详见 [ExpressHomeGrouper.groupByStation]）。
+     * 驿站名。**已经是可以直接显示的那个名字**：过了 [ExpressStationName] 归一化（品牌前缀
+     * `菜鸟驿站`、外层括号、空白都剥掉，同类写法取最长的一个），也过了用户在「驿站管理」里
+     * 做的改名 / 合并（见 [ExpressHomeGrouper.stationLabels]）。
      *
-     * 所以 UI 拿来直接显示即可，不用再处理一遍 —— 这里存的就是「用户该看到的那个名字」。
+     * 所以 UI 拿来直接显示即可，**不要再回头读 `record.station`** —— 那是用户改不动的原始串。
      * 空名归到 [ExpressHomeGrouper.UNKNOWN_STATION]。
      */
     val station: String,
@@ -521,20 +522,29 @@ object ExpressHomeGrouper {
         val sections = mutableListOf<ExpressHomeSection>()
 
         val pickup = records.filter { it.status in PICKUP_STATUSES }
-        // 身份表按**全部**取件候选算一次，下面三处（整站确认 / 分组 / 落档）共用同一份。
-        // 分开算会出岔子：pending 是 pickup 的子集，各自聚类可能选出不同的代表名，
-        // 于是「已确认的地点」和「待确认的记录」对不上号，该移出待取件的卡片会留在原地。
-        val ids = stationIdentities(pickup)
+        // 身份表按**全部记录**算一次，下面几处（整站确认 / 分组 / 落档）共用同一份。
+        //
+        // 范围是全部而不是只有 pickup —— 2026-09-26 实测踩到的坑：一个驿站的简称出现在待取件
+        // 记录里，全名出现在一条**已签收**记录里，而用户的改名规则记在全名上。只拿 pickup
+        // 聚类的话，简称在自己那一簇里当场成了代表名，规则（键是全名）命不中，
+        // 于是「改了名，首页纹丝不动」。**簇代表名必须跟记录当前状态无关** ——
+        // 同一个驿站在哪儿都该叫同一个名字。
+        val ids = stationIdentities(records)
+        // 归一化名 → 该显示的名字。规则作用在簇代表名上，整簇跟随（见 [stationLabels]）。
+        val labels = labelsOf(ids, rules)
         // 「整站取完」的地点整批移出待取件。注意这里只是**把它从这一档里摘掉**，
         // 记录本身留在存储里（并在下面进「已签收 / 异常」）—— 删除数据不该由一次双击决定。
-        val confirmed = confirmedStations(pickup, ids, rules)
-        val pending = pickup.filterNot { stationIdOf(it, ids, rules) in confirmed }
+        //
+        // 判定用**身份**而不是显示名：用户把两个驿站合并到同一个名字后，它们显示在同一张卡上，
+        // 但件还是各自的 —— 拿显示名算，会让「A 的件取完了」把 B 的件也一起移走。
+        val confirmed = confirmedStations(pickup, ids)
+        val pending = pickup.filterNot { identityOf(it, ids) in confirmed }
         if (pending.isNotEmpty()) {
             sections += ExpressHomeSection(
                 title = "到站包裹",
                 // 注意传的是 pending 的全量（含「已标记但本地点还没取完」的那几件）：
                 // 它们仍要显示在这张卡片上，只是沉到下面、变灰。
-                stationGroups = groupByStation(pending, ids, rules),
+                stationGroups = groupByStation(pending, labels),
             )
         }
 
@@ -555,7 +565,7 @@ object ExpressHomeGrouper {
         // 等宿主推来「已签收」，它会自然留在这里；拿它当一条「已取」的凭据也不错。
         val done = records.filter {
             it.status in DONE_STATUSES ||
-                (it.status in PICKUP_STATUSES && stationIdOf(it, ids, rules) in confirmed)
+                (it.status in PICKUP_STATUSES && identityOf(it, ids) in confirmed)
         }
         if (done.isNotEmpty()) {
             sections += ExpressHomeSection(title = "已签收 / 异常", records = done)
@@ -581,16 +591,19 @@ object ExpressHomeGrouper {
         rules: ExpressStationRules = ExpressStationRules.EMPTY,
     ): List<ExpressStationSummary> {
         val ids = stationIdentities(records)
+        val labels = labelsOf(ids, rules)
         val byKey = LinkedHashMap<String, MutableList<ExpressRecord>>()
         for (record in records) {
-            val key = normalizedKey(record)
-            byKey.getOrPut(ids[key] ?: key) { mutableListOf() } += record
+            byKey.getOrPut(identityOf(record, ids)) { mutableListOf() } += record
         }
         return byKey
             .map { (key, items) ->
                 ExpressStationSummary(
+                    // key 是**簇代表名**，也正是规则表用的键 —— 用户在详情页改名时写进
+                    // [ExpressStationRules.renames] 的就是它。
                     key = key,
-                    displayName = rules.apply(key),
+                    // 走和首页同一张显示名表：管理页里看到的名字，必须和首页卡片上的名字一样。
+                    displayName = labels[key] ?: key,
                     // 归一化**之前**的原始写法：用户要在这行里认出「哦，这两个名字原来是同一处」。
                     rawNames = items.mapNotNull { it.station?.takeIf(String::isNotBlank) }.distinct(),
                     records = items,
@@ -623,9 +636,8 @@ object ExpressHomeGrouper {
     private fun confirmedStations(
         pickup: List<ExpressRecord>,
         ids: Map<String, String>,
-        rules: ExpressStationRules,
     ): Set<String> =
-        pickup.groupBy { stationIdOf(it, ids, rules) }
+        pickup.groupBy { identityOf(it, ids) }
             .filterValues { items -> items.all { it.isPickedUp } }
             .keys
 
@@ -640,13 +652,12 @@ object ExpressHomeGrouper {
      */
     private fun groupByStation(
         records: List<ExpressRecord>,
-        ids: Map<String, String>,
-        rules: ExpressStationRules,
+        labels: Map<String, String>,
     ): List<ExpressStationGroup> {
-        // 自己攒 LinkedHashMap 而不是 records.groupBy：分组键要先过身份表，groupBy 塞不进这一步。
+        // 自己攒 LinkedHashMap 而不是 records.groupBy：分组键要先查显示名表，groupBy 塞不进这一步。
         val grouped = LinkedHashMap<String, MutableList<ExpressRecord>>()
         for (record in records) {
-            grouped.getOrPut(stationIdOf(record, ids, rules)) { mutableListOf() } += record
+            grouped.getOrPut(labels[normalizedKey(record)] ?: UNKNOWN_STATION) { mutableListOf() } += record
         }
         return grouped
             .map { (station, items) ->
@@ -675,34 +686,62 @@ object ExpressHomeGrouper {
         ExpressStationName.normalize(record.station).ifEmpty { UNKNOWN_STATION }
 
     /**
-     * 一条记录所属的驿站身份。
+     * 一条记录所属的驿站**身份** —— 也就是它那一簇的代表名。
      *
-     * 两步，顺序不能换：**先聚类成代表名，再套用户的合并 / 改名规则**。
+     * 只到聚类为止，**不套规则**：显示名字走 [stationLabels]。两者刻意分开：
+     * - 「身份」回答「这几件是不是一个地方」（整站确认、分组归类用），用户改名不该影响它；
+     * - 「显示名」回答「这个位置该印什么字」，用户改名就是改它。
      *
-     * 规则必须作用在**代表名**上，因为用户是在界面上看着代表名操作的 —— 界面显示哪个名字、
-     * 规则表用哪个键，是同一个字符串。反过来（规则作用在每条记录自己的归一化名上）会出岔子：
-     * 一组里有「阳光花园菜拼多多驿站」和「阳光23号楼109阳光花园菜拼多多驿站」两个写法时，
-     * 用户只改了一次名字，却只改中其中一个 —— 组当场裂回两张卡，看起来就像改名没生效。
+     * 合并成一个的代价是：用户把 A 合并到 B 之后，A 的件和 B 的件显示名相同，整站确认若按
+     * 显示名算就会把两批件当成一批 —— 「A 取完了」把还没取的 B 也一起移出待取件。
      */
-    private fun stationIdOf(
-        record: ExpressRecord,
-        ids: Map<String, String>,
-        rules: ExpressStationRules,
-    ): String {
+    private fun identityOf(record: ExpressRecord, ids: Map<String, String>): String {
         val key = normalizedKey(record)
-        return rules.apply(ids[key] ?: key)
+        return ids[key] ?: key
     }
 
     /**
      * 身份表：归一化名 → 代表名。同一个驿站的几种写法在这里折叠成同一个代表。
      *
      * 用户规则**不参与**这一步 —— 聚类只认字符串本身的相似性，规则是聚类之后套上去的
-     * （理由见 [stationIdOf]）。
+     * （理由见 [stationLabels]）。
      *
-     * 只算到站候选（调用方传的就是 pickup）—— 分组只发生在这一档，别处不需要。
+     * ⚠️ **传进来的必须是全部记录**，不能只传某一档（比如待取件）。同一个驿站的两种写法
+     * 完全可能分散在不同状态里（简称在待取件、全名在已签收），按档聚类会给出两个代表名，
+     * 于是规则只能命中其中一个 —— 用户改了名，首页那张卡照旧。
      */
     private fun stationIdentities(records: List<ExpressRecord>): Map<String, String> =
         ExpressStationName.representatives(records.map { normalizedKey(it) }.toSet())
+
+    /** 身份表 → 显示名表。规则套在**簇代表名**上，所以整簇一起跟随。 */
+    private fun labelsOf(
+        ids: Map<String, String>,
+        rules: ExpressStationRules,
+    ): Map<String, String> = ids.mapValues { (_, rep) -> rules.apply(rep) }
+
+    /**
+     * 「归一化名 → 该显示的驿站名」总表。
+     *
+     * 界面上**所有**印驿站名的地方都走这张表（到站卡片抬头、运输中 / 已签收卡片底部那行）。
+     * 谁自己回头读 `record.station`，用户改了名就会出现「有的地方改了、有的地方没改」——
+     * 正是 2026-09-26 用户报的那个问题。
+     *
+     * 规则套在**簇代表名**而不是每条记录自己的归一化名上：一个驿站的简称和全名是两个
+     * 不同的归一化名，用户只可能在其中之一上写规则（界面上一次只列一条），整簇都该跟着变。
+     */
+    fun stationLabels(
+        records: List<ExpressRecord>,
+        rules: ExpressStationRules,
+    ): Map<String, String> = labelsOf(stationIdentities(records), rules)
+
+    /**
+     * 一条记录该显示的驿站名；未知 / 空返回 null，调用方整行不排。
+     *
+     * [labels] 由 [stationLabels] 算出一次、反复使用 —— 这个函数会被逐条调用，
+     * 别在里面重算身份表。
+     */
+    fun stationLabelOf(record: ExpressRecord, labels: Map<String, String>): String? =
+        labels[normalizedKey(record)]?.takeIf { it != UNKNOWN_STATION }
 
     const val UNKNOWN_STATION = "未知取件地点"
 }

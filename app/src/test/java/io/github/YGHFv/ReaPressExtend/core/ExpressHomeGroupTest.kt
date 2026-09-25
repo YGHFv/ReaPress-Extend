@@ -416,6 +416,78 @@ class ExpressHomeGroupTest {
         assertEquals("家门口", station.displayName)
         assertTrue(station.renamed)
     }
+
+    @Test
+    fun `规则键落在已签收记录的那个写法上时待取件卡片也要改名`() {
+        // 复现 2026-09-26 用户报的问题（原话「首页的取件码的驿站名不会改过来」）：
+        // 简称落在待取件记录里、全名落在一条**已签收**记录里，而用户在驿站管理里改的是全名。
+        //
+        // 聚类范围若只取待取件，简称那一簇里就只剩它自己 —— 规则键是全名，命不中，
+        // 首页照旧显示简称。簇代表名必须跟记录当前状态无关。
+        val records = listOf(
+            record(
+                pickup = "1-6-4011",
+                station = "阳光花园菜拼多多驿站",
+                status = ExpressStatus.READY_FOR_PICKUP,
+            ),
+            record(station = "阳光23号楼109阳光花园菜拼多多驿站", status = ExpressStatus.SIGNED),
+        )
+        val rules = ExpressStationRules(mapOf("阳光23号楼109阳光花园菜拼多多驿站" to "阳光花园驿站"))
+
+        val pickup = ExpressHomeGrouper.group(records, rules).single { it.title == "到站包裹" }
+        assertEquals("阳光花园驿站", pickup.stationGroups.single().station)
+    }
+
+    @Test
+    fun `已签收卡片的驿站名走同一张显示名表`() {
+        // 运输中 / 已签收的卡片不在分组里（它们没有 group.station 可用），那行驿站名由调用方
+        // 从 stationLabels 取。两种写法都必须指向改后的名字，否则同一屏上会出现
+        // 「有的卡片改了、有的没改」。
+        val records = listOf(
+            record(
+                pickup = "1-6-4011",
+                station = "阳光花园菜拼多多驿站",
+                status = ExpressStatus.READY_FOR_PICKUP,
+            ),
+            record(station = "阳光23号楼109阳光花园菜拼多多驿站", status = ExpressStatus.SIGNED),
+        )
+        val rules = ExpressStationRules(mapOf("阳光23号楼109阳光花园菜拼多多驿站" to "阳光花园驿站"))
+        val labels = ExpressHomeGrouper.stationLabels(records, rules)
+
+        assertEquals("阳光花园驿站", ExpressHomeGrouper.stationLabelOf(records[0], labels))
+        assertEquals("阳光花园驿站", ExpressHomeGrouper.stationLabelOf(records[1], labels))
+    }
+
+    @Test
+    fun `没有驿站名的记录取不到显示名`() {
+        // 返回 null 而不是「未知取件地点」：分组抬头需要那个占位名，单条卡片不需要 ——
+        // 它该整行不排，而不是在卡片底部多印一行「未知取件地点」。
+        val records = listOf(record(pickup = "1", status = ExpressStatus.READY_FOR_PICKUP))
+        val labels = ExpressHomeGrouper.stationLabels(records, ExpressStationRules.EMPTY)
+        assertNull(ExpressHomeGrouper.stationLabelOf(records[0], labels))
+    }
+
+    @Test
+    fun `合并到同一个名字后整站确认仍按各自的件算`() {
+        // 「合并」只让两处显示成同一张卡，件还是各自的：标记 A 的件不该把 B 还没取的件
+        // 一起移出待取件。所以整站确认（和分组归类）用身份，只有展示才用显示名。
+        val records = listOf(
+            record(pickup = "1", station = "A花园店", status = ExpressStatus.READY_FOR_PICKUP),
+            record(pickup = "2", station = "B花园店", status = ExpressStatus.READY_FOR_PICKUP),
+        )
+        val rules = ExpressStationRules(mapOf("B花园店" to "A花园店"))
+
+        val before = ExpressHomeGrouper.group(records, rules).single { it.title == "到站包裹" }
+        assertEquals("两处并成一张卡", 1, before.stationGroups.size)
+        assertEquals(2, before.stationGroups.single().records.size)
+
+        // 标记 A 的件已取：A 那一簇取完了，B 的件还在
+        val after = ExpressHomeGrouper.group(
+            listOf(records[0].copy(pickedUpAt = 1L), records[1]),
+            rules,
+        ).single { it.title == "到站包裹" }
+        assertEquals("B 的件用户还没取，不能跟着消失", 1, after.stationGroups.single().records.size)
+    }
 }
 
 class ExpressRecordStoreTest {
