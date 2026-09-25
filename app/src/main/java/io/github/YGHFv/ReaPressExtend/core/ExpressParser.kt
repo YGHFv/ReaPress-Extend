@@ -36,6 +36,24 @@ object ExpressParser {
     )
 
     /**
+     * 收件手机号尾号。
+     *
+     * **必须带明确措辞**才认 —— 这是本文件里唯一一处「宁可漏，不可错」的取舍说到极致的规则：
+     * 通知里四位数字到处都是（取件码尾段、楼层货架号、验证码），而手机尾号本身**不是**取件凭据，
+     * 认错了会引导用户去跟店员报一个错的号。所以要求「手机/电话」与「尾号/后四位」同时出现，
+     * 两种语序都收：
+     *
+     * - `手机尾号1234` / `手机号后四位：1234`（手机名在前）
+     * - `尾号1234的手机`（尾号在前）
+     *
+     * 不认单独的「尾号1234」：那是运单号尾号的常见写法。
+     */
+    private val PHONE_TAIL_PATTERNS = listOf(
+        Regex("""(?:手机|电话|手机号|手机号码)\s*号?\s*(?:尾号|后四位|末四位|后4位|末4位)\s*[:：]?\s*(\d{4})(?!\d)"""),
+        Regex("""(?:尾号|后四位|末四位)\s*[:：]?\s*(\d{4})(?!\d)\s*的?\s*(?:手机|电话)"""),
+    )
+
+    /**
      * 状态关键词 → 状态。**顺序敏感**：越具体的越靠前。
      *
      * 例如「已签收」必须在「签收」之前判，否则「已签收」会先命中「签收」；
@@ -93,6 +111,15 @@ object ExpressParser {
         return null
     }
 
+    /** 收件手机尾号（4 位数字）。判据见 [PHONE_TAIL_PATTERNS]，抽不到返回 null。 */
+    fun parsePhoneTail(text: String): String? {
+        for (pattern in PHONE_TAIL_PATTERNS) {
+            val match = pattern.find(text) ?: continue
+            return match.groupValues[1]
+        }
+        return null
+    }
+
     fun parseStatus(text: String): ExpressStatus {
         for ((keyword, status) in STATUS_RULES) {
             if (text.contains(keyword)) return status
@@ -121,6 +148,7 @@ object ExpressParser {
             courier = Courier.fromTrackingNumber(trackingNumber),
             pickupCode = parsePickupCode(text),
             station = parseStation(text),
+            phoneTail = parsePhoneTail(text),
             status = parseStatus(text),
             title = title,
             matchedKeywords = verdict.matchedKeywords,

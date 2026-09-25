@@ -19,8 +19,18 @@ object ExpressRelay {
 
     const val RECEIVER_CLASS = "io.github.YGHFv.ReaPressExtend.relay.ExpressRelayReceiver"
 
-    /** 投递动作。 */
+    /** 投递动作：system_server 拦到一条快递通知。 */
     const val ACTION_DELIVER = "io.github.YGHFv.ReaPressExtend.DELIVER_EXPRESS"
+
+    /**
+     * 投递动作：宿主进程富化出一条包裹信息。
+     *
+     * 与 [ACTION_DELIVER] 分开而不是共用一个动作，是因为**接收端的处理完全不同**：
+     * deliver 要落记录 + 发通知，enrich 只落记录（补已有或新建一条）、**不发通知**。
+     * 用 action 而不是一个 boolean extra 来区分，接收端就不可能出现「忘了判 extra」这种错
+     * ——漏判时 `when` 直接落到 else 分支被忽略，而不是误发一条通知。
+     */
+    const val ACTION_ENRICH = "io.github.YGHFv.ReaPressExtend.ENRICH_EXPRESS"
 
     // ---- extras ----
     const val EXTRA_SOURCE_PACKAGE = "sourcePackage"
@@ -34,6 +44,31 @@ object ExpressRelay {
     const val EXTRA_CONFIDENCE = "confidence"
     const val EXTRA_KEYWORDS = "matchedKeywords"
     const val EXTRA_TIMESTAMP = "timestamp"
+
+    // ---- 只有宿主富化给得出的字段（通知文案里没有）。缺省一律表示「没有」。 ----
+
+    /** 电商平台（淘宝 / 天猫）。 */
+    const val EXTRA_PLATFORM = "platform"
+
+    /** 商品名称。 */
+    const val EXTRA_GOODS_NAME = "goodsName"
+
+    /** 到站 / 入站时间（毫秒）。`0` 表示没有。 */
+    const val EXTRA_ARRIVAL_AT = "arrivalAt"
+
+    /** 运单动态（宿主 `lastLogisticDetail`，如「已发往【上海转运中心】」）。 */
+    const val EXTRA_LOGISTICS_DETAIL = "logisticsDetail"
+
+    /** 驿站营业时间（宿主 `packageStation.officeTime`）。 */
+    const val EXTRA_STATION_HOURS = "stationHours"
+
+    // ---- 只有通知侧给得出的字段 ----
+
+    /** 收件手机号尾号（通知里的「手机尾号1234」）。 */
+    const val EXTRA_PHONE_TAIL = "phoneTail"
+
+    /** 记录来源，取值是 [io.github.YGHFv.ReaPressExtend.core.ExpressOrigin] 的名字。 */
+    const val EXTRA_ORIGIN = "origin"
 
     /**
      * 模块自身来源标记。

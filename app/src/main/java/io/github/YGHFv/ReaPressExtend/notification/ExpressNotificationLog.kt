@@ -64,9 +64,18 @@ object ExpressNotificationLog {
                 .asReversed()
         }.getOrDefault(emptyList())
 
+    /**
+     * 清空投递记录。
+     *
+     * ⚠️ 2026-09-26：记录页那张摘要卡已按用户要求撤掉，清空入口暂时没有落点
+     * （放置办法待定）。函数保留完整语义，入口回来时直接用。
+     *
+     * 用 `commit()` 与 [ExpressRecordStore.clear] 同理：用户点完很可能立刻退出甚至杀进程，
+     * 异步落盘会让这次删除丢掉，下次进来旧记录又回来了。
+     */
     fun clear(context: Context) {
         runCatching {
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_RECORDS).apply()
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_RECORDS).commit()
         }
     }
 

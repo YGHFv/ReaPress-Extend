@@ -52,6 +52,7 @@ import io.github.YGHFv.ReaPressExtend.BuildConfig
 import io.github.YGHFv.ReaPressExtend.config.ExpressSettings
 import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsKeys
 import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsSnapshot
+import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
 import io.github.YGHFv.ReaPressExtend.core.ExpressRule
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
 import io.github.YGHFv.ReaPressExtend.logging.ModuleLogBuffer
@@ -59,13 +60,15 @@ import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationLog
 import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationPoster
 import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
 import io.github.YGHFv.ReaPressExtend.relay.WatchdogReporter
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.NavigationBar
 import top.yukonga.miuix.kmp.basic.NavigationBarItem
+import top.yukonga.miuix.kmp.basic.PullToRefresh
 import top.yukonga.miuix.kmp.basic.Scaffold
+import top.yukonga.miuix.kmp.basic.ScrollBehavior
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.blur.BlendColorEntry
@@ -80,6 +83,7 @@ import top.yukonga.miuix.kmp.icon.extended.Home
 import top.yukonga.miuix.kmp.icon.extended.Info
 import top.yukonga.miuix.kmp.icon.extended.Recent
 import top.yukonga.miuix.kmp.icon.extended.Settings
+import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.preference.OverlayDropdownPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -298,6 +302,8 @@ private fun ExpressApp(
     var blurBars by remember { mutableStateOf(uiPrefs.blurBars) }
     var floatingNavBar by remember { mutableStateOf(uiPrefs.floatingNavBar) }
     var liquidGlass by remember { mutableStateOf(uiPrefs.liquidGlass) }
+    // 双击确认取件。和上面三个一样只影响本机界面，所以也走 uiPrefs 而不是功能设置。
+    var doubleTapPickup by remember { mutableStateOf(uiPrefs.doubleTapPickup) }
 
     // 功能设置（拦截开关等）。与外观分开：那份要投影给 system_server，这份不用。
     var settings by remember { mutableStateOf(ExpressSettings.read(context)) }
@@ -311,9 +317,64 @@ private fun ExpressApp(
     // 点开模块」—— 也就是 Activity 还活着但已离开前台时数据就变了。
     // 所以 [resumeTick] 每次 onResume 自增，这里随之重读；切回首页标签时也重读一次。
     var homeRecords by remember { mutableStateOf(ExpressRecordStore.load(context)) }
+    // 记录页那份投递审计。提到这一层是因为「下拉刷新」要能就地重读它（见下面的 refresh）。
+    var recordEntries by remember { mutableStateOf(ExpressNotificationLog.snapshot(context)) }
     LaunchedEffect(resumeTick) {
         homeRecords = ExpressRecordStore.load(context)
+        recordEntries = ExpressNotificationLog.snapshot(context)
     }
+
+    /**
+     * 双击卡片那**一行**：写/清「已取件」标记，然后重读列表。
+     *
+     * 重读而不是就地改内存里的那一条：这个标记的可见后果是**分组级**的（同一地点的包裹全部
+     * 确认后要整批移出「到站包裹」），那是 [io.github.YGHFv.ReaPressExtend.notification.ExpressHomeGrouper]
+     * 拿全量列表算出来的 —— 界面上手改一条只会让卡片显示和分组对不上。
+     * 列表上限 200 条、单人包裹量级，重读的代价可以忽略。
+     */
+    val togglePickup: (ExpressRecord) -> Unit = { record ->
+        val marking = !record.isPickedUp
+        val changed = ExpressRecordStore.setPickedUp(
+            context,
+            record.dedupeKey,
+            // 非 null = 标记为「此刻取走」；null = 撤销。时间戳只用来记录，不参与判定。
+            if (marking) System.currentTimeMillis() else null,
+        )
+        if (changed) homeRecords = ExpressRecordStore.load(context)
+    }
+
+    // 下拉刷新的指示器状态。两页各自一份：一边正在刷时不该把另一边的圈也叫出来。
+    var homeRefreshing by remember { mutableStateOf(false) }
+    var recordRefreshing by remember { mutableStateOf(false) }
+
+    /**
+     * 下拉刷新的公共流程：置位指示器 → 重读 → 保证指示器至少显示 [MIN_REFRESH_VISIBLE_MS] → 收位。
+     *
+     * 「至少显示」这一段是必要的：重读是本地 SharedPreferences 的同步读取，几毫秒就完了，
+     * 指示器会在松手的同一帧收回去，看起来像「下拉没有反应」。兜一下是为了让这次刷新**可见**，
+     * 不是为了假装在忙 —— 所以取的是一个刚好能看清的值，不是一秒的假进度。
+     */
+    fun refresh(reload: () -> Unit, setRefreshing: (Boolean) -> Unit) {
+        scope.launch {
+            setRefreshing(true)
+            val started = System.currentTimeMillis()
+            reload()
+            val spent = System.currentTimeMillis() - started
+            if (spent < MIN_REFRESH_VISIBLE_MS) delay(MIN_REFRESH_VISIBLE_MS - spent)
+            setRefreshing(false)
+        }
+    }
+
+    val onHomeRefresh: () -> Unit = {
+        refresh({ homeRecords = ExpressRecordStore.load(context) }) { homeRefreshing = it }
+    }
+    val onRecordRefresh: () -> Unit = {
+        refresh({ recordEntries = ExpressNotificationLog.snapshot(context) }) { recordRefreshing = it }
+    }
+
+    // 二级页（模块日志）。打开时整页替换掉主界面：日志页自带顶栏与返回，
+    // 底栏那四个页签在这一层没有意义，留着只会让人以为还能往左右滑。
+    var logPageOpen by remember { mutableStateOf(false) }
 
     // 运行时不支持 RuntimeShader（Android 13 以下）时，模糊与液态玻璃都没有效果。
     // 不隐藏开关而是置灰：用户能看到这些功能存在、知道为什么现在用不了。
@@ -349,6 +410,14 @@ private fun ExpressApp(
 
     val animateToTab: (Int) -> Unit = { index ->
         scope.launch { pagerState.springAnimateToPage(index) }
+    }
+
+    // 二级页整页替换主界面，不叠在上面：日志页自带顶栏（含返回），底栏那四个页签在
+    // 这一层没有意义。用提前 return 而不是 if/else 包住整个 Scaffold ——
+    // 前面那些 remember 都是无条件的，早退不会让 Compose 的槽位错位。
+    if (logPageOpen) {
+        LogPage(onBack = { logPageOpen = false })
+        return
     }
 
     Scaffold(
@@ -463,49 +532,135 @@ private fun ExpressApp(
             ),
         ) { page ->
             val pageScroll = scrollBehaviors[page]
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .overScrollVertical()
-                    .nestedScroll(pageScroll.nestedScrollConnection)
-                    .verticalScroll(rememberScrollState(), overscrollEffect = null)
-                    .padding(top = padding.calculateTopPadding())
-                    .padding(vertical = 4.dp),
-            ) {
-                when (page) {
-                    TAB_HOME -> HomePage(records = homeRecords)
-                    TAB_RECORDS -> RecordPage()
-                    TAB_ABOUT -> AboutPage(settings)
-                    else -> SettingsPage(
-                        settings = settings,
-                        update = ::updateSettings,
-                        uiPrefs = uiPrefs,
-                        themeMode = themeMode,
-                        onThemeModeChange = onThemeModeChange,
-                        blurBars = blurBars,
-                        onBlurBarsChange = {
-                            blurBars = it
-                            uiPrefs.blurBars = it
-                        },
-                        floatingNavBar = floatingNavBar,
-                        onFloatingNavBarChange = {
-                            floatingNavBar = it
-                            uiPrefs.floatingNavBar = it
-                        },
-                        liquidGlass = liquidGlass,
-                        onLiquidGlassChange = {
-                            liquidGlass = it
-                            uiPrefs.liquidGlass = it
-                        },
-                        blurSupported = blurSupported,
-                    )
+            // 一页的滚动主体：整页纵向滚动 + 顶栏收缩 + 越界回弹。
+            //
+            // 下拉刷新（快递 / 记录两页）要套在**这一层外面**，而它是靠嵌套滚动拿增量的 ——
+            // 所以 `overScrollVertical()` 必须留在这一层、不能因为「已经有刷新了」就摘掉：
+            // miuix 的越界节点会检测外层的 PullToRefresh 状态，刷新激活时主动把增量让出去，
+            // 两者本来就是一伙的。
+            val scrollContent: @Composable () -> Unit = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .overScrollVertical()
+                        .nestedScroll(pageScroll.nestedScrollConnection)
+                        .verticalScroll(rememberScrollState(), overscrollEffect = null)
+                        .padding(top = padding.calculateTopPadding())
+                        .padding(vertical = 4.dp),
+                ) {
+                    when (page) {
+                        // 关掉开关时传 null 而不是「传了但内部再判一次」：双击手势挂不挂、长什么样，
+                        // 由这一个参数决定，界面里没有第二处判断可以跟它跑偏。
+                        TAB_HOME -> HomePage(
+                            records = homeRecords,
+                            onTogglePickup = if (doubleTapPickup) togglePickup else null,
+                        )
+                        TAB_RECORDS -> RecordPage(recordEntries)
+                        TAB_ABOUT -> AboutPage(
+                            settings = settings,
+                            onOpenLog = { logPageOpen = true },
+                        )
+                        else -> SettingsPage(
+                            settings = settings,
+                            update = ::updateSettings,
+                            uiPrefs = uiPrefs,
+                            themeMode = themeMode,
+                            onThemeModeChange = onThemeModeChange,
+                            blurBars = blurBars,
+                            onBlurBarsChange = {
+                                blurBars = it
+                                uiPrefs.blurBars = it
+                            },
+                            floatingNavBar = floatingNavBar,
+                            onFloatingNavBarChange = {
+                                floatingNavBar = it
+                                uiPrefs.floatingNavBar = it
+                            },
+                            liquidGlass = liquidGlass,
+                            onLiquidGlassChange = {
+                                liquidGlass = it
+                                uiPrefs.liquidGlass = it
+                            },
+                            doubleTapPickup = doubleTapPickup,
+                            onDoubleTapPickupChange = {
+                                doubleTapPickup = it
+                                uiPrefs.doubleTapPickup = it
+                            },
+                            blurSupported = blurSupported,
+                        )
+                    }
+                    Spacer(Modifier.height(padding.calculateBottomPadding()))
+                    Spacer(Modifier.height(4.dp))
                 }
-                Spacer(Modifier.height(padding.calculateBottomPadding()))
-                Spacer(Modifier.height(4.dp))
+            }
+            // 只有快递 / 记录两页套下拉刷新：设置页满屏开关、关于页是静态信息，
+            // 下拉没有可刷的东西 —— 挂上去只会让用户拉出一个永远刷不出新内容的圈。
+            val contentPadding = PaddingValues(top = padding.calculateTopPadding())
+            when (page) {
+                TAB_HOME -> RefreshablePage(
+                    isRefreshing = homeRefreshing,
+                    onRefresh = onHomeRefresh,
+                    scrollBehavior = pageScroll,
+                    contentPadding = contentPadding,
+                ) {
+                    scrollContent()
+                }
+                TAB_RECORDS -> RefreshablePage(
+                    isRefreshing = recordRefreshing,
+                    onRefresh = onRecordRefresh,
+                    scrollBehavior = pageScroll,
+                    contentPadding = contentPadding,
+                ) {
+                    scrollContent()
+                }
+                else -> scrollContent()
             }
         }
     }
 }
+
+/**
+ * 给一页套上下拉刷新。
+ *
+ * 三个取舍：
+ *
+ * 1. **文案必须自己给中文**：miuix 默认是 `Pull down to refresh` 那一套英文。
+ * 2. `contentPadding` 只挪刷新指示器的位置（库内部是按 `offset` 用的，不占布局），
+ *    用来把它推到顶栏下面 —— 不给的话指示器会画在顶栏底下，被顶栏盖住。
+ * 3. 两页各自持有 `isRefreshing`，互不牵连。
+ *
+ * 状态提升用 `isRefreshing` 这个单向入参是库的约定：`onRefresh` 里自己置 `true`、
+ * 完事置 `false`，库只负责把指示器与手势对上（见 `ExpressApp` 里那个 `refresh`）。
+ */
+@Composable
+private fun RefreshablePage(
+    isRefreshing: Boolean,
+    onRefresh: () -> Unit,
+    scrollBehavior: ScrollBehavior,
+    contentPadding: PaddingValues,
+    content: @Composable () -> Unit,
+) {
+    PullToRefresh(
+        isRefreshing = isRefreshing,
+        onRefresh = onRefresh,
+        refreshTexts = REFRESH_TEXTS,
+        contentPadding = contentPadding,
+        topAppBarScrollBehavior = scrollBehavior,
+        modifier = Modifier.fillMaxSize(),
+        content = content,
+    )
+}
+
+/** 刷新指示器的四段文案（下拉 / 松手 / 刷新中 / 完成）。miuix 默认是英文，必须覆盖。 */
+private val REFRESH_TEXTS = listOf("下拉刷新", "松手刷新", "正在刷新…", "刷新成功")
+
+/**
+ * 下拉刷新的指示器**最短**显示时长。
+ *
+ * 重读本地 prefs 是几毫秒的事，不兜这一下的话指示器在松手那一帧就收完了，
+ * 用户看不到任何「刷新发生了」的反馈。取值刚好够看清，不追求「像在忙」。
+ */
+private const val MIN_REFRESH_VISIBLE_MS = 400L
 
 // ---------------------------------------------------------------- 设置页
 
@@ -522,17 +677,12 @@ private fun SettingsPage(
     onFloatingNavBarChange: (Boolean) -> Unit,
     liquidGlass: Boolean,
     onLiquidGlassChange: (Boolean) -> Unit,
+    doubleTapPickup: Boolean,
+    onDoubleTapPickupChange: (Boolean) -> Unit,
     blurSupported: Boolean,
 ) {
-    val context = LocalContext.current
-
     GroupTitle("界面")
-    Card(
-        modifier = Modifier
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 12.dp),
-        insideMargin = PaddingValues(0.dp),
-    ) {
+    SettingsCard {
         OverlayDropdownPreference(
             title = "主题",
             summary = "跟随系统，或固定为日间/夜间",
@@ -575,16 +725,28 @@ private fun SettingsPage(
         }
     }
 
+    GroupTitle("取件")
+    SettingsCard {
+        // 这一组的开关和上面「界面」那组一样只影响本机：它们不改拦截、不改判定，
+        // 也不投影给 system_server（见 ExpressUiPrefs 的类注释）。
+        SwitchPreference(
+            title = "双击确认取件",
+            summary = "在到站卡片上双击取件码那一行，标记这件已取走",
+            checked = doubleTapPickup,
+            onCheckedChange = onDoubleTapPickupChange,
+        )
+        HintText(
+            "双击范围是整行，不用对准那串数字。\n" +
+                "同一驿站有多件时，已确认的会变灰、沉到卡片下面；全部确认后才一起移出「到站包裹」。\n" +
+                "再双击一次可以撤销。标记只存在本机，不会同步给菜鸟或快递公司。",
+        )
+    }
+
     GroupTitle("工作模式")
-    Card(
-        modifier = Modifier
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 12.dp),
-        insideMargin = PaddingValues(0.dp),
-    ) {
+    SettingsCard {
         // 一个三态控件，不再有「总开关 + 模式」两个能互相矛盾的入口。
         // 以前那个开关在 system_server 侧压根没被读过，是个纯装饰。
-        InfoRow("当前", modeLabel(settings.mode))
+        // 不再另起一行写「当前：xx」—— 分段的选中态已经把它说清楚了，重复一行只是噪音。
         SegmentedRow(
             options = ExpressSettingsKeys.MODE_OPTIONS,
             selected = settings.mode,
@@ -595,23 +757,16 @@ private fun SettingsPage(
                 ExpressSettingsKeys.MODE_OFF ->
                     "模块不处理任何通知，原通知原样显示。"
                 ExpressSettingsKeys.MODE_PASSTHROUGH ->
-                    "模块判定快递通知并额外发一条，原通知照常显示。\n" +
-                        "建议先用这个模式跑几天，确认模块的通知都发得出来。"
+                    "命中快递通知时额外发一条，原通知照常显示。建议先用这个模式跑几天。"
                 else ->
                     "命中快递通知时吞掉原通知，只留模块发的那条。\n" +
-                        "若模块的通知发不出去（权限被收回、进程被冻结），原通知又已经被吞，" +
-                        "这一条就彻底看不到了 —— 所以切换前请先确认放行模式下通知收得到。"
+                        "模块的通知发不出去时原通知已经没了，所以先确认放行模式下收得到再切。"
             },
         )
     }
 
     GroupTitle("来源")
-    Card(
-        modifier = Modifier
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 12.dp),
-        insideMargin = PaddingValues(0.dp),
-    ) {
+    SettingsCard {
         SwitchPreference(
             title = "菜鸟",
             summary = "com.cainiao.wireless",
@@ -639,13 +794,7 @@ private fun SettingsPage(
     }
 
     GroupTitle("判定阈值")
-    Card(
-        modifier = Modifier
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 12.dp),
-        insideMargin = PaddingValues(0.dp),
-    ) {
-        InfoRow("当前阈值", "${settings.confidenceThreshold} / 100")
+    SettingsCard {
         SegmentedRow(
             options = listOf("30" to "宽松", "50" to "默认", "70" to "严格"),
             selected = settings.confidenceThreshold.toString(),
@@ -655,41 +804,25 @@ private fun SettingsPage(
                 }
             },
         )
-        HintText(
-            "阈值越高越不容易误拦非快递通知，但可能漏掉信息量少的快递提醒。" +
-                "判定依据是关键词命中 + 运单号/取件码等结构化字段。",
-        )
+        HintText("阈值越高越不容易误拦，但可能漏掉信息量少的快递提醒。")
     }
 
     GroupTitle("关键词")
-    Card(
-        modifier = Modifier
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 12.dp),
-        insideMargin = PaddingValues(0.dp),
-    ) {
+    SettingsCard {
         InfoRow("内置关键词", "${ExpressRule.DEFAULT_KEYWORDS.size} 个")
         InfoRow("自定义追加", "${settings.extraKeywords.size} 个")
         InfoRow("排除词", "${settings.excludeKeywords.size} 个")
-        HintText("自定义关键词需要键盘输入，当前版本先用内置值；后续版本提供编辑入口。")
+        HintText("自定义关键词暂只读，后续版本提供编辑入口。")
     }
 
     GroupTitle("框架")
-    Card(
-        modifier = Modifier
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 12.dp),
-        insideMargin = PaddingValues(0.dp),
-    ) {
+    SettingsCard {
         InfoRow(
             "Xposed 服务",
             if (ExpressSettings.isServiceAvailable()) "已连接" else "未连接（设置无法同步给 hook）",
             if (ExpressSettings.isServiceAvailable()) null else MiuixTheme.colorScheme.error,
         )
-        HintText(
-            "未连接说明 LSPosed 没启用本模块、或模块不在作用域内。" +
-                "此时界面上的设置仍会保存，但被注入的进程读不到。",
-        )
+        HintText("未连接说明 LSPosed 没启用本模块，或作用域没包含它。设置仍会保存，但被注入的进程读不到。")
     }
 }
 
@@ -698,35 +831,29 @@ private fun SettingsPage(
 /**
  * 投递记录页。
  *
+ * 列表由 [ExpressApp] 持有（它是「下拉刷新」的重读对象），这里只负责画。
+ *
  * 按天分组：同一天只出一行日标题（今天 / 昨天 / MM-dd），卡片里只留 HH:mm。
  * 比每条都写满「09-26 00:55:44」清爽，也更容易按天扫读 —— 排查「昨晚那条发了没有」
  * 时，眼睛先落到日标题上。
+ *
+ * 统计从卡片挪进了分组抬头：原来那张摘要卡上还挂着「清空投递记录」，清空入口撤掉之后
+ * （放置办法待定）它就只剩一行统计 —— 为一行「已发出 12 / 12」单独占一张卡不值当，
+ * 抬头那行恰好是它的位置。
  */
 @Composable
-private fun RecordPage() {
-    val context = LocalContext.current
-    // 每次进入这一页重读一次；模块常年无界面，进来看到的就是最新状态。
-    val entries = remember { ExpressNotificationLog.snapshot(context) }
-
+private fun RecordPage(entries: List<ExpressNotificationLog.Entry>) {
     if (entries.isEmpty()) {
         GroupTitle("通知投递记录")
         RecordCard(
             title = "暂无记录",
-            description = "拦截到快递通知后会出现在这里。这一页记录的是**投递结果**" +
+            description = "拦截到快递通知后会出现在这里。这一页记的是投递结果" +
                 "（模块的通知有没有真的发出去），不是包裹列表。",
         )
         return
     }
 
-    GroupTitle("通知投递记录")
-    RecordCard(
-        title = "已发出 ${entries.count { it.delivered }} / ${entries.size}",
-        description = if (entries.any { !it.delivered }) {
-            "标红的是没发出去的 —— 展开看失败原因。常见原因是通知权限未授予。"
-        } else {
-            "全部投递成功。"
-        },
-    )
+    GroupTitle("通知投递记录 · 已发出 ${entries.count { it.delivered }} / ${entries.size}")
 
     entries.take(30).forEachIndexed { index, entry ->
         val day = dayLabel(entry.at)
@@ -771,10 +898,6 @@ private fun dayLabel(at: Long): String {
     }
 }
 
-/** 模式的中文名。文案表在 [ExpressSettingsKeys.MODE_OPTIONS]，界面与诊断摘要共用一份。 */
-private fun modeLabel(mode: String): String =
-    ExpressSettingsKeys.MODE_OPTIONS.firstOrNull { it.first == mode }?.second ?: mode
-
 /** 卡片右上角的时刻（同一天内只需要时分）。 */
 private fun clockLabel(at: Long): String =
     java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
@@ -785,20 +908,17 @@ private fun clockLabel(at: Long): String =
 /**
  * 关于页。诊断信息也放在这里 —— 它本来就是「出问题时才看」的内容，
  * 单独占一个页签不值得，但也不能藏起来（模块常年无界面，没有这些信息就无从排查）。
+ *
+ * @param onOpenLog 打开二级页「模块日志」（[LogPage]）
  */
 @Composable
-private fun AboutPage(settings: ExpressSettingsSnapshot) {
+private fun AboutPage(settings: ExpressSettingsSnapshot, onOpenLog: () -> Unit) {
     val context = LocalContext.current
     val permissionOk = ExpressNotificationPoster.hasPermission(context)
     var hookForceRequested by remember { mutableStateOf(false) }
 
     GroupTitle("模块状态")
-    Card(
-        modifier = Modifier
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 12.dp),
-        insideMargin = PaddingValues(0.dp),
-    ) {
+    SettingsCard {
         InfoRow("版本", "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
         InfoRow("构建模式", if (BuildConfig.DEBUG) "debug" else "release")
         InfoRow(
@@ -809,12 +929,7 @@ private fun AboutPage(settings: ExpressSettingsSnapshot) {
     }
 
     GroupTitle("权限")
-    Card(
-        modifier = Modifier
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 12.dp),
-        insideMargin = PaddingValues(0.dp),
-    ) {
+    SettingsCard {
         InfoRow(
             "通知权限",
             if (permissionOk) "已授予" else "未授予 —— 替换通知发不出去",
@@ -827,12 +942,7 @@ private fun AboutPage(settings: ExpressSettingsSnapshot) {
     }
 
     GroupTitle("system_server hook")
-    Card(
-        modifier = Modifier
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 12.dp),
-        insideMargin = PaddingValues(0.dp),
-    ) {
+    SettingsCard {
         val installed = WatchdogReporter.lastBootInstalled(context)
         val at = WatchdogReporter.lastBootAt(context)
         InfoRow(
@@ -854,12 +964,7 @@ private fun AboutPage(settings: ExpressSettingsSnapshot) {
         val tripped = WatchdogReporter.watchdogTripped(context)
         val reason = WatchdogReporter.lastBootReason(context)
         if (reason.isNotBlank()) {
-            Text(
-                reason,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                fontSize = 12.sp,
-                color = MiuixTheme.colorScheme.error,
-            )
+            HintText(reason, color = MiuixTheme.colorScheme.error)
         }
         if (tripped) {
             HintText(
@@ -890,42 +995,26 @@ private fun AboutPage(settings: ExpressSettingsSnapshot) {
     GroupTitle("接入须知")
     // 下面这些是「装完不生效」时唯一能自助排查的线索，放在关于页而不是藏进日志。
 
-    Card(
-        modifier = Modifier
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 12.dp),
-        insideMargin = PaddingValues(0.dp),
-    ) {
-        DiagnosticNote("1. 在 LSPosed 里勾选本模块，作用域必须包含 system（全局拦截的前提）。")
-        DiagnosticNote("2. 改动作用域或模块代码后需重启设备，system_server 里的 hook 才会更新。")
-        DiagnosticNote("3. 模块界面至少打开过一次才算脱离 stopped，广播才收得到。")
-        DiagnosticNote("4. 若「记录」页显示未发出，先看上面的通知权限。")
+    SettingsCard {
+        HintText("1. 在 LSPosed 里勾选本模块，作用域必须包含 system（全局拦截的前提）。")
+        HintText("2. 改动作用域或模块代码后需重启设备，system_server 里的 hook 才会更新。")
+        HintText("3. 模块界面至少打开过一次才算脱离 stopped，广播才收得到。")
+        HintText("4. 若「记录」页显示未发出，先看上面的通知权限。")
     }
 
-    GroupTitle("模块日志")
-    val logs = remember { ModuleLogBuffer.snapshot().take(40) }
-    Card(
-        modifier = Modifier
-            .padding(horizontal = 12.dp)
-            .padding(bottom = 12.dp),
-        insideMargin = PaddingValues(0.dp),
-    ) {
-        if (logs.isEmpty()) {
-            InfoRow("暂无日志", "")
-        } else {
-            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
-                for (line in logs) {
-                    Text(
-                        "${ModuleLogBuffer.formatTime(line.at)} ${line.level} ${line.message}",
-                        fontSize = 11.sp,
-                        color = if (line.level == "ERROR") {
-                            MiuixTheme.colorScheme.error
-                        } else {
-                            MiuixTheme.colorScheme.onSurfaceVariantSummary
-                        },
-                    )
-                }
-            }
-        }
+    GroupTitle("诊断")
+    SettingsCard {
+        // 一行入口，不在这里摊开日志：日志一次几十上百行，摆在这一页会把「模块状态 /
+        // 权限 / 看门狗」这些真要看的信息全推到屏幕外。点进去是一整页（[LogPage]），
+        // 那一页有顶栏和返回，也放得下更长的正文。
+        //
+        // 摘要只给条数（和错误数）：`ArrowPreference` 的副标题位置塞不下
+        // 「最近 09-26 04:12:33.123」这种长度，折行会把卡片撑得比正文还高。
+        val logs = ModuleLogBuffer.snapshot()
+        ArrowPreference(
+            title = "模块日志",
+            summary = logSummary(logs),
+            onClick = onOpenLog,
+        )
     }
 }

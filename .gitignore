@@ -12,3 +12,9 @@ local.properties
 *.keystore
 *.jks
 .kotlin/
+
+# 真机日志里带真实运单号 / 手机尾号 / 取件码，仓库是公开的，一律不进版本库。
+log/
+
+# 本机的工程记忆与工作记录（.workbuddy/memory）同理：只留本地。
+.workbuddy/
