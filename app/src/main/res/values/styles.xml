@@ -1,0 +1,26 @@
+<resources>
+    <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar" />
+
+    <!--
+      隐形 Activity 的主题：用于「接收器不能申请运行时权限」的场景（POST_NOTIFICATIONS 只有
+      Activity 能弹授权框）。透明 + 无预览 + 不进入最近任务，配合 finish() 实现「闪一下都不闪」。
+      注意 windowNoDisplay 保持 false —— 置 true 会让 Activity 完全不渲染，反而拿不到权限回调。
+    -->
+    <style name="NoDisplayTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowDisablePreview">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowNoDisplay">false</item>
+    </style>
+
+    <!--
+      模块主界面的主题。浅色版本在这里，深色版本在 values-night/styles.xml —— 两个资源目录按系统的
+      深浅色自动切换，于是窗口底色跟着系统走；页面内部配色由 Compose 侧的 MiuixTheme 决定。
+      窗口底色写死颜色是为了避免启动瞬间闪一下系统默认白/黑。
+    -->
+    <style name="ModuleTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#FFF4F5F7</item>
+    </style>
+</resources>

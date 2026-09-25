@@ -1,0 +1,4 @@
+<resources>
+    <string name="module_name">快递助手</string>
+    <string name="module_description">拦截菜鸟 / 拼多多 / 淘宝 / 快递短信的快递通知，重发为一条干净的汇总通知</string>
+</resources>
