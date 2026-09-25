@@ -54,11 +54,13 @@ import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsKeys
 import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsSnapshot
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
 import io.github.YGHFv.ReaPressExtend.core.ExpressRule
+import io.github.YGHFv.ReaPressExtend.core.ExpressStationRules
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
 import io.github.YGHFv.ReaPressExtend.logging.ModuleLogBuffer
 import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationLog
 import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationPoster
 import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
+import io.github.YGHFv.ReaPressExtend.notification.ExpressStationRuleStore
 import io.github.YGHFv.ReaPressExtend.relay.WatchdogReporter
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -376,6 +378,11 @@ private fun ExpressApp(
     // 底栏那四个页签在这一层没有意义，留着只会让人以为还能往左右滑。
     var logPageOpen by remember { mutableStateOf(false) }
 
+    // 驿站管理（合并 / 改外显名）的规则，以及那个二级页面开没开。
+    // 规则改完立刻重读一遍：首页分组是拿它现算的，不重读的话名字改了但卡片没动。
+    var stationRules by remember { mutableStateOf(ExpressStationRuleStore.load(context)) }
+    var stationAdminOpen by remember { mutableStateOf(false) }
+
     // 运行时不支持 RuntimeShader（Android 13 以下）时，模糊与液态玻璃都没有效果。
     // 不隐藏开关而是置灰：用户能看到这些功能存在、知道为什么现在用不了。
     val blurSupported = remember { isRuntimeShaderSupported() }
@@ -417,6 +424,22 @@ private fun ExpressApp(
     // 前面那些 remember 都是无条件的，早退不会让 Compose 的槽位错位。
     if (logPageOpen) {
         LogPage(onBack = { logPageOpen = false })
+        return
+    }
+
+    // 驿站管理同样是二级页。传的是**全量**记录而不是首页算出来的分组：管理页要能管到
+    // 所有驿站（包括只有已签收包裹的那些），否则用户想合并两个名字时，可能因为其中一个
+    // 暂时没有待取件而在列表里找不到它。
+    if (stationAdminOpen) {
+        StationAdminPage(
+            records = homeRecords,
+            rules = stationRules,
+            onRename = { key, display ->
+                ExpressStationRuleStore.setRename(context, key, display)
+                stationRules = ExpressStationRuleStore.load(context)
+            },
+            onBack = { stationAdminOpen = false },
+        )
         return
     }
 
@@ -553,6 +576,7 @@ private fun ExpressApp(
                         // 由这一个参数决定，界面里没有第二处判断可以跟它跑偏。
                         TAB_HOME -> HomePage(
                             records = homeRecords,
+                            rules = stationRules,
                             onTogglePickup = if (doubleTapPickup) togglePickup else null,
                         )
                         TAB_RECORDS -> RecordPage(recordEntries)
@@ -587,6 +611,8 @@ private fun ExpressApp(
                                 uiPrefs.doubleTapPickup = it
                             },
                             blurSupported = blurSupported,
+                            stationRules = stationRules,
+                            onOpenStations = { stationAdminOpen = true },
                         )
                     }
                     Spacer(Modifier.height(padding.calculateBottomPadding()))
@@ -662,6 +688,19 @@ private val REFRESH_TEXTS = listOf("下拉刷新", "松手刷新", "正在刷新
  */
 private const val MIN_REFRESH_VISIBLE_MS = 400L
 
+/**
+ * 设置页「驿站管理」那一行的摘要。
+ *
+ * 只说「有没有手工规则」这一个事实，**不说驿站总数**：那要遍历全部记录才知道，
+ * 而设置页每次重组都算一遍是白费。点进去第一行就写着「共 N 个驿站」。
+ */
+private fun stationAdminSummary(rules: ExpressStationRules): String =
+    if (rules.isEmpty) {
+        "合并同一驿站的不同写法、改显示名称"
+    } else {
+        "已设置 ${rules.renames.size} 条规则"
+    }
+
 // ---------------------------------------------------------------- 设置页
 
 @Composable
@@ -680,6 +719,8 @@ private fun SettingsPage(
     doubleTapPickup: Boolean,
     onDoubleTapPickupChange: (Boolean) -> Unit,
     blurSupported: Boolean,
+    stationRules: ExpressStationRules,
+    onOpenStations: () -> Unit,
 ) {
     GroupTitle("界面")
     SettingsCard {
@@ -739,6 +780,14 @@ private fun SettingsPage(
             "双击范围是整行，不用对准那串数字。\n" +
                 "同一驿站有多件时，已确认的会变灰、沉到卡片下面；全部确认后才一起移出「到站包裹」。\n" +
                 "再双击一次可以撤销。标记只存在本机，不会同步给菜鸟或快递公司。",
+        )
+        CardDivider()
+        // 驿站管理放在「取件」组里而不是单开一组：它服务的就是取件（去哪个驿站、认哪几张卡片），
+        // 单开一组会给它一个与其分量不符的位置。
+        ArrowPreference(
+            title = "驿站管理",
+            summary = stationAdminSummary(stationRules),
+            onClick = onOpenStations,
         )
     }
 

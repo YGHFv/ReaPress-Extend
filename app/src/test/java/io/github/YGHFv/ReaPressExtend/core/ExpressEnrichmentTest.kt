@@ -624,10 +624,11 @@ class ExpressHostFieldsTest {
     }
 
     @Test
-    fun `入站时长按整天算`() {
-        assertEquals("今天入站", ExpressFormatter.inStationLabel(0L, 3 * 3_600_000L, zone))
-        assertEquals("已入站1天", ExpressFormatter.inStationLabel(0L, day + 1L, zone))
-        assertEquals("已入站2天", ExpressFormatter.inStationLabel(0L, 2 * day + 5 * 60_000L, zone))
+    fun `入站时长只报天数不带到站前缀`() {
+        // 前缀「已入站」在到站包裹分组里是废话（抬头已经说了），所以只留天数本身
+        assertEquals("今天", ExpressFormatter.inStationLabel(0L, 3 * 3_600_000L, zone))
+        assertEquals("1天", ExpressFormatter.inStationLabel(0L, day + 1L, zone))
+        assertEquals("2天", ExpressFormatter.inStationLabel(0L, 2 * day + 5 * 60_000L, zone))
     }
 
     @Test
@@ -638,17 +639,52 @@ class ExpressHostFieldsTest {
         val arrived = 1_790_245_293_000L // 2026-09-24 18:21:33 +08:00
 
         // 09-26 03:30 —— 用户看到「2天」的那一刻
-        assertEquals("已入站2天", ExpressFormatter.inStationLabel(arrived, 1_790_364_600_000L, zone))
+        assertEquals("2天", ExpressFormatter.inStationLabel(arrived, 1_790_364_600_000L, zone))
         // 09-25 23:59 —— 差 29.6 小时，24 小时制也会说 1 天，这条是两边一致的基准
-        assertEquals("已入站1天", ExpressFormatter.inStationLabel(arrived, 1_790_351_940_000L, zone))
+        assertEquals("1天", ExpressFormatter.inStationLabel(arrived, 1_790_351_940_000L, zone))
         // 09-25 00:10 —— 只过了 5.8 小时，24 小时制说「今天」，但跨过午夜就该算 1 天。
         // 这条是本测试的核心：它把「跨自然日即 1 天」这个口径钉死。
-        assertEquals("已入站1天", ExpressFormatter.inStationLabel(arrived, 1_790_266_200_000L, zone))
+        assertEquals("1天", ExpressFormatter.inStationLabel(arrived, 1_790_266_200_000L, zone))
     }
 
     @Test
     fun `时间倒挂时不显示负数天数`() {
-        // 时钟回拨或宿主给错时间都可能出现，宁可说「今天入站」也不能出现「已入站-1天」
-        assertEquals("今天入站", ExpressFormatter.inStationLabel(day * 5, 0L, zone))
+        // 时钟回拨或宿主给错时间都可能出现，宁可说「今天」也不能出现「-1天」
+        assertEquals("今天", ExpressFormatter.inStationLabel(day * 5, 0L, zone))
+    }
+
+    @Test
+    fun `营业时间压成钟点区间`() {
+        // 真机实测格式（菜鸟 8.11.923 `packageStation.officeTime`）：中文长写法 →
+        // 卡片上只要「几点到几点」。小时去前导零是用户指定口径。
+        assertEquals("9:00-21:00", ExpressFormatter.stationHoursLabel("周一至周日09点00分到21点00分"))
+        // 已经规范的写法走同一条规则，口径统一
+        assertEquals("9:00-21:00", ExpressFormatter.stationHoursLabel("09:00-21:00"))
+        // 「每天」和「周一至周日」等价，同样丢掉
+        assertEquals("8:30-20:00", ExpressFormatter.stationHoursLabel("每天8:30-20:00"))
+    }
+
+    @Test
+    fun `营业时间里非全周的星期前缀必须留着`() {
+        // 丢掉「工作日」这半句会变成误导：用户周末跑一趟取不到
+        assertEquals("周一至周五 · 9:00-18:00", ExpressFormatter.stationHoursLabel("周一至周五 09:00-18:00"))
+    }
+
+    @Test
+    fun `营业时间有两段时不能截掉后半段`() {
+        // 有午休的驿站会给两段，只取前两个钟点会显示成「9:00-12:00」——等于骗人
+        assertEquals(
+            "9:00-12:00，14:00-21:00",
+            ExpressFormatter.stationHoursLabel("09点00分到12点00分，14点00分到21点00分"),
+        )
+    }
+
+    @Test
+    fun `营业时间认不出钟点时原样返回`() {
+        // 宁可难看也不能编一个不存在的营业时间
+        assertEquals("全天", ExpressFormatter.stationHoursLabel("全天"))
+        assertEquals("09点00分", ExpressFormatter.stationHoursLabel("09点00分"))
+        assertNull(ExpressFormatter.stationHoursLabel("   "))
+        assertNull(ExpressFormatter.stationHoursLabel(null))
     }
 }
