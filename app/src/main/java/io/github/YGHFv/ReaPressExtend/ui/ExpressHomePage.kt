@@ -56,6 +56,12 @@ internal fun HomePage(
     }
 
     val sections = ExpressHomeGrouper.group(records, rules)
+    // 驿站显示名表：整页算一次。到站卡片抬头是分组时就带出来的（同一张表），下面那些
+    // 平铺卡片（运输中 / 已签收）自己取一次 —— 它们不在分组里，拿不到 group.station。
+    //
+    // 逐条算不行：每条都要重跑一遍聚类，而且两份结果一旦有出入，同一条记录在两个位置
+    // 就会印出两个名字。
+    val stationLabels = ExpressHomeGrouper.stationLabels(records, rules)
     // 「已入站2天」这种相对时间需要一个「现在」。在 UI 层取一次再往下传 —— core 层刻意不碰
     // 系统时钟（见 ExpressFormatter.inStationLabel），所以这里是整条链路上唯一的时间来源。
     val now = System.currentTimeMillis()
@@ -68,7 +74,11 @@ internal fun HomePage(
             }
         }
         for (record in section.records) {
-            ParcelCard(record, onTogglePickup)
+            ParcelCard(
+                record = record,
+                stationLabel = ExpressHomeGrouper.stationLabelOf(record, stationLabels),
+                onTogglePickup = onTogglePickup,
+            )
         }
     }
 }
@@ -176,9 +186,17 @@ private fun StationGroupCard(
  * 不按地点聚合时的单条卡片（运输中、已签收、用户已确认取件移出待取件的）。
  *
  * 双击还原只对**已标记过已取件**的记录开放，理由见 [pickupToggleTarget] 的调用点。
+ *
+ * @param stationLabel 该记录该显示的驿站名（用户改过名就是改后的名字），未知传 null。
+ *   由调用方用 [ExpressHomeGrouper.stationLabels] 算好传进来，**不要在卡片里读
+ *   `record.station`** —— 那是原始串，用户在驿站管理里改的名字对它不生效。
  */
 @Composable
-private fun ParcelCard(record: ExpressRecord, onTogglePickup: ((ExpressRecord) -> Unit)?) {
+private fun ParcelCard(
+    record: ExpressRecord,
+    stationLabel: String?,
+    onTogglePickup: ((ExpressRecord) -> Unit)?,
+) {
     // 运输中 / 已签收的普通卡片本来就没有「确认取件」这个动作，给它们挂双击是凭空多出一个
     // 可操作区，误触的代价大于收益 —— 所以这里按记录本身过滤，而不是照搬到站卡片那套。
     //
@@ -186,7 +204,7 @@ private fun ParcelCard(record: ExpressRecord, onTogglePickup: ((ExpressRecord) -
     // 剩下的撤销入口（单件驿站误触一下就直接移档，没有灰态窗口可以退回去）。
     val target = if (record.isPickedUp) onTogglePickup else null
     SettingsCard {
-        ParcelCardBody(record, target)
+        ParcelCardBody(record, stationLabel, target)
     }
 }
 
@@ -300,20 +318,28 @@ private fun PickupCardBody(
  * 运单号和商品名，信息能完整显示。**不为了视觉统一而统一**：两套布局服务的动作不同。
  *
  * 三行结构（状态挂在右上角）：
- * ①主标识 + 运单号全号 ②手机尾号 · 运单动态 ③来源 · 物品。
+ * ①主标识 + 运单号全号 + 驿站名 ②手机尾号 · 运单动态 ③来源 · 物品。
  * 运单号从「单独一行」升到标题行之后，卡片少了一行 —— 少掉的那行本来就只装一个字段，
- * 而它和公司名是同一件事（哪家的哪一单）。
+ * 而它和公司名是同一件事（哪家的哪一单）。驿站名 2026-09-26 同理并进标题行
+ * （见 [ParcelTitleRow]），卡片再少一行。
  *
  * 用户整站确认取件后移出「到站包裹」的记录也走这里（进了「已签收 / 异常」那一档）。
  * 对它们不用 [PickupCardBody]：那个左列是为「到驿站念一串码」服务的，而这些件已经取回来了 ——
  * 再摆一个大号取件码是在提示一个已经做完的动作。状态文案由
  * [ExpressFormatter.statusLabel] 换成「已取件」。
  *
+ * @param stationLabel 该显示的驿站名，未知传 null（整段不排）。**不是 `record.station`** ——
+ *   原始串过不了用户的改名 / 合并规则。2026-09-26 起直接排进标题行、紧跟运单号，
+ *   字号与颜色都跟运单号同档（不再是原来那行蓝色）。
  * @param onTogglePickup 双击整张卡片撤销「已取件」。**只有已标记过的记录会传非 null**（见
  *   [ParcelCard]）—— 否则每一张运输中的卡片都会变成一个隐藏的双击区。
  */
 @Composable
-private fun ParcelCardBody(record: ExpressRecord, onTogglePickup: ((ExpressRecord) -> Unit)?) {
+private fun ParcelCardBody(
+    record: ExpressRecord,
+    stationLabel: String?,
+    onTogglePickup: ((ExpressRecord) -> Unit)?,
+) {
     Column(
         modifier = Modifier
             // 和到站卡片同一条规矩：手势在 padding 之前，双击区域含整张卡片的留白。
@@ -322,7 +348,9 @@ private fun ParcelCardBody(record: ExpressRecord, onTogglePickup: ((ExpressRecor
     ) {
         Row(verticalAlignment = Alignment.Top) {
             Column(modifier = Modifier.weight(1f)) {
-                ParcelTitleRow(record)
+                // 驿站名一并交给标题行：它和运单号是同一类信息（这一单是哪个、归哪儿），
+                // 单独占一行时卡片白高一截（见 ParcelTitleRow 的注释）。
+                ParcelTitleRow(record, stationLabel)
                 // 副行：手机尾号 + 运单动态。规则的取舍（为什么不显示运单号尾号）在
                 // ExpressFormatter.detailLine 里，那边是纯函数、可单测。
                 parcelSubtitle(record)?.let { subtitle ->
@@ -358,32 +386,31 @@ private fun ParcelCardBody(record: ExpressRecord, onTogglePickup: ((ExpressRecor
                 color = statusColor(record),
             )
         }
-
-        record.station?.takeIf { it.isNotBlank() }?.let { station ->
-            Spacer(Modifier.height(6.dp))
-            Text(
-                station,
-                fontSize = 13.sp,
-                color = MiuixTheme.colorScheme.primary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
     }
 }
 
 /**
- * 运输中卡片的标题行：主标识（取件码 / 公司简称）+ **运单号全号**。
+ * 运输中 / 已签收卡片的标题行：主标识（取件码 / 公司简称）+ **运单号全号** + **驿站名**。
  *
  * 运单号跟在公司名后面、**沿用 12sp 常规字重**，不跟着标题一起放大：它是核对用的附属信息，
  * 放大就会跟公司名抢视觉重心，整行也变重。读序正好对上用户的动作顺序 ——
- * 「哪家快递 → 哪一单」。
+ * 「哪家快递 → 哪一单」。驿站名接在运单号后面，是同一读序的第三段（这一单归哪儿）。
+ *
+ * 驿站名 2026-09-26 从卡片最底行挪进来（用户要求「站点放到运单号后面」），两个原因：
+ * ①它和运单号是同一类信息，分两行时白占一行高度（商品名那一行才是真正需要横向空间的）；
+ * ②原来那行用 `primary` 蓝色，是整张卡片上唯一的彩色文字 —— 扫一屏时比包裹本身还抢眼，
+ * 而分组抬头「到站包裹」已经用蓝色标了地点，这里再标一次属于重复强调。
+ * 现在它和运单号同一档字号、同一个次要色，只靠 `·` 分隔：**位置本身说明了它是驿站**，
+ * 不需要颜色再标一次（用户 2026-09-26 明确要求去掉蓝色）。
  *
  * 主标识位已经在显示运单号时（认不出公司，见 [titleShowsTracking]）不再补一遍，
  * 否则同一串数字会在标题里出现两次。
+ *
+ * @param stationLabel 该显示的驿站名（用户改过名就是改后的名字），未知传 null（整段不排）。
+ *   **不是 `record.station`** —— 原始串过不了用户的改名 / 合并规则。
  */
 @Composable
-private fun ParcelTitleRow(record: ExpressRecord) {
+private fun ParcelTitleRow(record: ExpressRecord, stationLabel: String?) {
     val pickup = record.pickupCode?.takeIf { it.isNotBlank() }
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text(
@@ -403,7 +430,31 @@ private fun ParcelTitleRow(record: ExpressRecord) {
                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                // 两个都 fill = false：够宽时各按内容排，不够时一起收缩 —— 谁都不会把对方挤出卡片。
+                // 三个字段（主标识 / 运单号 / 驿站名）全都 fill = false：够宽时各按内容排，
+                // 不够时一起收缩 —— 不会出现某一个把其它两个挤出卡片。
+                modifier = Modifier.weight(1f, fill = false),
+            )
+        }
+        if (stationLabel != null) {
+            // 分隔符单独一个 Text，不拼进驿站名里：它和驿站名是两种东西，
+            // 拼在一起的话「·」会跟着驿站名一起被截断（极端窄屏下只剩个孤零零的点）。
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = "·",
+                fontSize = 12.sp,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                maxLines = 1,
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = stationLabel,
+                fontSize = 12.sp,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                // 这一段是行尾的「弹性尾巴」：三个字段全都 fill = false，空间不够时一起收缩，
+                // 不会出现某一个把其它两个挤出卡片。驿站名本身长短差得最多（有的带楼栋号），
+                // 所以是最先被截的那一段 —— 截掉的也确实是它最不关键的后半截。
                 modifier = Modifier.weight(1f, fill = false),
             )
         }
