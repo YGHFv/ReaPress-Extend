@@ -88,6 +88,38 @@ class ExpressParserTest {
         assertEquals("丰巢", ExpressParser.parseStation("包裹已放入丰巢，请凭取件码取件"))
     }
 
+    // ---- 手机尾号 ----
+
+    @Test
+    fun `手机尾号在手机二字之后`() {
+        assertEquals(
+            "1234",
+            ExpressParser.parsePhoneTail("您的包裹已放入快递柜，手机尾号1234，取件码 8-2-3021"),
+        )
+    }
+
+    @Test
+    fun `手机号后四位带冒号`() {
+        assertEquals("5678", ExpressParser.parsePhoneTail("凭手机号后四位：5678 取件"))
+    }
+
+    @Test
+    fun `尾号在手机之前的语序也认`() {
+        assertEquals("1234", ExpressParser.parsePhoneTail("尾号1234的手机请到前台取件"))
+    }
+
+    @Test
+    fun `单独的尾号不认成手机尾号`() {
+        // 这是运单号尾号的常见写法 —— 认了就会让用户去跟店员报一个错的号
+        assertNull(ExpressParser.parsePhoneTail("您的包裹运单号尾号0123，请及时取件"))
+    }
+
+    @Test
+    fun `数字串更长时不当成手机尾号`() {
+        // 「手机尾号12345」里的数字串比 4 位长，说不清到底哪四位是尾号 —— 宁可不要
+        assertNull(ExpressParser.parsePhoneTail("手机尾号12345"))
+    }
+
     // ---- 状态 ----
 
     @Test

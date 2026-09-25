@@ -327,6 +327,79 @@ class CourierTest {
         assertEquals(Courier.EMS, Courier.fromTrackingNumber("EA123456789CN"))
         assertEquals(Courier.EMS, Courier.fromTrackingNumber("KA123456789CN"))
     }
+
+    @Test
+    fun `邮政包裹的 partnerCode 认得出来`() {
+        // 真机证据（log/run6）：两行 partnerCode=POSTB，运单号 9 开头 13 位（邮政快递包裹号段），
+        // 它们在 log/run10 的 emit 里都是 cp=快递 —— 就是用户上报「邮储的快递只显示单号」那批
+        assertEquals(Courier.EMS, Courier.fromPartnerCode("POSTB"))
+        // 大小写/空格不敏感，和其它 code 一条规矩
+        assertEquals(Courier.EMS, Courier.fromPartnerCode(" postb "))
+    }
+
+    @Test
+    fun `汇通的 partnerCode 仍然不认`() {
+        // 没有一份真机数据能把 HTKY 绑到某个品牌上，认错会让用户在驿站报错公司名
+        assertNull(Courier.fromPartnerCode("HTKY"))
+    }
+
+    @Test
+    fun `宿主给的中文公司名优先认得出来`() {
+        // 带后缀的写法靠包含匹配吃掉，不需要为每个变体加词
+        assertEquals(Courier.EMS, Courier.fromCompanyName("邮政快递包裹"))
+        assertEquals(Courier.EMS, Courier.fromCompanyName("EMS"))
+        // 邮储银行这条线宿主给的名字里没有「邮政」二字，靠别名兜住
+        assertEquals(Courier.EMS, Courier.fromCompanyName("邮储"))
+        assertEquals(Courier.EMS, Courier.fromCompanyName("中国邮政储蓄银行"))
+        assertEquals(Courier.ZHONGTONG, Courier.fromCompanyName("中通快递"))
+        assertEquals(Courier.JITU, Courier.fromCompanyName("极兔速递"))
+    }
+
+    @Test
+    fun `中文公司名认不出时返回 UNKNOWN 而不是猜`() {
+        assertEquals(Courier.UNKNOWN, Courier.fromCompanyName("某某物流"))
+        assertEquals(Courier.UNKNOWN, Courier.fromCompanyName(null))
+        assertEquals(Courier.UNKNOWN, Courier.fromCompanyName("  "))
+    }
+
+    @Test
+    fun `简称与识别关键字共用一份定义`() {
+        // byCompanyKeyword 由 shortName 派生，这条钉住两者不漂：每个公司的简称都能认回自己
+        for (courier in Courier.entries.filter { it != Courier.UNKNOWN }) {
+            assertEquals(
+                "简称 ${courier.shortName} 认不回 ${courier.name}",
+                courier,
+                Courier.fromCompanyName(courier.shortName),
+            )
+        }
+    }
+
+    @Test
+    fun `三级判定：中文名优先于代码`() {
+        // 宿主两边都给了且互相矛盾时，以中文名为准 —— 它是宿主直接显示在自己卡片上的那个
+        assertEquals(Courier.EMS, Courier.resolve("邮政快递包裹", "ZTO", "79030000000009"))
+    }
+
+    @Test
+    fun `三级判定：中文名认不出还能退回代码`() {
+        // 这条是防回归用的：以前写成 `fromCompanyName(n) ?: fromPartnerCode(c)`，
+        // 而 fromCompanyName 认不出时返回的是 UNKNOWN（非空），`?:` 直接把后两级跳过了 ——
+        // 「宿主没给中文名」的记录会一个都认不出来。
+        assertEquals(Courier.ZHONGTONG, Courier.resolve(null, "ZTO", "79030000000009"))
+        assertEquals(Courier.ZHONGTONG, Courier.resolve("", "ZTO", "79030000000009"))
+        assertEquals(Courier.EMS, Courier.resolve("未知物流", "POSTB", "9823000000004"))
+    }
+
+    @Test
+    fun `三级判定：代码认不出退回运单号前缀`() {
+        assertEquals(Courier.JITU, Courier.resolve(null, "HTKY", "JT3100000000000"))
+    }
+
+    @Test
+    fun `三级判定：三条都没有才是 UNKNOWN`() {
+        assertEquals(Courier.UNKNOWN, Courier.resolve(null, null, "9823000000004"))
+        assertEquals(Courier.UNKNOWN, Courier.resolve(null, null, null))
+    }
 }
 
 class ExpressStatusTest {
