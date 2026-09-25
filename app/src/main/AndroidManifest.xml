@@ -1,0 +1,77 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <!--
+      miuix-blur 把 minSdk 声明成 33（RuntimeShader 需要 Android 13）。库内所有效果路径都有
+      isRuntimeShaderSupported()（SDK_INT >= 33）运行时门禁，低版本设备只是没有效果、不会崩；
+      模块自己的调用侧同样先查这个开关再挂玻璃层，所以放行合并。
+    -->
+    <uses-sdk tools:overrideLibrary="top.yukonga.miuix.kmp.blur" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 模块常驻后台接收 system_server 投来的拦截事件，靠前台服务保活。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <queries>
+        <package android:name="com.cainiao.wireless" />
+        <package android:name="com.xunmeng.pinduoduo" />
+        <package android:name="com.taobao.taobao" />
+    </queries>
+
+    <application
+        android:name=".ExpressApplication"
+        android:allowBackup="false"
+        android:description="@string/module_description"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/module_name"
+        android:theme="@style/AppTheme">
+
+        <!--
+          LSPosed Manager 的模块识别靠这四个 meta-data。API 102 实际生效的模块元数据在
+          META-INF/xposed/module.prop（minApiVersion / targetApiVersion / staticScope），
+          这里这份是给 Manager 界面显示用的，两者必须一致。
+        -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:resource="@string/module_description" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="102" />
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/xposed_scope" />
+
+        <!-- 模块自己的主界面。也是让模块脱离 stopped 状态的入口 —— stopped 应用的广播收不到，
+             而拦截事件的投递正是靠广播。 -->
+        <activity
+            android:name=".ui.ExpressMainActivity"
+            android:enabled="true"
+            android:exported="true"
+            android:label="@string/module_name"
+            android:theme="@style/ModuleTheme">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          接收 system_server 投来的拦截事件。exported=true 是必需的：投递方是 system_server
+          （system uid），不是本应用。安全性由「显式组件 + 私有 action」保证 —— 别的应用虽然
+          也能发这个广播，但最多只能让模块多发一条快递通知，不涉及任何敏感数据读取。
+
+          没有 intent-filter：投递方用 setClassName 显式寻址（见 ExpressRelaySender）。
+          隐式广播在 Android 8+ 受限，且我们本来就知道目标是谁。
+        -->
+        <receiver
+            android:name=".relay.ExpressRelayReceiver"
+            android:enabled="true"
+            android:exported="true" />
+    </application>
+</manifest>

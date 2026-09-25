@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  模块作用域。LSPosed Manager 读这份做勾选界面；META-INF/xposed/scope.list 是 API 102
+  的实际生效清单（staticScope=true 时以它为准）。两处必须一致。
+
+  system 是 libxposed 约定的虚拟包名，代表 system_server —— 全局通知拦截就挂在它里面。
+  它单独列出来是因为风险等级完全不同：system_server 崩溃 = 开机循环，而普通 App 崩溃
+  只影响那个 App。所以：
+  - 阶段 0-1 只挂菜鸟，验证构建链与注入链
+  - 阶段 2 才加 system，且 hook 处于「只观察不拦截」模式（BuildConfig.OBSERVE_ONLY）
+  - 阶段 4 才打开拦截，并且有 Watchdog 熔断兜底
+-->
+<resources>
+    <string-array name="xposed_scope">
+        <item>com.cainiao.wireless</item>
+        <item>system</item>
+    </string-array>
+</resources>
