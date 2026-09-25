@@ -5,6 +5,8 @@ import io.github.YGHFv.ReaPressExtend.core.Courier
 import io.github.YGHFv.ReaPressExtend.core.ExpressEnrichmentMatcher
 import io.github.YGHFv.ReaPressExtend.core.ExpressOrigin
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
+import io.github.YGHFv.ReaPressExtend.core.ExpressStationName
+import io.github.YGHFv.ReaPressExtend.core.ExpressStationRules
 import io.github.YGHFv.ReaPressExtend.core.ExpressStatus
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
 import org.json.JSONArray
@@ -435,6 +437,13 @@ data class ExpressHomeSection(
 
 /** 一个取件地点下的包裹。 */
 data class ExpressStationGroup(
+    /**
+     * 驿站名，**已经过 [ExpressStationName] 归一化**：品牌前缀（`菜鸟驿站`）、外层括号、
+     * 空白都被剥掉了，而且取的是同类写法里最长的那个（详见 [ExpressHomeGrouper.groupByStation]）。
+     *
+     * 所以 UI 拿来直接显示即可，不用再处理一遍 —— 这里存的就是「用户该看到的那个名字」。
+     * 空名归到 [ExpressHomeGrouper.UNKNOWN_STATION]。
+     */
     val station: String,
     /**
      * 该地点的取件候选，**顺序有意义**：还没取的在前、已确认取件的在后，
@@ -442,6 +451,32 @@ data class ExpressStationGroup(
      */
     val records: List<ExpressRecord>,
 )
+
+/**
+ * 「驿站管理」页列出来的一行 —— 一个驿站当前的样子。
+ *
+ * 和 [ExpressStationGroup] 的区别：那个是**首页卡片**（只装待取件、已经分好组），
+ * 这个是**管理用的条目**（装件数、原始写法、有没有被改过）。两者共用同一套归一化规则，
+ * 但用途不同，所以不强行合并成一个类型。
+ */
+data class ExpressStationSummary(
+    /**
+     * 规则表的键 —— [ExpressStationRules.renames] 用的就是这个字符串。
+     * 也是这站所有记录「代表了它们」的那个归一化名。
+     */
+    val key: String,
+    /** 当前该显示的名字（用户的规则生效之后）。没改过时等于 [key]。 */
+    val displayName: String,
+    /** 这站出现过的**原始**写法（归一化之前，去重）。界面拿它告诉用户「这些写法被认为是一处」。 */
+    val rawNames: List<String>,
+    /** 这个驿站名下的记录（不分状态）。详情页拿它列出「这站是哪几件」。 */
+    val records: List<ExpressRecord>,
+    /** 用户手工改过名 / 合并过。界面据此决定要不要显示「恢复默认」。 */
+    val renamed: Boolean,
+) {
+    /** 这个驿站名下有多少条记录。 */
+    val count: Int get() = records.size
+}
 
 /**
  * 按首页需要的方式把记录分组。纯函数，可单测。
@@ -475,20 +510,31 @@ object ExpressHomeGrouper {
         ExpressStatus.FAILED,
     )
 
-    fun group(records: List<ExpressRecord>): List<ExpressHomeSection> {
+    /**
+     * @param rules 用户在「驿站管理」里做的合并 / 改名。默认空规则 = 只靠自动归一化分组，
+     *   这也是单测里最常传的那一种。
+     */
+    fun group(
+        records: List<ExpressRecord>,
+        rules: ExpressStationRules = ExpressStationRules.EMPTY,
+    ): List<ExpressHomeSection> {
         val sections = mutableListOf<ExpressHomeSection>()
 
         val pickup = records.filter { it.status in PICKUP_STATUSES }
+        // 身份表按**全部**取件候选算一次，下面三处（整站确认 / 分组 / 落档）共用同一份。
+        // 分开算会出岔子：pending 是 pickup 的子集，各自聚类可能选出不同的代表名，
+        // 于是「已确认的地点」和「待确认的记录」对不上号，该移出待取件的卡片会留在原地。
+        val ids = stationIdentities(pickup)
         // 「整站取完」的地点整批移出待取件。注意这里只是**把它从这一档里摘掉**，
         // 记录本身留在存储里（并在下面进「已签收 / 异常」）—— 删除数据不该由一次双击决定。
-        val confirmed = confirmedStations(pickup)
-        val pending = pickup.filterNot { stationKey(it) in confirmed }
+        val confirmed = confirmedStations(pickup, ids, rules)
+        val pending = pickup.filterNot { stationIdOf(it, ids, rules) in confirmed }
         if (pending.isNotEmpty()) {
             sections += ExpressHomeSection(
                 title = "到站包裹",
                 // 注意传的是 pending 的全量（含「已标记但本地点还没取完」的那几件）：
                 // 它们仍要显示在这张卡片上，只是沉到下面、变灰。
-                stationGroups = groupByStation(pending),
+                stationGroups = groupByStation(pending, ids, rules),
             )
         }
 
@@ -509,13 +555,50 @@ object ExpressHomeGrouper {
         // 等宿主推来「已签收」，它会自然留在这里；拿它当一条「已取」的凭据也不错。
         val done = records.filter {
             it.status in DONE_STATUSES ||
-                (it.status in PICKUP_STATUSES && stationKey(it) in confirmed)
+                (it.status in PICKUP_STATUSES && stationIdOf(it, ids, rules) in confirmed)
         }
         if (done.isNotEmpty()) {
             sections += ExpressHomeSection(title = "已签收 / 异常", records = done)
         }
 
         return sections
+    }
+
+    /**
+     * 列出记录里出现过的驿站，供「驿站管理」页展示。
+     *
+     * 跟 [group] 用的是同一套归一化 + 聚类：界面上列出来的驿站，和首页卡片上的驿站，
+     * 保证是同一批 —— 两边各算一次的话，用户会在管理页看到首页上不存在的条目。
+     *
+     * 返回的 [ExpressStationSummary.key] 就是 [ExpressStationRules.renames] 的键，
+     * 界面显示什么名字、规则表用什么键，是同一个字符串，中间不做转换。
+     *
+     * **不筛状态**：管理页要能管到所有驿站（包括只有已签收包裹的那些）—— 用户想合并
+     * 两个名字，不该因为其中一个暂时没有待取件就找不到入口。
+     */
+    fun stations(
+        records: List<ExpressRecord>,
+        rules: ExpressStationRules = ExpressStationRules.EMPTY,
+    ): List<ExpressStationSummary> {
+        val ids = stationIdentities(records)
+        val byKey = LinkedHashMap<String, MutableList<ExpressRecord>>()
+        for (record in records) {
+            val key = normalizedKey(record)
+            byKey.getOrPut(ids[key] ?: key) { mutableListOf() } += record
+        }
+        return byKey
+            .map { (key, items) ->
+                ExpressStationSummary(
+                    key = key,
+                    displayName = rules.apply(key),
+                    // 归一化**之前**的原始写法：用户要在这行里认出「哦，这两个名字原来是同一处」。
+                    rawNames = items.mapNotNull { it.station?.takeIf(String::isNotBlank) }.distinct(),
+                    records = items,
+                    renamed = rules.hasRule(key),
+                )
+            }
+            // 有名字的驿站排前面，未知的垫底 —— 和首页卡片同一个顺序。
+            .sortedWith(compareBy({ it.key == UNKNOWN_STATION }, { it.displayName }))
     }
 
     /**
@@ -533,9 +616,16 @@ object ExpressHomeGrouper {
      *
      * 「全站」只拿**取件候选**算，不看已签收的历史记录 —— 否则一件半年前签收的旧记录会让
      * 这个地点永远凑不满，用户就再也移不掉它了。
+     *
+     * 判定用的是驿站**身份**（[ExpressStationName]）而不是名字字符串：同一个驿站的两种写法
+     * 得算一站，否则同一处的包裹会被拆成两批，两边都凑不满，用户永远移不掉它们。
      */
-    private fun confirmedStations(pickup: List<ExpressRecord>): Set<String> =
-        pickup.groupBy { stationKey(it) }
+    private fun confirmedStations(
+        pickup: List<ExpressRecord>,
+        ids: Map<String, String>,
+        rules: ExpressStationRules,
+    ): Set<String> =
+        pickup.groupBy { stationIdOf(it, ids, rules) }
             .filterValues { items -> items.all { it.isPickedUp } }
             .keys
 
@@ -544,12 +634,24 @@ object ExpressHomeGrouper {
      *
      * 没有驿站信息的归到「未知取件地点」而不是丢弃 —— 通知里没写驿站名不代表这个包裹不存在，
      * 用户至少能看到取件码。
+     *
+     * 分组键是驿站**身份**而不是名字字符串，理由见 [ExpressStationName]：同一个驿站的简称
+     * 和带楼栋号的全名必须落在同一张卡上。
      */
-    private fun groupByStation(records: List<ExpressRecord>): List<ExpressStationGroup> =
-        records
-            .groupBy { stationKey(it) }
+    private fun groupByStation(
+        records: List<ExpressRecord>,
+        ids: Map<String, String>,
+        rules: ExpressStationRules,
+    ): List<ExpressStationGroup> {
+        // 自己攒 LinkedHashMap 而不是 records.groupBy：分组键要先过身份表，groupBy 塞不进这一步。
+        val grouped = LinkedHashMap<String, MutableList<ExpressRecord>>()
+        for (record in records) {
+            grouped.getOrPut(stationIdOf(record, ids, rules)) { mutableListOf() } += record
+        }
+        return grouped
             .map { (station, items) ->
                 ExpressStationGroup(
+                    // 存的是**归一化后的代表名**（最长的那种写法），UI 直接显示，不用再剥一次。
                     station = station,
                     // 两条排序规则叠在一起：
                     // ① **还没取的排前面**。用户来这一屏是去取件的，视线该先落到要拿的那几件上；
@@ -563,10 +665,44 @@ object ExpressHomeGrouper {
             }
             // 有名字的驿站排前面，未知的垫底。
             .sortedWith(compareBy({ it.station == UNKNOWN_STATION }, { it.station }))
+    }
 
-    /** 分组键。空 / 空白驿站名一律归到 [UNKNOWN_STATION]。 */
-    private fun stationKey(record: ExpressRecord): String =
-        record.station?.takeIf { it.isNotBlank() } ?: UNKNOWN_STATION
+    /**
+     * 归一化后的驿站名（**不含**用户规则）。空名（只有空白、或整个名字就是品牌）
+     * 一律归到 [UNKNOWN_STATION]。
+     */
+    private fun normalizedKey(record: ExpressRecord): String =
+        ExpressStationName.normalize(record.station).ifEmpty { UNKNOWN_STATION }
+
+    /**
+     * 一条记录所属的驿站身份。
+     *
+     * 两步，顺序不能换：**先聚类成代表名，再套用户的合并 / 改名规则**。
+     *
+     * 规则必须作用在**代表名**上，因为用户是在界面上看着代表名操作的 —— 界面显示哪个名字、
+     * 规则表用哪个键，是同一个字符串。反过来（规则作用在每条记录自己的归一化名上）会出岔子：
+     * 一组里有「阳光花园菜拼多多驿站」和「阳光23号楼109阳光花园菜拼多多驿站」两个写法时，
+     * 用户只改了一次名字，却只改中其中一个 —— 组当场裂回两张卡，看起来就像改名没生效。
+     */
+    private fun stationIdOf(
+        record: ExpressRecord,
+        ids: Map<String, String>,
+        rules: ExpressStationRules,
+    ): String {
+        val key = normalizedKey(record)
+        return rules.apply(ids[key] ?: key)
+    }
+
+    /**
+     * 身份表：归一化名 → 代表名。同一个驿站的几种写法在这里折叠成同一个代表。
+     *
+     * 用户规则**不参与**这一步 —— 聚类只认字符串本身的相似性，规则是聚类之后套上去的
+     * （理由见 [stationIdOf]）。
+     *
+     * 只算到站候选（调用方传的就是 pickup）—— 分组只发生在这一档，别处不需要。
+     */
+    private fun stationIdentities(records: List<ExpressRecord>): Map<String, String> =
+        ExpressStationName.representatives(records.map { normalizedKey(it) }.toSet())
 
     const val UNKNOWN_STATION = "未知取件地点"
 }

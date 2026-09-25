@@ -61,7 +61,7 @@ object ExpressFormatter {
     }
 
     /**
-     * 「已入站 N 天」。**按自然日差算，不是 24 小时整除。**
+     * 在站时长：「N 天」。**按自然日差算，不是 24 小时整除。**
      *
      * 这条口径是照菜鸟定的（2026-09-26 实测）：一件 09-24 18:21 到站的包裹，
      * 09-26 03:30 打开时菜鸟显示「已入站2天」，而 24 小时制只会算出 1 天。
@@ -69,14 +69,19 @@ object ExpressFormatter {
      * 不是「够不够 24 小时」—— 照 24 小时算，同一件包裹会在到站 24 小时后
      * 突然从「今天」跳成「1天」，那个跳变点跟用户感知的「过了一天」对不上。
      *
+     * **不带「已入站」三个字**：它挂在到站包裹分组的卡片上，抬头已经说了这批件的状态，
+     * 每行再重复一遍只是把右列第一行撑长（那行还要放公司名和运单号）。剩下的「2天」
+     * 才是用户判断「要不要现在跑一趟」的依据。
+     *
      * `now` 由调用方注入 —— core 层不碰系统时钟，这条规则才能单测。
      * [zone] 给默认值是因为它属于「运行环境」而不是「时间」：同一条记录在两个时区
      * 可能差一天，而用户看的是自己手机上的日历。
      *
      * **只对到站件用**：`arrivalAt` 取的是宿主物流记录里「最后一次状态变更时间」，
-     * 对运输中的件说「已入站」是错的。调用方要先看 [ExpressRecord.status]。
+     * 对运输中的件算这个数是错的。调用方要先看 [ExpressRecord.status]。
      *
-     * 不足一天说「今天入站」而不是「已入站0天」：后者读起来像出错。
+     * 不足一天只说「今天」：`0天` 读起来像出错，而「今天」在中文里本来就是
+     * 「今天到的」这个意思。
      */
     fun inStationLabel(
         arrivalAt: Long,
@@ -87,8 +92,55 @@ object ExpressFormatter {
             Instant.ofEpochMilli(arrivalAt).atZone(zone).toLocalDate(),
             Instant.ofEpochMilli(now).atZone(zone).toLocalDate(),
         )
-        // days <= 0 只可能来自时钟回拨或宿主给错时间，按「刚发生」处理，不显示「已入站-1天」。
-        return if (days <= 0L) "今天入站" else "已入站${days}天"
+        // days <= 0 只可能来自时钟回拨或宿主给错时间，按「刚发生」处理，不显示「-1天」。
+        return if (days <= 0L) "今天" else "${days}天"
+    }
+
+    /**
+     * 驿站营业时间：把宿主的中文长写法压成「9:00-21:00」。
+     *
+     * 实测菜鸟 8.11.923 的 `packageStation.officeTime` 形如
+     * 「周一至周日09点00分到21点00分」。它挂在驿站名后面（11sp 小字），原样贴上去
+     * 会把抬头那一行挤到折行；而卡片真正要回答的是「现在去还是明天去」，也就是
+     * 几个钟点而已。
+     *
+     * 规则：
+     * - 「周一至周日」「每天」这类**全周**前缀丢掉 —— 它是绝大多数驿站的默认值，
+     *   对用户零决策价值；
+     * - 前缀**不是**全周时保留（`周一至周五` 丢掉就变成误导：用户周末白跑一趟），
+     *   与时间之间用 `·` 隔开；
+     * - 钟点统一成 `H:mm`（小时去前导零、分钟补零）—— 这是用户指定的口径；
+     * - 抓到 4 个钟点按「上午段、下午段」两段输出（`9:00-12:00，14:00-21:00`），
+     *   有午休的驿站不会被截掉后半段。
+     *
+     * 解析不出成对的钟点就**原样返回**：宁可难看，也不能把信息弄丢或者编出一个
+     * 不存在的营业时间。
+     */
+    fun stationHoursLabel(raw: String?): String? {
+        val text = raw?.trim().orEmpty()
+        if (text.isEmpty()) return null
+        val times = STATION_TIME.findAll(text).take(4).toList()
+        // 奇数个钟点说不清怎么配对（要么宿主给了半句话，要么我们的正则太宽），退回原文。
+        if (times.size < 2 || times.size % 2 != 0) return text
+        val ranges = times.chunked(2).joinToString("，") { "${clockOf(it[0])}-${clockOf(it[1])}" }
+        val prefix = text.substring(0, times.first().range.first).trimEnd(*PREFIX_TRIM)
+        return if (prefix.isEmpty() || FULL_WEEK.containsMatchIn(prefix)) ranges else "$prefix · $ranges"
+    }
+
+    /** 宿主营业时间里的一个钟点：`09点00分` / `9:00` / `21点` 都认。 */
+    private val STATION_TIME = Regex("""(\d{1,2})\s*[:：点时]\s*(\d{1,2})?\s*分?""")
+
+    /** 前缀与时间之间的残留标点，如「周一至周五，09:00-18:00」里的逗号。 */
+    private val PREFIX_TRIM = charArrayOf(' ', '，', ',', '、', '：', ':', '至', '-', '~', '到')
+
+    /** 「全周」表述：这些前缀丢掉不损失信息，因为它们等于「没限制」。 */
+    private val FULL_WEEK = Regex("""(每[天日]|全周|一周[七7]天|每?周[一1]\s*[至\-~到]\s*周[日天七])""")
+
+    /** 把正则命中的钟点写成 `H:mm`；分钟缺省按 0 算（`09点` = 9:00）。 */
+    private fun clockOf(match: MatchResult): String {
+        val hour = match.groupValues[1].toIntOrNull() ?: return match.value
+        val minute = match.groupValues[2].toIntOrNull() ?: 0
+        return "$hour:${minute.toString().padStart(2, '0')}"
     }
 
     /**

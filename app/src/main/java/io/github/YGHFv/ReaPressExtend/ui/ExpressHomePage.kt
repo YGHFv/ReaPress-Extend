@@ -20,6 +20,7 @@ import androidx.compose.ui.unit.sp
 import io.github.YGHFv.ReaPressExtend.core.Courier
 import io.github.YGHFv.ReaPressExtend.core.ExpressFormatter
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
+import io.github.YGHFv.ReaPressExtend.core.ExpressStationRules
 import io.github.YGHFv.ReaPressExtend.core.ExpressStatus
 import io.github.YGHFv.ReaPressExtend.notification.ExpressHomeGrouper
 import io.github.YGHFv.ReaPressExtend.notification.ExpressHomeSection
@@ -36,19 +37,25 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  * 聚合这件事的意义在于：同一个驿站常有多个包裹，分开列会让用户在一个驿站和另一个驿站之间
  * 来回找；聚在一起则「去一趟驿站，这几件一起拿」。
  *
+ * @param rules 用户在「驿站管理」里做的合并 / 改名。分组时要它，否则同一个驿站的两种写法
+ *   会显示成两张卡 —— 也就等于那一页白做了。
  * @param onTogglePickup 双击卡片切换「已取件」（确认 / 撤销）。**传 null 表示这个功能关着** ——
  *   不用另开一个布尔参数：手势开不开和回调有没有是同一件事，两个参数能互相矛盾。
  *   关掉它只是**挂不上手势**：已经标记过的记录照旧变灰、照旧参与整站确认、照旧排在后面
  *   （那些标记是存下来的数据，不该因为关掉开关就变个样子）。
  */
 @Composable
-internal fun HomePage(records: List<ExpressRecord>, onTogglePickup: ((ExpressRecord) -> Unit)?) {
+internal fun HomePage(
+    records: List<ExpressRecord>,
+    rules: ExpressStationRules = ExpressStationRules.EMPTY,
+    onTogglePickup: ((ExpressRecord) -> Unit)?,
+) {
     if (records.isEmpty()) {
         EmptyHome()
         return
     }
 
-    val sections = ExpressHomeGrouper.group(records)
+    val sections = ExpressHomeGrouper.group(records, rules)
     // 「已入站2天」这种相对时间需要一个「现在」。在 UI 层取一次再往下传 —— core 层刻意不碰
     // 系统时钟（见 ExpressFormatter.inStationLabel），所以这里是整条链路上唯一的时间来源。
     val now = System.currentTimeMillis()
@@ -115,7 +122,11 @@ private fun StationGroupCard(
         // 营业时间取组里第一条有值的。同一个驿站的所有包裹拿到的是同一份站点数据，
         // 但**逐条找而不是只看第一条**：宿主是按站点下发 officeTime 的，
         // 组内第一件恰好没带、第二件带了的情况不该把整组的营业时间吞掉。
-        val hours = group.records.firstNotNullOfOrNull { it.stationHours?.takeIf(String::isNotBlank) }
+        //
+        // 拿到的是「周一至周日09点00分到21点00分」这种中文长写法，必须过一遍规范化 ——
+        // 它只有 11sp 却是抬头行里最长的一段，原样贴上去直接折行。规则见 stationHoursLabel。
+        val hours = group.records
+            .firstNotNullOfOrNull { ExpressFormatter.stationHoursLabel(it.stationHours) }
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -124,7 +135,10 @@ private fun StationGroupCard(
         ) {
             Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = stationTitle(group.station),
+                    // 直接用分组给的名字：品牌前缀（`菜鸟驿站`）、外层括号、空白已经在
+                    // ExpressStationName 里剥掉了，而且同一个驿站的不同写法也被归到了一起。
+                    // UI 这边再处理一遍只会让两处规则慢慢跑偏。
+                    text = group.station,
                     fontSize = 16.sp,
                     fontWeight = FontWeight(550),
                     color = MiuixTheme.colorScheme.primary,
@@ -195,7 +209,7 @@ private val PICKUP_COLUMN_WIDTH = 124.dp
  * 只有到站件走这套 —— 运输中 / 已签收走 [ParcelCardBody]（上下结构，见那里的注释）。
  *
  * 左列只放「到了驿站要念出来的那串东西」—— 取件码，大号；没有取件码时才退回快递公司名。
- * 右列两行：①快递 + 运单号 + 已入站多久（拿不到到站时间时这一行可能整行不排）②来源 + 物品。
+ * 右列两行：①快递 + 运单号 + 在站多久（拿不到到站时间时这一行可能整行不排）②来源 + 物品。
  *
  * 为什么到站件要分栏：用户在驿站门口看这一屏，视线先落在左列那串码上（念给店员），
  * 确认之后再扫右边「是哪件、放了几天」。原来的上下结构里这两类信息挤在同一列，
@@ -228,10 +242,10 @@ private fun PickupCardBody(
         PickupColumn(record)
         Spacer(Modifier.width(10.dp))
         Column(modifier = Modifier.weight(1f)) {
-            // 第一行：快递 + 运单号，末尾接「已入站N天」。
+            // 第一行：快递 + 运单号，末尾接在站时长（「2天」/「今天」）。
             //
             // 拆成两个 Text 而不是拼成一整串：空间不够时**该被牺牲的是运单号**，
-            // 不是「已入站N天」——后者才是用户判断「要不要现在跑一趟」的依据。
+            // 不是那几个字 —— 后者才是用户判断「要不要现在跑一趟」的依据。
             // 左边那段用 weight(1f, fill = false)，够宽时按内容宽度、不够时才收缩。
             //
             // 两段都可能为空（左列已经占了公司名和运单号时 left 为空；宿主没给到站时间时
@@ -491,7 +505,8 @@ private fun PickupColumn(record: ExpressRecord) {
 }
 
 /**
- * 到站卡片第一行的尾段：「已入站N天」。**拿不到到站时间就整段不显示**（返回 null）。
+ * 到站卡片第一行的尾段：在站时长（`2天` / `今天`）。
+ * **拿不到到站时间就整段不显示**（返回 null）。
  *
  * 原来这里在没有到站时间时退回状态文案 —— 而到站件的状态不是「已到站」就是「待取件」：
  * 前者和分组抬头「到站包裹」重复，后者就是用户明确要求去掉的那个蓝色「待取件」。
@@ -503,8 +518,8 @@ private fun PickupColumn(record: ExpressRecord) {
  * 用次要色而不是状态色：它是背景信息，不是要用户立刻行动的事。
  */
 private fun stationTail(record: ExpressRecord, now: Long): String? {
-    // 这个函数只服务到站卡片，但状态判断留在里面而不是靠调用方保证 —— 说「已入站」
-    // 的前提是这件真的在站里，拿运输中件的「最后一次状态变更时间」说「已入站」是错的。
+    // 这个函数只服务到站卡片，但状态判断留在里面而不是靠调用方保证 —— 算这个数的前提
+    // 是这件真的在站里，拿运输中件的「最后一次状态变更时间」去算会得出一个假的停留天数。
     if (record.status !in STATION_STATUSES) return null
     return record.arrivalAt?.let { ExpressFormatter.inStationLabel(it, now) }
 }
@@ -512,7 +527,7 @@ private fun stationTail(record: ExpressRecord, now: Long): String? {
 /**
  * 驿站名。
  *
- * 原始串形如 `菜鸟驿站(阜阳颍滨花园店)`。抬头已经说明了这是取件地点，
+ * 原始串形如 `菜鸟驿站(临河阳光花园店)`。抬头已经说明了这是取件地点，
  * 去掉「菜鸟驿站」前缀只留门店名，既省横向空间又更易读。
  *
  * 只剥**最外层**那一对括号：门店名本身可能带括号（`菜鸟驿站(A店(东门))`），
@@ -561,10 +576,10 @@ private fun titleShowsTracking(record: ExpressRecord): Boolean =
         !record.trackingNumber.isNullOrBlank()
 
 /**
- * 「已入站N天」只在这两个状态下显示。
+ * 在站时长只在这两个状态下显示。
  *
  * [ExpressRecord.arrivalAt] 取的是宿主物流记录里最后一次状态变更的时间 —— 对到站件，
- * 那一次变更就是「入站」；对运输中的件，那是「离开上一站」，说成入站会把用户引到驿站白跑。
+ * 那一次变更就是「入站」；对运输中的件，那是「离开上一站」，拿它算停留天数会把用户引到驿站白跑。
  */
 private val STATION_STATUSES = setOf(
     ExpressStatus.ARRIVED_STATION,

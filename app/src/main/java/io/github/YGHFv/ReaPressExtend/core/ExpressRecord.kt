@@ -33,8 +33,8 @@ data class ExpressRecord(
      * 一次「到站 / 入站」发生的时间（毫秒）。
      *
      * 取的是宿主物流记录里**最后一次状态变更时间**（到站件的最后一次变更就是入站），
-     * 所以只对 [ExpressStatus.ARRIVED_STATION] / [ExpressStatus.READY_FOR_PICKUP] 有「已入站N天」
-     * 的语义 —— 展示层要先看状态再用它，别对运输中的件说「已入站」。
+     * 所以只对 [ExpressStatus.ARRIVED_STATION] / [ExpressStatus.READY_FOR_PICKUP] 有「在站几天」
+     * 的语义 —— 展示层要先看状态再用它，别拿运输中件的这个时间去算停留天数。
      */
     val arrivalAt: Long? = null,
     /**
@@ -56,10 +56,14 @@ data class ExpressRecord(
      */
     val logisticsDetail: String? = null,
     /**
-     * 驿站营业时间，如「08:00-21:00」。
+     * 驿站营业时间，**原样保留宿主给的那串**，如「周一至周日09点00分到21点00分」。
      *
-     * 宿主 key 是 `packageStation.officeTime`。宿主常常不下发（很多驿站就没填），
-     * 为空表示「不知道」而不是「不营业」—— 展示层整段省略即可。
+     * 宿主 key 是 `packageStation.officeTime`。不在这里做格式化：core 里这个字段是
+     * 「宿主原话」，规范化属于展示层（[ExpressFormatter.stationHoursLabel]），
+     * 免得以后想换写法时历史记录里的数据已经不可逆地改过了。
+     *
+     * 宿主常常不下发（很多驿站就没填），为空表示「不知道」而不是「不营业」——
+     * 展示层整段省略即可。
      */
     val stationHours: String? = null,
     /**
@@ -121,7 +125,7 @@ data class ExpressRecord(
      * 1. **双方都有运单号** → 完全按运单号判。运单号全局唯一，不同就是两件 —— 哪怕取件码
      *    碰巧一样（同一货架格先后放过两件的情况真实存在）。
      * 2. **双方都有取件码** → 按取件码判。**这里刻意不比驿站名**：同一个包裹的多次推送里
-     *    驿站名的详略经常不一致（「菜鸟驿站(合肥南湖春城华韵古筝店)」vs「合肥南湖春城店」），
+     *    驿站名的详略经常不一致（「菜鸟驿站(合肥南湖新城华韵古筝店)」vs「合肥南湖新城店」），
      *    拿驿站名参与比对会把同一个包裹拆成两条，首页上就是两张卡片。
      * 3. 只有一边有运单号/取件码 → 用另一边有的那个比对（情形 1/2 的退化版）。
      * 4. 都没有 → 只能比原文。

@@ -201,18 +201,18 @@ class ExpressDedupeTest {
     @Test
     fun `取件码相同但驿站名详略不同视为同一包裹`() {
         // 真实场景：同一个包裹的两次推送里驿站名一个写全、一个写简
-        // （「菜鸟驿站(合肥南湖春城华韵古筝店)」vs「菜鸟驿站(合肥南湖春城店)」）。
+        // （「菜鸟驿站(合肥南湖新城华韵古筝店)」vs「菜鸟驿站(合肥南湖新城店)」）。
         // 驿站名不参与身份判定，否则首页上会出现两张卡片。
         val dedupe = ExpressDedupe()
         assertTrue(
             dedupe.shouldAccept(
-                record(pickup = "17-5-8644", station = "菜鸟驿站(合肥南湖春城华韵古筝店)"),
+                record(pickup = "17-5-8644", station = "菜鸟驿站(合肥南湖新城华韵古筝店)"),
                 now,
             ),
         )
         assertFalse(
             dedupe.shouldAccept(
-                record(pickup = "17-5-8644", station = "菜鸟驿站(合肥南湖春城店)"),
+                record(pickup = "17-5-8644", station = "菜鸟驿站(合肥南湖新城店)"),
                 now + 1000,
             ),
         )

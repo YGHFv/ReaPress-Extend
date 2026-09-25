@@ -37,9 +37,9 @@ class ExpressHomeGroupTest {
     @Test
     fun `到站包裹按驿站聚合`() {
         val records = listOf(
-            record(pickup = "3-2-4008", station = "菜鸟驿站(阜阳颍滨花园店)", status = ExpressStatus.READY_FOR_PICKUP),
-            record(pickup = "17-5-8644", station = "菜鸟驿站(合肥南湖春城店)", status = ExpressStatus.READY_FOR_PICKUP),
-            record(pickup = "1-6-4011", station = "菜鸟驿站(阜阳颍滨花园店)", status = ExpressStatus.ARRIVED_STATION),
+            record(pickup = "3-2-4008", station = "菜鸟驿站(临河阳光花园店)", status = ExpressStatus.READY_FOR_PICKUP),
+            record(pickup = "17-5-8644", station = "菜鸟驿站(合肥南湖新城店)", status = ExpressStatus.READY_FOR_PICKUP),
+            record(pickup = "1-6-4011", station = "菜鸟驿站(临河阳光花园店)", status = ExpressStatus.ARRIVED_STATION),
         )
         val sections = ExpressHomeGrouper.group(records)
 
@@ -47,7 +47,7 @@ class ExpressHomeGroupTest {
         assertEquals(3, pickupSection.count)
         assertEquals(2, pickupSection.stationGroups.size)
         // 同一个驿站的兩件必须聚在一组
-        val fuyang = pickupSection.stationGroups.first { it.station.contains("阜阳") }
+        val fuyang = pickupSection.stationGroups.first { it.station.contains("临河") }
         assertEquals(2, fuyang.records.size)
     }
 
@@ -132,7 +132,8 @@ class ExpressHomeGroupTest {
             record(pickup = "2", station = "菜鸟驿站(A店)", status = ExpressStatus.READY_FOR_PICKUP),
         )
         val groups = ExpressHomeGrouper.group(records).first().stationGroups
-        assertEquals("菜鸟驿站(A店)", groups.first().station)
+        // 显示的是归一化后的名字：品牌前缀和外层括号在身份判定那一步就剥掉了
+        assertEquals("A店", groups.first().station)
         assertEquals(ExpressHomeGrouper.UNKNOWN_STATION, groups.last().station)
     }
 
@@ -249,6 +250,171 @@ class ExpressHomeGroupTest {
         assertEquals(2, pickup.count)
         // 还标着的那件沉在后面，撤销过的那件回到前面（未取的算「还得拿」）
         assertEquals(listOf("1-1-1111", "2-2-2222"), pickup.stationGroups.single().records.map { it.pickupCode })
+    }
+
+    // ---- 驿站身份：同一个取件地点的不同写法 ----
+
+    @Test
+    fun `同一驿站的两种写法合成一张卡`() {
+        // 真机样本（2026-09-26）：通知里是简称，宿主 packageStation.name 带楼栋号
+        val records = listOf(
+            record(
+                pickup = "1-1-1111",
+                station = "阳光花园菜拼多多驿站",
+                status = ExpressStatus.READY_FOR_PICKUP,
+            ),
+            record(
+                pickup = "2-2-2222",
+                station = "阳光23号楼109阳光花园菜拼多多驿站",
+                status = ExpressStatus.READY_FOR_PICKUP,
+            ),
+        )
+        val pickup = ExpressHomeGrouper.group(records).first { it.title == "到站包裹" }
+
+        assertEquals("同一个地点只该有一张卡", 1, pickup.stationGroups.size)
+        assertEquals(2, pickup.stationGroups.single().records.size)
+        // 显示用信息最全的那个写法（带楼栋号，找起来少问一次人）
+        assertEquals("阳光23号楼109阳光花园菜拼多多驿站", pickup.stationGroups.single().station)
+    }
+
+    @Test
+    fun `品牌前缀与括号不同的写法合成一张卡`() {
+        val records = listOf(
+            record(
+                pickup = "1-1-1111",
+                station = "菜鸟驿站(临河阳光花园店)",
+                status = ExpressStatus.READY_FOR_PICKUP,
+            ),
+            record(pickup = "2-2-2222", station = "临河阳光花园店", status = ExpressStatus.READY_FOR_PICKUP),
+        )
+        val pickup = ExpressHomeGrouper.group(records).first { it.title == "到站包裹" }
+
+        assertEquals(1, pickup.stationGroups.size)
+        assertEquals("临河阳光花园店", pickup.stationGroups.single().station)
+    }
+
+    @Test
+    fun `整站确认跨写法也生效`() {
+        // 两种写法其实是同一站 → 都标记后整批移出，而不是各自卡在待取件里凑不满
+        val records = listOf(
+            record(
+                pickup = "1-1-1111",
+                station = "阳光花园菜拼多多驿站",
+                status = ExpressStatus.READY_FOR_PICKUP,
+            ).copy(pickedUpAt = 1L),
+            record(
+                pickup = "2-2-2222",
+                station = "阳光23号楼109阳光花园菜拼多多驿站",
+                status = ExpressStatus.READY_FOR_PICKUP,
+            ).copy(pickedUpAt = 2L),
+        )
+        val sections = ExpressHomeGrouper.group(records)
+
+        assertTrue(sections.none { it.title == "到站包裹" })
+        assertEquals(2, sections.first { it.title == "已签收 / 异常" }.count)
+    }
+
+    @Test
+    fun `用户规则能把两个名字毫不相干的驿站并成一张卡`() {
+        // 机器认不出来（这两个名字没有任何字符串关系），只有住那儿的人知道是同一处
+        val records = listOf(
+            record(pickup = "1-1-1111", station = "南门驿站", status = ExpressStatus.READY_FOR_PICKUP),
+            record(pickup = "2-2-2222", station = "南门小区代收点", status = ExpressStatus.READY_FOR_PICKUP),
+        )
+        val rules = ExpressStationRules(mapOf("南门驿站" to "南门小区代收点"))
+        val pickup = ExpressHomeGrouper.group(records, rules).first { it.title == "到站包裹" }
+
+        assertEquals(1, pickup.stationGroups.size)
+        assertEquals("南门小区代收点", pickup.stationGroups.single().station)
+    }
+
+    @Test
+    fun `用户规则只换显示名，不动记录里的原始写法`() {
+        val records = listOf(
+            record(
+                pickup = "1-1-1111",
+                station = "菜鸟驿站(临河阳光花园店)",
+                status = ExpressStatus.READY_FOR_PICKUP,
+            ),
+        )
+        val rules = ExpressStationRules(mapOf("临河阳光花园店" to "家门口"))
+        val group = ExpressHomeGrouper.group(records, rules).first().stationGroups.single()
+
+        assertEquals("家门口", group.station)
+        // 原始串留在记录里 —— 这正是「恢复默认」不需要备份任何东西的原因
+        assertEquals("菜鸟驿站(临河阳光花园店)", group.records.single().station)
+    }
+
+    @Test
+    fun `撤销规则后回到原始名字`() {
+        val records = listOf(
+            record(pickup = "1-1-1111", station = "临河阳光花园店", status = ExpressStatus.READY_FOR_PICKUP),
+        )
+        val renamed = ExpressHomeGrouper.group(
+            records,
+            ExpressStationRules(mapOf("临河阳光花园店" to "家门口")),
+        ).first().stationGroups.single().station
+
+        val restored = ExpressHomeGrouper.group(records, ExpressStationRules.EMPTY)
+            .first().stationGroups.single().station
+
+        assertEquals("家门口", renamed)
+        assertEquals("临河阳光花园店", restored)
+    }
+
+    // ---- 驿站管理页的数据源 ----
+
+    @Test
+    fun `stations 列出所有驿站包括已签收的`() {
+        // 管理页要能管到所有驿站：只有已签收包裹的驿站也得在列表里，
+        // 否则用户想合并两个名字时可能找不到其中一方
+        val records = listOf(
+            record(pickup = "1-1-1111", station = "A站", status = ExpressStatus.READY_FOR_PICKUP),
+            record(tracking = "SF1", station = "B站", status = ExpressStatus.SIGNED),
+            record(tracking = "SF2", station = null, status = ExpressStatus.IN_TRANSIT),
+        )
+        val stations = ExpressHomeGrouper.stations(records)
+
+        assertEquals(3, stations.size)
+        // 未知地点垫底，和首页卡片同一个顺序
+        assertEquals(ExpressHomeGrouper.UNKNOWN_STATION, stations.last().key)
+        assertEquals(listOf("A站", "B站"), stations.dropLast(1).map { it.displayName })
+    }
+
+    @Test
+    fun `stations 列出同一驿站的原始写法`() {
+        val records = listOf(
+            record(
+                pickup = "1",
+                station = "菜鸟驿站(临河阳光花园店)",
+                status = ExpressStatus.READY_FOR_PICKUP,
+            ),
+            record(pickup = "2", station = "临河阳光花园店", status = ExpressStatus.READY_FOR_PICKUP),
+        )
+        val station = ExpressHomeGrouper.stations(records).single()
+
+        // key 是规则表的键（归一化后的名字），rawNames 是用户要认出来的那几串原始写法
+        assertEquals("临河阳光花园店", station.key)
+        assertEquals(2, station.count)
+        assertEquals(
+            listOf("菜鸟驿站(临河阳光花园店)", "临河阳光花园店"),
+            station.rawNames,
+        )
+        assertFalse(station.renamed)
+    }
+
+    @Test
+    fun `stations 标出被手工改过的驿站`() {
+        val records = listOf(
+            record(pickup = "1", station = "临河阳光花园店", status = ExpressStatus.READY_FOR_PICKUP),
+        )
+        val station = ExpressHomeGrouper.stations(
+            records,
+            ExpressStationRules(mapOf("临河阳光花园店" to "家门口")),
+        ).single()
+
+        assertEquals("家门口", station.displayName)
+        assertTrue(station.renamed)
     }
 }
 
@@ -408,12 +574,12 @@ class ExpressRecordStoreTest {
         val a = record().copy(
             trackingNumber = null,
             pickupCode = "17-5-8644",
-            station = "菜鸟驿站(合肥南湖春城华韵古筝店)",
+            station = "菜鸟驿站(合肥南湖新城华韵古筝店)",
         )
         val b = record().copy(
             trackingNumber = null,
             pickupCode = "17-5-8644",
-            station = "菜鸟驿站(合肥南湖春城店)",
+            station = "菜鸟驿站(合肥南湖新城店)",
         )
         assertTrue("驿站名不参与身份判定", a.isSamePackageAs(b))
     }
