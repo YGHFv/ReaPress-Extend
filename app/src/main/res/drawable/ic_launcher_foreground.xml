@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  adaptive icon 的 foreground 占位。
+
+  图标本体整个放在 background 里（理由见 `mipmap-anydpi-v26/ic_launcher.xml`），
+  这里必须是**全透明**而不是随便一张图 —— 放任何东西都会在包裹上面再叠一层。
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="#00000000" />
+</shape>

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  API 26+ 的自适应图标。
+
+  同名的 `mipmap-anydpi-v26/ic_launcher.xml` 优先级高于 `mipmap-*/ic_launcher.png`，
+  所以清单里的 `android:icon="@mipmap/ic_launcher"` 一个字都不用改：新系统走这里，
+  老系统（API < 26）继续用那五档 PNG。
+
+## 为什么整张图放在 background 而不是 foreground
+
+用户给的是一张**成品图标**（自带卡片底 + 居中包裹），不是「前景 + 背景」两层的源文件。
+放进 foreground 会被启动器按视差缩放，包裹会随桌面滚动而漂移；放 background 是静止的。
+
+## 为什么不是「铺满」（2026-09-26 修正）
+
+第一版把这张图铺满 108dp 画布，真机装上一看**包裹顶满了整个图标**，明显比旁边的大。
+原因不在图里，在算术：**adaptive 的可见区只有画布中心 72/108**，外面那圈是给各家 mask
+裁切与视差留的余量。原图里包裹本已占卡片的 62%，铺满之后：
+
+    包裹 / 可见区 = 62% × (108 / 72) ≈ 93%
+
+也就是说，原图四周那圈留白**全落在了被裁掉的部分里**。
+
+所以生成时把整张卡片缩到画布的 72%（`CARD_SCALE`）居中放置，四周由同色白底补满：
+包裹于是只占可见区的约 67%，与各家图标的观感一致。复算一遍：
+
+    包裹 / 可见区 = 62% × 0.72 × (108 / 72) ≈ 67%
+
+⚠️ **改这个比例要连着改生成脚本**，直接改这里的数值是没用的 —— 尺寸在 PNG 里。
+
+## 四角为什么不透明
+
+方形 mask 的启动器若拿到透明角，会露出系统底色，看上去像图标缺了一块。
+生成时整张画布铺的就是白底，天然满足。legacy 那五档 PNG 反过来**必须**带圆角：
+API < 26 的启动器不会加 mask，会把整张图连边角一起显示出来。
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@mipmap/ic_launcher_adaptive" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

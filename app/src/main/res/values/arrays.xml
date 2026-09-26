@@ -1,7 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   模块作用域。LSPosed Manager 读这份做勾选界面；META-INF/xposed/scope.list 是 API 102
-  的实际生效清单（staticScope=true 时以它为准）。两处必须一致。
+  的实际生效清单（staticScope=true 时以它为准）。两处必须一致 —— 少写一处，Manager
+  里就会出现「列表里根本没有这个 App 可勾」的情况。
+
+  ## 为什么有淘宝
+
+  菜鸟一旦没绑淘宝账号，它自己的 WebView cookie 库里就**没有 `.taobao.com` 域**
+  （2026-09-26 真机实测坐实），而淘宝 App 里必然有。模块自己发 MTOP 请求要的登录态
+  （现在只剩轨迹那条路 —— 身份码改由菜鸟用自己的会话取，见 `CainiaoIdentityBridge`）
+  就只有淘宝这一头能给，所以淘宝是本模块的第二条凭据来源，不是「顺便加上的富化目标」。
+
+  ## 为什么有拼多多
+
+  用户要求先占位：拼多多的富化（读它自己的包裹列表）还没实现，但作用域先勾上，
+  以后要加 hook 时不必再让用户改一次作用域 + 重启设备。当前它只会打一行
+  `enrichment hook not implemented yet`，见 [io.github.YGHFv.ReaPressExtend.hook.ExpressHookDispatcher]。
+
+  ## system 为什么要单独想
 
   system 是 libxposed 约定的虚拟包名，代表 system_server —— 全局通知拦截就挂在它里面。
   它单独列出来是因为风险等级完全不同：system_server 崩溃 = 开机循环，而普通 App 崩溃
@@ -13,6 +29,8 @@
 <resources>
     <string-array name="xposed_scope">
         <item>com.cainiao.wireless</item>
+        <item>com.taobao.taobao</item>
+        <item>com.xunmeng.pinduoduo</item>
         <item>system</item>
     </string-array>
 </resources>

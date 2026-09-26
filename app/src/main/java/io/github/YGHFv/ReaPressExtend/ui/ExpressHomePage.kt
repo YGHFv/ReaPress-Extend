@@ -27,6 +27,7 @@ import io.github.YGHFv.ReaPressExtend.notification.ExpressHomeGrouper
 import io.github.YGHFv.ReaPressExtend.notification.ExpressHomeSection
 import io.github.YGHFv.ReaPressExtend.notification.ExpressStationGroup
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
@@ -47,6 +48,8 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  * @param onOpenDetail 单击卡片进包裹详情页（看全轨迹 / 驿站完整地址 / 商品图）。
  *   传 null 表示不提供入口 —— 与 [onTogglePickup] 同一种约定，且两者互相独立：
  *   取件开关关掉之后，单击进详情仍然应该可用。
+ * @param onOpenArchive 底部「归档快递」那一行的入口（已签收超过 7 天的记录）。传 null 就整行不排
+ *   —— 与上面两个参数同一种约定。归档件本身**不在这一页**，这一行只是去二级页的入口。
  */
 @Composable
 internal fun HomePage(
@@ -54,37 +57,61 @@ internal fun HomePage(
     rules: ExpressStationRules = ExpressStationRules.EMPTY,
     onTogglePickup: ((ExpressRecord) -> Unit)?,
     onOpenDetail: ((ExpressRecord) -> Unit)? = null,
+    onOpenArchive: (() -> Unit)? = null,
 ) {
     if (records.isEmpty()) {
         EmptyHome()
         return
     }
 
-    val sections = ExpressHomeGrouper.group(records, rules)
+    // 「已入站2天」这种相对时间需要一个「现在」。在 UI 层取一次再往下传 —— core 层刻意不碰
+    // 系统时钟（见 ExpressFormatter.inStationLabel），所以这里是整条链路上唯一的时间来源。
+    //
+    // 它同时决定**归档切分**（超期 7 天的已签收件不在这页显示，见 ExpressHomeGrouper.archive），
+    // 所以必须在下面那次 group() 之前取好 —— 一次计算、两处使用，两边不会差出几毫秒。
+    val now = System.currentTimeMillis()
+    val sections = ExpressHomeGrouper.group(records, rules, now)
     // 驿站显示名表：整页算一次。到站卡片抬头是分组时就带出来的（同一张表），下面那些
     // 平铺卡片（运输中 / 已签收）自己取一次 —— 它们不在分组里，拿不到 group.station。
     //
     // 逐条算不行：每条都要重跑一遍聚类，而且两份结果一旦有出入，同一条记录在两个位置
     // 就会印出两个名字。
     val stationLabels = ExpressHomeGrouper.stationLabels(records, rules)
-    // 「已入站2天」这种相对时间需要一个「现在」。在 UI 层取一次再往下传 —— core 层刻意不碰
-    // 系统时钟（见 ExpressFormatter.inStationLabel），所以这里是整条链路上唯一的时间来源。
-    val now = System.currentTimeMillis()
 
     for (section in sections) {
         GroupTitle("${section.title} · ${section.count}件")
         if (section.stationGroups.isNotEmpty()) {
             for (group in section.stationGroups) {
-                StationGroupCard(group, now, onTogglePickup, onOpenDetail)
+                StationGroupCard(group, rules, now, onTogglePickup, onOpenDetail)
             }
         }
         for (record in section.records) {
             ParcelCard(
                 record = record,
                 stationLabel = ExpressHomeGrouper.stationLabelOf(record, stationLabels),
+                rules = rules,
                 now = now,
                 onTogglePickup = onTogglePickup,
                 onOpenDetail = onOpenDetail,
+            )
+        }
+    }
+
+    // 「归档快递」入口：恒在整页最下面，即使当前一件归档都没有也显示 —— 它同时是**功能说明**
+    // （用户从这里知道「签收超过 7 天的会去哪」，否则那些记录只是悄悄从列表里消失，
+    // 看着像数据丢了）。件数写在副标题上，不用进去就能知道里面有多少。
+    if (onOpenArchive != null) {
+        val archivedCount = ExpressHomeGrouper.archive(records, now).size
+        GroupTitle("归档")
+        SettingsCard {
+            ArrowPreference(
+                title = "归档快递",
+                summary = if (archivedCount == 0) {
+                    "暂无 · 签收超过 7 天会自动移到这里"
+                } else {
+                    "$archivedCount 件 · 签收超过 7 天"
+                },
+                onClick = onOpenArchive,
             )
         }
     }
@@ -130,6 +157,7 @@ private fun EmptyHome() {
 @Composable
 private fun StationGroupCard(
     group: ExpressStationGroup,
+    rules: ExpressStationRules,
     now: Long,
     onTogglePickup: ((ExpressRecord) -> Unit)?,
     onOpenDetail: ((ExpressRecord) -> Unit)?,
@@ -185,13 +213,16 @@ private fun StationGroupCard(
         }
         for ((index, record) in group.records.withIndex()) {
             if (index > 0) RowDivider()
-            PickupCardBody(record, now, onTogglePickup, onOpenDetail)
+            PickupCardBody(record, rules, now, onTogglePickup, onOpenDetail)
         }
     }
 }
 
 /**
  * 不按地点聚合时的单条卡片（运输中、已签收、用户已确认取件移出待取件的）。
+ *
+ * 「归档快递」二级页也用它（[ExpressArchivePage]）：那边同样是平铺、不聚合的一列包裹，
+ * 复用它才能保证归档件和首页上的同一件长得一模一样 —— 归档只是**位置**变了，不是另一种东西。
  *
  * 双击还原只对**已标记过已取件**的记录开放，理由见 [cardTapTarget] 的调用点。
  * 单击进详情则是**所有**卡片都开的 —— 想知道「件现在到底到哪了」的场合，运输中的件
@@ -202,9 +233,10 @@ private fun StationGroupCard(
  *   `record.station`** —— 那是原始串，用户在驿站管理里改的名字对它不生效。
  */
 @Composable
-private fun ParcelCard(
+internal fun ParcelCard(
     record: ExpressRecord,
     stationLabel: String?,
+    rules: ExpressStationRules,
     now: Long,
     onTogglePickup: ((ExpressRecord) -> Unit)?,
     onOpenDetail: ((ExpressRecord) -> Unit)?,
@@ -216,7 +248,7 @@ private fun ParcelCard(
     // 剩下的撤销入口（单件驿站误触一下就直接移档，没有灰态窗口可以退回去）。
     val target = if (record.isPickedUp) onTogglePickup else null
     SettingsCard {
-        ParcelCardBody(record, stationLabel, now, target, onOpenDetail)
+        ParcelCardBody(record, stationLabel, rules, now, target, onOpenDetail)
     }
 }
 
@@ -253,14 +285,19 @@ private val PICKUP_COLUMN_WIDTH = 124.dp
  *
  * @param onOpenDetail 单击进详情。与 [onTogglePickup] 互相独立：取件开关关掉后
  *   单击进详情仍然有效（两件事在 [cardTapTarget] 里各装各的）。
+ * @param rules 驿站规则。卡片上显示的取件码是「记录自己的，缺了用该站默认码」
+ *   （[ExpressHomeGrouper.pickupCodeOf]）—— 所以这里必须先算好再往下传，
+ *   卡片里各段**不能**再直接读 `record.pickupCode`。
  */
 @Composable
 private fun PickupCardBody(
     record: ExpressRecord,
+    rules: ExpressStationRules,
     now: Long,
     onTogglePickup: ((ExpressRecord) -> Unit)?,
     onOpenDetail: ((ExpressRecord) -> Unit)?,
 ) {
+    val pickup = ExpressHomeGrouper.pickupCodeOf(record, rules)
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -273,7 +310,7 @@ private fun PickupCardBody(
     ) {
         // 没有取件码时左列显示公司名 —— 手势照样有效（同一件包裹、同一个动作），
         // 用户不会因为「这件没码」就找不到确认入口。
-        PickupColumn(record)
+        PickupColumn(record, pickup)
         Spacer(Modifier.width(10.dp))
         Column(modifier = Modifier.weight(1f)) {
             // 第一行：快递 + 运单号，末尾接在站时长（「2天」/「今天」）。
@@ -284,7 +321,7 @@ private fun PickupCardBody(
             //
             // 两段都可能为空（左列已经占了公司名和运单号时 left 为空；宿主没给到站时间时
             // tail 为空），**全空就整行不排** —— 否则第二行上面会多出一段说不清来历的空隙。
-            val left = courierLine(record)
+            val left = courierLine(record, pickup)
             val tail = stationTail(record, now)
             if (left.isNotEmpty() || tail != null) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -357,15 +394,19 @@ private fun PickupCardBody(
  * @param onTogglePickup 双击整张卡片撤销「已取件」。**只有已标记过的记录会传非 null**（见
  *   [ParcelCard]）—— 否则每一张运输中的卡片都会变成一个隐藏的双击区。
  * @param onOpenDetail 单击进详情。所有卡片都开。
+ * @param rules 驿站规则。取件码走 [ExpressHomeGrouper.pickupCodeOf]（记录缺码时用该站默认码），
+ *   所以下面几段**不能**再直接读 `record.pickupCode`。
  */
 @Composable
 private fun ParcelCardBody(
     record: ExpressRecord,
     stationLabel: String?,
+    rules: ExpressStationRules,
     now: Long,
     onTogglePickup: ((ExpressRecord) -> Unit)?,
     onOpenDetail: ((ExpressRecord) -> Unit)?,
 ) {
+    val pickup = ExpressHomeGrouper.pickupCodeOf(record, rules)
     Column(
         modifier = Modifier
             // 和到站卡片同一条规矩：手势在 padding 之前，点击区域含整张卡片的留白。
@@ -377,7 +418,7 @@ private fun ParcelCardBody(
             Column(modifier = Modifier.weight(1f)) {
                 // 驿站名一并交给标题行：它和运单号是同一类信息（这一单是哪个、归哪儿），
                 // 单独占一行时卡片白高一截（见 ParcelTitleRow 的注释）。
-                ParcelTitleRow(record, stationLabel)
+                ParcelTitleRow(record, stationLabel, pickup)
             }
             Text(
                 text = transitStatusLabel(record, now),
@@ -389,7 +430,7 @@ private fun ParcelCardBody(
         // 同一档的次要信息，一大一小就分出了本不存在的层级（2026-09-26 用户指出）。
         // 占整行宽后，文本延伸进右上角状态下面那块空白（上面的结构注释）；
         // 超出仍截尾 —— 完整动态在详情页看。
-        parcelSubtitle(record)?.let { subtitle ->
+        parcelSubtitle(record, pickup)?.let { subtitle ->
             Spacer(Modifier.height(4.dp))
             Text(
                 text = subtitle,
@@ -457,21 +498,23 @@ private fun transitStatusLabel(record: ExpressRecord, now: Long): String {
  *
  * @param stationLabel 该显示的驿站名（用户改过名就是改后的名字），未知传 null（整段不排）。
  *   **不是 `record.station`** —— 原始串过不了用户的改名 / 合并规则。
+ * @param pickup 该念出来的取件码（记录自己的，缺了是该站默认码）。调用方先算好 ——
+ *   卡片里不能再读 `record.pickupCode`，否则设了默认码的件会出现「有的位置有码、有的没有」。
  */
 @Composable
-private fun ParcelTitleRow(record: ExpressRecord, stationLabel: String?) {
-    val pickup = record.pickupCode?.takeIf { it.isNotBlank() }
+private fun ParcelTitleRow(record: ExpressRecord, stationLabel: String?, pickup: String?) {
+    val code = pickup?.takeIf { it.isNotBlank() }
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text(
-            text = pickup ?: courierLabel(record),
-            fontSize = if (pickup != null) 24.sp else 17.sp,
-            fontWeight = if (pickup != null) FontWeight(600) else FontWeight(550),
+            text = code ?: courierLabel(record),
+            fontSize = if (code != null) 24.sp else 17.sp,
+            fontWeight = if (code != null) FontWeight(600) else FontWeight(550),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f, fill = false),
         )
         val tracking = record.trackingNumber?.takeIf { it.isNotBlank() }
-        if (tracking != null && !titleShowsTracking(record)) {
+        if (tracking != null && !titleShowsTracking(record, pickup)) {
             Spacer(Modifier.width(6.dp))
             Text(
                 text = tracking,
@@ -518,9 +561,12 @@ private fun ParcelTitleRow(record: ExpressRecord, stationLabel: String?) {
  *
  * 三样都凑不出来时退回原文首行：那是「其他」分组里解析失败的记录，卡片上总得有点什么，
  * 空着比给一句原文更糟。只有原文也没有（理论上不该发生）才返回 null，整行省略。
+ *
+ * @param pickup 该念出来的取件码（见 [ParcelTitleRow]）—— 公司名只在标题没显示它时才补，
+ *   而「标题显不显示公司名」取决于**有没有码**，所以这里必须拿同一个 [pickup] 判断。
  */
-private fun parcelSubtitle(record: ExpressRecord): String? {
-    val courier = if (!record.pickupCode.isNullOrBlank() && record.courier != Courier.UNKNOWN) {
+private fun parcelSubtitle(record: ExpressRecord, pickup: String?): String? {
+    val courier = if (!pickup.isNullOrBlank() && record.courier != Courier.UNKNOWN) {
         record.courier.shortName
     } else {
         null
@@ -590,19 +636,22 @@ private fun Modifier.cardTapTarget(
  * 已确认取件的整列**变灰**（[MiuixTheme.colorScheme.disabledOnSurface]）。用「禁用色」而不是
  * 随手挑一个灰：它本来就表达「这一项已经不用管了」，正是这里的语义；换主题/换深浅色时
  * 也跟着走，不会在夜间主题里糊成一团。
+ *
+ * @param pickup 该念出来的取件码（记录自己的，缺了是该站默认码）——由调用方算好传进来，
+ *   这里**不能**读 `record.pickupCode`：两者不等价，读了就会出现「填了默认码但左列还是公司名」。
  */
 @Composable
-private fun PickupColumn(record: ExpressRecord) {
-    val pickup = record.pickupCode?.takeIf { it.isNotBlank() }
+private fun PickupColumn(record: ExpressRecord, pickup: String?) {
+    val code = pickup?.takeIf { it.isNotBlank() }
     val color = if (record.isPickedUp) {
         MiuixTheme.colorScheme.disabledOnSurface
     } else {
         MiuixTheme.colorScheme.onSurface
     }
     Column(modifier = Modifier.width(PICKUP_COLUMN_WIDTH)) {
-        if (pickup != null) {
+        if (code != null) {
             Text(
-                text = pickup,
+                text = code,
                 fontSize = 26.sp,
                 lineHeight = 29.sp,
                 fontWeight = FontWeight(600),
@@ -689,9 +738,13 @@ private fun courierLabel(record: ExpressRecord): String = when {
  *
  * 用来避免同一个单号在一张卡片上出现两次：主标识位占了它，右列第一行（[courierLine]）
  * 和运输中卡片的标题行（[ParcelTitleRow]）就要让开。
+ *
+ * ⚠️ 判断依据是**最终显示的**取件码（[ExpressHomeGrouper.pickupCodeOf] 的结果），
+ * 不是 `record.pickupCode`：用户给某站填了默认码之后，那站的件在主标识位显示的就是那串码，
+ * 读原始字段会得出「没码」的结论，于是同一张卡上运单号会被排两遍。
  */
-private fun titleShowsTracking(record: ExpressRecord): Boolean =
-    record.pickupCode.isNullOrBlank() &&
+private fun titleShowsTracking(record: ExpressRecord, pickup: String?): Boolean =
+    pickup.isNullOrBlank() &&
         record.courier == Courier.UNKNOWN &&
         !record.trackingNumber.isNullOrBlank()
 
@@ -719,14 +772,17 @@ private val STATION_STATUSES = setOf(
  * 用全号而不是尾号：改成左右分栏后右侧空间还够；用户核对包裹、跟客服报单号时，
  * 尾号不够用（菜鸟首页只给尾号是因为它的卡片横向更挤）。
  * 公司名用简称（`中通` 而不是 `中通快递`）就是为了给全号腾出这两个字的位置。
+ *
+ * @param pickup 最终该显示的取件码（见 [PickupColumn]）——「左列是码还是公司名」取决于它，
+ *   所以内部一律用它判断，不读 `record.pickupCode`。
  */
-private fun courierLine(record: ExpressRecord): String = buildString {
-    val hasPickup = !record.pickupCode.isNullOrBlank()
+private fun courierLine(record: ExpressRecord, pickup: String?): String = buildString {
+    val hasPickup = !pickup.isNullOrBlank()
     // 左列显示公司名 ⟺ 没有取件码且认得出公司，这时它已经承担了公司信息。
     if (hasPickup && record.courier != Courier.UNKNOWN) {
         append(record.courier.shortName)
     }
-    if (!titleShowsTracking(record)) {
+    if (!titleShowsTracking(record, pickup)) {
         record.trackingNumber?.takeIf { it.isNotBlank() }?.let { tracking ->
             if (isNotEmpty()) append(" · ")
             append(tracking)

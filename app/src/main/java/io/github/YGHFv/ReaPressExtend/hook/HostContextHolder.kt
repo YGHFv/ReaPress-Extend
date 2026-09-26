@@ -27,6 +27,18 @@ import io.github.YGHFv.ReaPressExtend.xposed.callbacks.XCallback
  *
  * 两条路互补：装得早就靠 onCreate 捕获，装得晚就靠 currentApplication() 现取。
  *
+ * ## [onReady]：别让「拿不到 context」变成一个静默的分支（2026-09-26 加）
+ *
+ * 上面那两条路只解决了「能取到 context」，没解决「**什么时候**取到」。而有些初始化动作
+ * 必须在 context 到手的那一刻做，晚一步就永远做不成 —— 反向索取通道（轨迹 / 身份码）就是：
+ * 它们的注册点原本只有 `onPackageReady` 那一下，那时 `acquire()` 必然返回 null，
+ * 于是**唯一的重试机会落在宿主查出包裹之后**（`deliver`）。
+ *
+ * 代价在真机上现形了：唤醒销把一个**从没打开过界面**的菜鸟拉起来（用户要的就是不用打开它），
+ * 那个进程不会查包裹 → 索取通道从来没立起来 → 模块发的广播没人接，日志里**连一句错都没有**。
+ * 「沉默」是最难查的故障形态，所以这里把 context 的到达变成一次**回调**：
+ * 谁需要它，就在 [onReady] 上挂一笔，早到晚到都会被执行到（已经拿到就直接同步执行）。
+ *
  * ## 为什么用 `currentApplication()` 而不是 `currentActivityThread().getApplication()`
  *
  * 两者等价，但前者是公开静态方法、一步到位；走 ActivityThread 实例还得先取实例再调方法，
@@ -47,6 +59,45 @@ internal object HostContextHolder {
 
     /** 取不到 context 时只记一次日志，避免刷屏（这个路径会被反复调用）。 */
     @Volatile private var failureLogged = false
+
+    /** [onReady] 挂上来的回调。context 到手时**一次性**全部执行并清空。 */
+    private val readyLock = Any()
+
+    private val readyListeners = mutableListOf<(Context) -> Unit>()
+
+    /**
+     * 注册一个「宿主 Context 可用时执行」的回调。
+     *
+     * - context 已经在了 → **当场同步执行**（调用方不必先自己判断时机）；
+     * - 还没到 → 挂起，等 [publish] 来唤醒。
+     *
+     * ⚠️ 回调**只执行一次**，且可能跑在宿主的任意线程上（`Application#onCreate` 是主线程，
+     * `acquire()` 的调用方可能在工作线程）。所以回调体必须自己保证线程安全，且**不许阻塞**
+     * —— 它是宿主启动路径上的一环。
+     */
+    fun onReady(listener: (Context) -> Unit) {
+        val immediate = synchronized(readyLock) {
+            cached ?: run { readyListeners.add(listener); null }
+        }
+        if (immediate != null) runCatching { listener(immediate) }
+    }
+
+    /**
+     * context 到手了：先落缓存（这样回调里再调 [acquire] 不会递归），再放回调。
+     *
+     * 先取快照再执行：回调里若又 [onReady] 挂新的，不该被这轮吞掉。
+     */
+    private fun publish(context: Context) {
+        cached = context
+        val pending = synchronized(readyLock) {
+            readyListeners.toList().also { readyListeners.clear() }
+        }
+        pending.forEach { listener ->
+            // 回调里的异常只记日志：它是宿主启动路径上的一环，绝不能反向影响宿主。
+            runCatching { listener(context) }
+                .onFailure { XposedBridge.logError("HostContextHolder: onReady listener failed", it) }
+        }
+    }
 
     /**
      * 装 `Application#onCreate` 捕获钩子。
@@ -93,7 +144,8 @@ internal object HostContextHolder {
             }
             return null
         }
-        cached = context
+        // 走 publish 而不是直接赋值：兜底这条路上取到 context，同样要唤醒 [onReady] 的等待者。
+        publish(context)
         return context
     }
 
@@ -104,6 +156,6 @@ internal object HostContextHolder {
      * 那比反射可靠，拿到后让后续调用不必再走兜底路径。
      */
     fun upgrade(context: Context?) {
-        if (context != null) cached = context
+        if (context != null) publish(context)
     }
 }

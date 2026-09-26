@@ -254,9 +254,13 @@ object ExpressFormatter {
      *
      * 只有一样时只显示那一样；两样都没有返回 null（调用方整行省略，不留「商品：null」）。
      * 用 `·` 而不是菜鸟的 `|`：`|` 在正文里偏高，一行出现两次会显得碎。
+     *
+     * 平台侧再过一次 [ExpressPlatform.normalize]：写入 / 读取两个边界已经洗过了，这里是
+     * **排版这一层的兜底** —— 凡是走到这一行的记录，无论它从哪条路来，都不该出现
+     * 「来源：普通收件」这种把收件类型词当平台的情况（它还会把商品名的位置占住）。
      */
     fun goodsSummary(record: ExpressRecord): String? {
-        val platform = record.platform?.takeIf { it.isNotBlank() }
+        val platform = ExpressPlatform.normalize(record.platform)
         val goods = record.goodsName?.takeIf { it.isNotBlank() }
         return when {
             platform != null && goods != null -> "$platform · $goods"

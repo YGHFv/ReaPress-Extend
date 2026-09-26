@@ -7,7 +7,8 @@ import android.content.res.Configuration
 /**
  * 界面偏好。
  *
- * 装两块：**外观**（主题、模糊、底栏形态）与**界面交互行为**（双击取件码确认取件）。
+ * 装两块：**外观**（主题、模糊、底栏形态）与**界面交互行为**（双击取件码确认取件、
+ * 不在系统最近任务里留卡片）。
  * 两者的共同点是**只影响模块自己的界面**，被注入侧（system_server、宿主进程）完全不需要知道 ——
  * 这正是它们和 [io.github.YGHFv.ReaPressExtend.config.ExpressSettings] 的分界线。
  *
@@ -63,6 +64,24 @@ internal class ExpressUiPrefs private constructor(private val prefs: SharedPrefe
         }
 
     /**
+     * 本模块不出现在系统**「最近任务 / 后台」列表**里（划掉后台就彻底退出，不留卡片）。
+     *
+     * **默认关**。理由：这是模块自己的主界面，留在后台能一键切回来是有用的；而隐藏之后
+     * 每次都得从桌面图标重新进，属于「只有明确不想要那张卡片的人才该付的代价」。
+     * 所以做成开关而不是写死在清单里 —— 装完还能改。
+     *
+     * ⚠️ 这里存的只是**意图**。真正生效靠运行时调
+     * `ActivityManager.AppTask#setExcludeFromRecents`（见 `ExpressMainActivity` 里那个方法）：
+     * 清单属性 `android:excludeFromRecents` 和启动期 flag 都是**一次性的**，装完 / 启动完就改不了，
+     * 做不成开关。
+     */
+    var hideFromRecents: Boolean
+        get() = prefs.getBoolean(KEY_HIDE_FROM_RECENTS, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_HIDE_FROM_RECENTS, value).commit()
+        }
+
+    /**
      * 解析当前该用深色还是浅色。
      *
      * 0 跟随系统，1 强制日间，2 强制夜间。
@@ -83,6 +102,7 @@ internal class ExpressUiPrefs private constructor(private val prefs: SharedPrefe
         private const val KEY_FLOATING_NAV_BAR = "themeFloatingNavBar"
         private const val KEY_LIQUID_GLASS = "themeLiquidGlass"
         private const val KEY_DOUBLE_TAP_PICKUP = "doubleTapPickup"
+        private const val KEY_HIDE_FROM_RECENTS = "hideFromRecents"
 
         const val THEME_FOLLOW_SYSTEM = 0
         const val THEME_LIGHT = 1

@@ -58,15 +58,34 @@ object ExpressHookDispatcher {
         when (packageName) {
             CAINIAO -> {
                 // hook 安装失败不能让宿主进程受影响，更不能冒泡到框架的包加载流程上。
-                val ok = runCatching { CainiaoPackageHook.install(classLoader) }.getOrElse { error ->
+                val ok = runCatching {
+                    // 进程名等于包名才是主进程。这个标记只给身份码桥接用：身份码那个模块
+                    // （`identity_code`）活在主进程里，而非主进程既没有它的初始化环境、也无法
+                    // 保证取得到码 —— 但它们同样会收到广播并回一个「取不到」的回执，
+                    // 那会盖掉主进程刚取到的码。所以只在主进程装。
+                    CainiaoPackageHook.install(classLoader, isMainProcess = process == CAINIAO)
+                }.getOrElse { error ->
                     XposedBridge.logError("$packageName: cainiao package hook install threw", error)
                     false
                 }
                 XposedBridge.logAlways("$packageName: cainiao package hook installed=$ok")
             }
-            // 拼多多 / 淘宝的富化还没做。这里刻意只记一行日志、不做任何反射动作 ——
+            TAOBAO -> {
+                // 富化（直接读淘宝自己的包裹列表）还没做，但**凭据采集**要做：
+                // 菜鸟一旦没绑淘宝账号，它的 cookie 库里就没有 `.taobao.com` 域，而淘宝 App 里
+                // 必然有 —— 这是「宿主里没有凭据」时唯一的正路，理由见 [TaobaoCredentialHook]。
+                val ok = runCatching {
+                    // 进程名等于包名才是主进程；非主进程读了也是同一份应用级 dataDir，不必重复。
+                    TaobaoCredentialHook.install(classLoader, isMainProcess = process == TAOBAO)
+                }.getOrElse { error ->
+                    XposedBridge.logError("$packageName: taobao credential hook install threw", error)
+                    false
+                }
+                XposedBridge.logAlways("$packageName: taobao credential hook installed=$ok")
+            }
+            // 拼多多的富化还没做。这里刻意只记一行日志、不做任何反射动作 ——
             // 否则日志看起来像"已经装上了"，真机验证时会白跑一轮。
-            PINDUODUO, TAOBAO ->
+            PINDUODUO ->
                 XposedBridge.logAlways("$packageName: enrichment hook not implemented yet")
             else ->
                 XposedBridge.logAlways("$packageName: no hook registered, ignoring")

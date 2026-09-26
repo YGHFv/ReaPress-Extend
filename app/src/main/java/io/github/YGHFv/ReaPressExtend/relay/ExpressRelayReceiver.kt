@@ -35,11 +35,39 @@ class ExpressRelayReceiver : BroadcastReceiver() {
         val app = context.applicationContext
         // 日志缓冲要绑定落盘位置，否则模块进程的日志重启就丢。
         ModuleLogBuffer.attach(app)
+        // 登录态缓存同理要绑一次：进程重启后内存是空的，得把落盘的那份读回来
+        // （轨迹拉取靠它，见 TraceCookieCache —— 身份码那条路已经不用 cookie 了）。
+        TraceCookieCache.attach(app)
 
         when (intent.action) {
             ExpressRelay.ACTION_DELIVER -> handleDeliver(app, intent)
             ExpressRelay.ACTION_ENRICH -> handleEnrich(app, intent)
             ExpressRelay.ACTION_COOKIE_SYNC -> handleCookieSync(app, intent)
+            // 身份码：菜鸟用**它自己的会话**取来的结果（应答 / 主动推送 / 失败回执三种来路）。
+            // 到这里只需要「翻译成 CainiaoIdentityResult 交给等待方」，界面的等待逻辑在
+            // IdentityCodeFetcher 那一侧。
+            ExpressRelay.ACTION_IDENTITY_SYNC -> IdentityCodeFetcher.submitFromHost(intent)
+            // 宿主自查本地包裹表之后的一句播报。**只记日志**，不碰任何状态 ——
+            // 它是这一环的唯一可读判据（宿主侧 logcat 在 MIUI 上读不出来，
+            // 见 ExpressRelay.ACTION_HOST_QUERY_REPORT 的说明），
+            // 所以哪怕将来觉得这行「没什么用」也别删：删掉之后
+            // 「打开模块到底有没有真的去查」就又回到只能猜的状态了。
+            ExpressRelay.ACTION_HOST_QUERY_REPORT ->
+                intent.getStringExtra(ExpressRelay.EXTRA_HOST_QUERY_REPORT)
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { report ->
+                        ModuleAndroidLog.legacy(LOG_TAG, "host self query: $report")
+                        // 那一批已经全部投递并落库了（自查是同步的，宿主是调用返回之后才发的播报）。
+                        // 首页若是刚打开就渲染的，此刻手里的还是旧快照 —— 叫它重读一遍，
+                        // 否则功能成了用户也看不出来。理由见 ACTION_RECORDS_CHANGED 的注释。
+                        runCatching {
+                            app.sendBroadcast(
+                                Intent(ExpressRelay.ACTION_RECORDS_CHANGED)
+                                    .setPackage(app.packageName),
+                            )
+                        }
+                    }
+                    ?: ModuleAndroidLog.error(LOG_TAG, "host query report with empty payload, dropped")
             WatchdogReporter.ACTION_WATCHDOG_STATUS -> {
                 WatchdogReporter.persistLocally(app, intent)
                 val installed = intent.getBooleanExtra(WatchdogReporter.EXTRA_INSTALLED, false)
@@ -111,16 +139,27 @@ class ExpressRelayReceiver : BroadcastReceiver() {
     /**
      * 宿主同步过来的淘宝登录态 cookie（[ExpressRelay.ACTION_COOKIE_SYNC]）。
      *
-     * 只进内存缓存（[TraceCookieCache]），**不落盘、不打内容日志** —— 它是登录态，
-     * 任何静态留痕都会放大泄露面。extras 为空直接忽略：宿主侧读不到时不会发，
+     * 进内存缓存 + **落模块私有目录**（[TraceCookieStore]，2026-09-26 用户拍板的修订，
+     * 理由见那里的注释）—— **不打内容日志**。extras 为空直接忽略：宿主侧读不到时不会发，
      * 防御性起见这里也拦一道。
+     *
+     * 落定之后**不再广播内部信号**：唯一会等它的地方（身份码弹窗）用短轮询等这一份
+     * （见 `IdentityCodeDialog`）—— 为一个 3 秒的等待引入一条广播契约不值得。
      */
     private fun handleCookieSync(app: Context, intent: Intent) {
         val cookie = intent.getStringExtra(ExpressRelay.EXTRA_COOKIE)?.takeIf { it.isNotBlank() }
         if (cookie == null) {
-            ModuleAndroidLog.error(LOG_TAG, "cookie sync with empty payload, dropped")
+            // 两种「没有 cookie」要分开：
+            //   - 收到**回执**（宿主明确说了原因）→ 记下来。这是「这台设备拉不到轨迹」最常见
+            //     的成因，用户在菜鸟里没登录过淘宝系账号时就是这条；
+            //   - 连回执都没有 → 广播压根没送到（宿主进程不在时系统静默丢弃），这里写不出
+            //     任何日志。**这条链路的沉默本身就是结论**。
+            intent.getStringExtra(ExpressRelay.EXTRA_COOKIE_ERROR)?.takeIf { it.isNotBlank() }
+                ?.let { ModuleAndroidLog.legacy(LOG_TAG, "cookie sync 收到宿主回执：$it") }
+                ?: ModuleAndroidLog.error(LOG_TAG, "cookie sync with empty payload, dropped")
             return
         }
+        TraceCookieCache.attach(app)
         TraceCookieCache.put(
             cookie,
             intent.getStringExtra(ExpressRelay.EXTRA_COOKIE_UA)?.takeIf { it.isNotBlank() },
@@ -162,6 +201,12 @@ class ExpressRelayReceiver : BroadcastReceiver() {
             arrivalAt = intent.getLongExtra(ExpressRelay.EXTRA_ARRIVAL_AT, 0L).takeIf { it > 0L },
             logisticsDetail = intent.getStringExtra(ExpressRelay.EXTRA_LOGISTICS_DETAIL)?.takeIf { it.isNotBlank() },
             stationHours = intent.getStringExtra(ExpressRelay.EXTRA_STATION_HOURS)?.takeIf { it.isNotBlank() },
+            // 坐标用 NaN 传「没有」（见发送端）。NaN 一律当 null —— 它在 `ExpressRecord` 里
+            // 是「没有坐标」的表示法，进了模型就再也分不出「0,0」和「没给」了。
+            stationLat = intent.getDoubleExtra(ExpressRelay.EXTRA_STATION_LAT, Double.NaN)
+                .takeIf { !it.isNaN() },
+            stationLng = intent.getDoubleExtra(ExpressRelay.EXTRA_STATION_LNG, Double.NaN)
+                .takeIf { !it.isNaN() },
             phoneTail = intent.getStringExtra(ExpressRelay.EXTRA_PHONE_TAIL)?.takeIf { it.isNotBlank() },
             stationAddress = intent.getStringExtra(ExpressRelay.EXTRA_STATION_ADDRESS)?.takeIf { it.isNotBlank() },
             goodsImage = intent.getStringExtra(ExpressRelay.EXTRA_GOODS_IMAGE)?.takeIf { it.isNotBlank() },

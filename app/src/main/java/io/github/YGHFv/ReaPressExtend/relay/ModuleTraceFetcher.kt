@@ -7,12 +7,14 @@ import io.github.YGHFv.ReaPressExtend.core.ExpressStatus
 import io.github.YGHFv.ReaPressExtend.hook.CainiaoTraceApi
 import io.github.YGHFv.ReaPressExtend.hook.CainiaoTraceFetcher
 import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
+import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
+import java.util.Collections
 
 /**
  * 模块进程侧的轨迹拉取入口。
  *
  * 轨迹拉取已整体收拢到模块进程（2026-09-26）：cookie 由 hook 侧经 `ACTION_COOKIE_SYNC`
- * 同步进 [TraceCookieCache]（只内存），拉取引擎复用 [CainiaoTraceFetcher]（闸门、串行、
+ * 同步进 [TraceCookieCache]（内存 + 模块私有目录），拉取引擎复用 [CainiaoTraceFetcher]（闸门、串行、
  * 风控退避都在那）。两个进程各自调 [CainiaoTraceFetcher.requestFetch]，互不知晓、互不重复
  * —— 闸门（成功表 / 冷却表）是**进程内**的，但同一次拉取只有一个进程会发起（见下）。
  *
@@ -50,6 +52,26 @@ object ModuleTraceFetcher {
     @Volatile private var riskRestored = false
 
     /**
+     * 诊断：已经记过的那几种「没发起拉取」的原因。
+     *
+     * 三条静默 return 曾经让整条链路不可观测 —— 用户在菜鸟里没登录过淘宝账号时，模块侧
+     * 的表现是「点开详情转几秒、然后显示暂无轨迹」，和「风控退避中」「广播没送到」完全同形。
+     * 加了日志之后这三种才分得开。
+     *
+     * **必须去重**：这些判断在热路径上（[maybeBackstopFetch] 每次富化都过一遍），不去重的话
+     * 一次首页刷新就能把环形缓冲刷满，把真正有用的行挤出去。
+     *
+     * 用 `logAlways` 而非 `log`：模块进程的 INFO 受「简洁日志」开关抑制（默认开），
+     * 而这恰恰是排查时唯一想看的那一段。
+     */
+    private val skipNotes = Collections.synchronizedSet(HashSet<String>())
+
+    private fun noteSkip(reason: String) {
+        if (!skipNotes.add(reason)) return
+        XposedBridge.logAlways("trace 未发起：$reason")
+    }
+
+    /**
      * 把风控退避状态接上持久化（模块进程首次用到拉取时调用）。
      *
      * 没有这一步，退避只活在内存里 —— 模块进程被杀（装新包 / 划掉后台 / 系统回收）就归零，
@@ -74,7 +96,16 @@ object ModuleTraceFetcher {
      *   false 表示本地没有 cookie，调用方应改发 `ACTION_TRACE_REQUEST` 给菜鸟进程兜底。
      */
     fun onDemand(context: Context, tracking: String): Boolean {
-        if (TraceCookieCache.get() == null) return false
+        // 先绑一次缓存：进程重启后内存是空的，得把上次落到模块私有目录的那份登录态读回来。
+        // 没有这一步，「模块重启 → 磁盘里明明有 cookie 却当没有」会一直存在（2026-09-26 修）。
+        TraceCookieCache.attach(context)
+        if (TraceCookieCache.get() == null) {
+            noteSkip("模块手里没有登录态（已回退给菜鸟进程拉；宿主到底有没有登录态，看有没有 cookie sync 回执）")
+            // 顺手向两个宿主各要一次：这一条由调用方转给菜鸟代拉，但**下一次**点开模块就该
+            // 能自己拉了 —— 而凭据可能在淘宝那边（菜鸟没绑淘宝账号时正是如此）。
+            HostCredentialRequester.requestFromHosts(context)
+            return false
+        }
         ensureRiskPersisted(context)
         CainiaoTraceFetcher.requestFetch(
             cookieProvider = { TraceCookieCache.get() },
@@ -94,7 +125,11 @@ object ModuleTraceFetcher {
     fun maybeBackstopFetch(context: Context, record: ExpressRecord) {
         if (record.status !in AUTO_STATUSES) return
         val tracking = record.trackingNumber?.takeIf { it.isNotBlank() } ?: return
-        if (TraceCookieCache.get() == null) return
+        TraceCookieCache.attach(context)
+        if (TraceCookieCache.get() == null) {
+            noteSkip("保底拉取跳过：模块手里没有登录态")
+            return
+        }
         ensureRiskPersisted(context)
         val now = System.currentTimeMillis()
         // 占坑在判断之后：间隔未到直接返回，不更新时刻（否则批内第一条之后的永远没机会）。
@@ -111,7 +146,11 @@ object ModuleTraceFetcher {
     fun maybeAutoFetch(context: Context, record: ExpressRecord) {
         if (record.status !in AUTO_STATUSES) return
         val tracking = record.trackingNumber?.takeIf { it.isNotBlank() } ?: return
-        if (TraceCookieCache.get() == null) return
+        TraceCookieCache.attach(context)
+        if (TraceCookieCache.get() == null) {
+            noteSkip("自动更新跳过：模块手里没有登录态")
+            return
+        }
         ensureRiskPersisted(context)
         CainiaoTraceFetcher.requestFetch(
             cookieProvider = { TraceCookieCache.get() },

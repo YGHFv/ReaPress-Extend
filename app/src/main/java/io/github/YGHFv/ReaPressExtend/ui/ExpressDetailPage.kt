@@ -24,8 +24,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.github.YGHFv.ReaPressExtend.core.Courier
 import io.github.YGHFv.ReaPressExtend.core.ExpressFormatter
+import io.github.YGHFv.ReaPressExtend.core.ExpressPlatform
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
+import io.github.YGHFv.ReaPressExtend.core.ExpressStationRules
 import io.github.YGHFv.ReaPressExtend.core.ExpressTracePoint
+import io.github.YGHFv.ReaPressExtend.notification.ExpressHomeGrouper
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
@@ -79,6 +82,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 internal fun ExpressDetailPage(
     record: ExpressRecord,
     stationLabel: String?,
+    rules: ExpressStationRules,
     isRefreshing: Boolean,
     onRefresh: () -> Unit,
     onBack: () -> Unit,
@@ -125,8 +129,8 @@ internal fun ExpressDetailPage(
                     .padding(top = padding.calculateTopPadding())
                     .padding(vertical = 4.dp),
             ) {
-                PackageSection(record)
-                StationSection(record, stationLabel)
+                PackageSection(record, rules)
+                StationSection(record, stationLabel, rules)
                 TraceSection(record, traceHint)
                 Spacer(Modifier.height(padding.calculateBottomPadding()))
                 Spacer(Modifier.height(4.dp))
@@ -143,7 +147,7 @@ internal fun ExpressDetailPage(
  * 到驿站念的是它，而运单号更多是拿去核对或报客服。
  */
 @Composable
-private fun PackageSection(record: ExpressRecord) {
+private fun PackageSection(record: ExpressRecord, rules: ExpressStationRules) {
     GroupTitle("包裹")
     SettingsCard {
         PackageHeader(record)
@@ -152,9 +156,14 @@ private fun PackageSection(record: ExpressRecord) {
         if (record.courier != Courier.UNKNOWN) {
             InfoRow("快递公司", record.courier.displayName)
         }
-        record.pickupCode?.takeIf { it.isNotBlank() }?.let { InfoRow("取件码", it) }
+        // 与首页卡片同一条来源：记录自己的码优先，缺了用该站的默认码（用户在驿站管理里填的）。
+        // 两处各读一遍 `record.pickupCode` 的话，就会出现「首页有码、详情页没有」的错位。
+        ExpressHomeGrouper.pickupCodeOf(record, rules)?.let { InfoRow("取件码", it) }
         record.phoneTail?.takeIf { it.isNotBlank() }?.let { InfoRow("手机尾号", it) }
-        record.platform?.takeIf { it.isNotBlank() }?.let { InfoRow("来源", it) }
+        // 来源也要过一遍归一化：宿主对非淘包裹给的 `pkgSourceDesc` 是「普通收件」这类
+        // **收件类型词**，不是平台名（见 [ExpressPlatform]）。这一行显示「来源：普通收件」
+        // 等于用一整行说了一件零信息量的事。
+        ExpressPlatform.normalize(record.platform)?.let { InfoRow("来源", it) }
     }
 }
 
@@ -226,9 +235,15 @@ private val GOODS_IMAGE_CORNER = 10.dp
  * 三项都拿不到时整组不排 —— 空组会在页面上留下一句孤零零的抬头。
  */
 @Composable
-private fun StationSection(record: ExpressRecord, stationLabel: String?) {
+private fun StationSection(
+    record: ExpressRecord,
+    stationLabel: String?,
+    rules: ExpressStationRules,
+) {
     val name = stationLabel?.takeIf { it.isNotBlank() }
-    val address = record.stationAddress?.takeIf { it.isNotBlank() }
+    // 宿主给的地址优先，缺了才用用户在驿站管理里填的精确地址 —— 宿主那个是快递公司自己给的，
+    // 比手填的更权威；反过来只在「宿主什么都没有」时才补位（那正是用户填它的原因）。
+    val address = ExpressHomeGrouper.stationAddressOf(record, rules)
     val hours = ExpressFormatter.stationHoursLabel(record.stationHours)
     if (name == null && address == null && hours == null) return
 
