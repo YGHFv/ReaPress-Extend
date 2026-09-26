@@ -52,6 +52,27 @@ object ExpressStationName {
     private const val MIN_SHARED_SUFFIX = 4
 
     /**
+     * 只说了「哪一类地方」、没说是「哪一处」的词。
+     *
+     * 淘宝的通知只写「您购买的宝贝已送达代收点」，抽出来的就是这两个字 —— 它**不是地名**，
+     * 拿它当驿站名会在首页凭空多出一个叫「代收点」的分组，和真正的「颍滨花园驿站」并列，
+     * 用户以为要多跑一趟（2026-09-26 真机现场）。而且它还会**挡住富化的真名**：合并走
+     * 「只填空不覆盖」，占位词非空，宿主给的驿站名就永远进不来（见
+     * [ExpressRecord.mergeEnrichment] 里的让位规则）。
+     *
+     * 只认**整个名字恰好就是这个词**：`南门小区代收点` 带了地名，那是有效地点，不能误伤。
+     */
+    private val PLACEHOLDERS = setOf(
+        "代收点",
+        "快递代收点",
+        "快递点",
+        "快递柜",
+        "自提柜",
+        "智能快递柜",
+        "智能柜",
+    )
+
+    /**
      * 归一化：同一个名字的不同包装在这里被抹平。
      *
      * 空白也一并去掉 —— 它从来不是地名的组成部分，纯粹是两边录入的差异。
@@ -62,6 +83,9 @@ object ExpressStationName {
         // 编译器会去 String 上找 orEmpty（那里没有），是个一眼看不出的坑。
         val original = raw.orEmpty().filterNot { it.isWhitespace() }
         if (original.isEmpty()) return ""
+        // 整个名字就是个「地方类型词」→ 等于没说在哪。返回空串，由调用方归到「未知取件地点」。
+        // 放在剥品牌**之前**：`菜鸟驿站代收点` 剥完也还是占位词，两处都要判。
+        if (original in PLACEHOLDERS) return ""
         var name = original
         // 括号和品牌前缀会互相遮住（`(菜鸟驿站A店)` 是先括号后前缀），剥到不动为止。
         // 3 轮只是防死循环，正常最多两轮。
@@ -71,10 +95,19 @@ object ExpressStationName {
             if (next == name) break
             name = next
         }
+        if (name in PLACEHOLDERS) return ""
         // 整个名字就是品牌（`菜鸟驿站`）时退回原文：那至少还是用户看到的那串字，
         // 而且它确实没告诉我们「哪家店」，不该和别的驿站混为一谈。
         return name.ifEmpty { original }
     }
+
+    /**
+     * 这个串里有没有「地点信息」—— 等价于 [normalize] 之后还剩不剩东西。
+     *
+     * 给「合并两个来源的驿站名」用：通知侧的 `代收点` 没有地点信息，就该把位置让给
+     * 宿主富化给的真名，而不是靠「非空」把它占住（见 [ExpressRecord.mergeEnrichment]）。
+     */
+    fun hasLocation(raw: String?): Boolean = normalize(raw).isNotEmpty()
 
     /**
      * 把一批名字聚成类，返回「名字 → 该类的代表名」（代表名也在返回值里，指向自己）。

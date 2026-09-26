@@ -25,7 +25,12 @@ data class ExpressSettingsSnapshot(
     val confidenceThreshold: Int = ExpressSettingsKeys.DEFAULT_CONFIDENCE_THRESHOLD,
     /** 界面请求复位看门狗熔断。system_server 消费后清回 false（一次性语义）。 */
     val hookForceEnabled: Boolean = false,
+    /** 包裹详情（轨迹）的获取模式：自动更新 / 点击时获取。见 [ExpressSettingsKeys]。 */
+    val traceFetchMode: String = ExpressSettingsKeys.DEFAULT_TRACE_FETCH_MODE,
 ) {
+    /** 是否「自动更新」轨迹（false = 只在点开详情 / 下拉时按需拉）。 */
+    val isTraceAutoFetch: Boolean
+        get() = traceFetchMode == ExpressSettingsKeys.MODE_TRACE_AUTO
     /** 模块是否在工作。关掉时 hook 直接放行，不做判定也不投递。 */
     val isEnabled: Boolean get() = mode != ExpressSettingsKeys.MODE_OFF
 

@@ -144,6 +144,22 @@ class ExpressParserTest {
     }
 
     @Test
+    fun `菜鸟宿主的待发货与已揽件认得出`() {
+        // 这两个是宿主 `logisticsStatusDesc` 的原话（不是通知文案），以前不在状态表里，
+        // 于是这类件在首页掉进「其他」—— 表现就是「状态显示不出来」
+        assertEquals(ExpressStatus.CREATED, ExpressParser.parseStatus("待发货"))
+        assertEquals(ExpressStatus.PICKED_UP, ExpressParser.parseStatus("已揽件"))
+        assertEquals(ExpressStatus.IN_TRANSIT, ExpressParser.parseStatus("已发货"))
+    }
+
+    @Test
+    fun `已揽件与派件中不互相干扰`() {
+        // 只差一个字，顺序或子串判错就会串档
+        assertEquals(ExpressStatus.PICKED_UP, ExpressParser.parseStatus("您的包裹已揽件"))
+        assertEquals(ExpressStatus.DELIVERING, ExpressParser.parseStatus("您的包裹派件中"))
+    }
+
+    @Test
     fun `无状态词返回 UNKNOWN`() {
         assertEquals(ExpressStatus.UNKNOWN, ExpressParser.parseStatus("这是一条普通消息"))
     }
@@ -173,5 +189,15 @@ class ExpressParserTest {
         assertEquals("SF1234567890123", record.trackingNumber)
         assertEquals(Courier.SHUNFENG, record.courier)
         assertEquals(ExpressStatus.DELIVERING, record.status)
+    }
+
+    @Test
+    fun `包裹正在等待揽收判为CREATED`() {
+        // 宿主 lastLogisticDetail 的原话。不收它的话这类件会被 statusDesc 的
+        // 笼统「运输中」抬进错误的档位。
+        assertEquals(ExpressStatus.CREATED, ExpressParser.parseStatus("包裹正在等待揽收"))
+        assertEquals(ExpressStatus.CREATED, ExpressParser.parseStatus("您的快递待揽收"))
+        // 「已揽收」仍是 PICKED_UP，不能被新词截胡
+        assertEquals(ExpressStatus.PICKED_UP, ExpressParser.parseStatus("快件已揽收"))
     }
 }

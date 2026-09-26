@@ -8,6 +8,7 @@ import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
 import io.github.YGHFv.ReaPressExtend.core.ExpressStationName
 import io.github.YGHFv.ReaPressExtend.core.ExpressStationRules
 import io.github.YGHFv.ReaPressExtend.core.ExpressStatus
+import io.github.YGHFv.ReaPressExtend.core.ExpressTraceCodec
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
 import org.json.JSONArray
 import org.json.JSONObject
@@ -78,6 +79,18 @@ object ExpressRecordStore {
      * @return true 表示这条记录改变了存储内容（新增或状态推进）
      */
     fun upsert(context: Context, record: ExpressRecord): Boolean = runCatching {
+        // 准入守卫：连运单号和取件码都没有的东西**不是包裹**，是一条噪音通知 ——
+        // 记进来就是首页上一块「快递包裹 / 未知」的空壳卡片（真机 2026-09-26 的
+        // 「📦 揽件通知」）。判据与理由见 [ExpressRecord.hasIdentity]。
+        // 在存储层挡而不是在发送端挡：relay 契约是「加键可以、改键名 = 破坏兼容」，
+        // 这里的把关对所有来源生效，也不用动跨进程协议。
+        if (!record.hasIdentity) {
+            ModuleAndroidLog.legacy(
+                LOG_TAG,
+                "upsert dropped (no identity): raw=${record.rawText.take(40)}",
+            )
+            return@runCatching false
+        }
         val next = applyUpsert(load(context), record) ?: return@runCatching false
         save(context, next)
         true
@@ -103,6 +116,15 @@ object ExpressRecordStore {
 
         return when {
             record.status.order > existing.status.order -> current.map {
+                if (isSamePackageLoose(it, record)) mergeVersions(it, record) else it
+            }
+            // CREATED 纠正 IN_TRANSIT：宿主的 statusDesc 对未揽收件笼统写「运输中」，先落下
+            // 的 IN_TRANSIT 是笼统值，后来更具体的「等待揽收」行不是乱序回退（取舍见
+            // [ExpressRecord.mergeEnrichment] 里同名特例）。update 守卫若不放行，
+            // mergeVersions 根本没机会执行。
+            record.status == ExpressStatus.CREATED &&
+                existing.status == ExpressStatus.IN_TRANSIT &&
+                record.timestamp >= existing.timestamp -> current.map {
                 if (isSamePackageLoose(it, record)) mergeVersions(it, record) else it
             }
             record.status.order < existing.status.order -> null
@@ -154,6 +176,10 @@ object ExpressRecordStore {
     fun load(context: Context): List<ExpressRecord> =
         runCatching {
             parse(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_RECORDS, null))
+                // 读时顺手清掉历史「无身份」记录：写入侧（[upsert] / [enrich]）的守卫只挡得住
+                // 新数据，挡不住守卫上线前已经躺在 XML 里的那几条。在读的这一层过滤而不另写
+                // 一次性迁移 —— 下一次任何写入都会把过滤结果存回去，历史垃圾自然蒸发。
+                .filter { it.hasIdentity }
                 .sortedByDescending { it.timestamp }
         }.getOrDefault(emptyList())
 
@@ -176,9 +202,14 @@ object ExpressRecordStore {
      *
      * 会，但面很窄。走到「配不上」这一步，说明通知记录里**连这个运单号的尾号都没出现过**
      * （出现过的话 [ExpressEnrichmentMatcher] 直接给 60 分以上、早就配上了），取件码也没对上。
-     * 唯一残留的重复场景是：那条通知压根没写运单号（只有驿站名 + 取件码），两边只能靠驿站名
-     * 拿到 [ExpressEnrichmentMatcher] 的 15 分，不足以确认是不是同一件。这种就真的会多出一张
-     * 卡片 —— 这是**有意的取舍**：宁可重复一张，不可漏掉一件。
+     * 之后分两种：
+     *
+     * - **富化这条自己带了取件码** → 下一次富化到达时，[applyEnrichment] 会拿合并后的记录
+     *   再比一遍，把那条「只有取件码」的通知记录收编掉，重复自动消失。所以这类重复是**一过性**的
+     *   ——2026-09-26 真机现场正是如此：通知 13:20:54 建条，富化 13:21:07 补齐取件码 → 收编。
+     * - **富化这条也没有取件码**（宿主没下发 `authCode`，真机 04:27 那批就是这样）→ 两边各自
+     *   只有一个强标识、且互不相同，**没有任何可比的东西**，只能并存。这是**有意的取舍**：
+     *   宁可重复一张，不可漏掉一件，更不可猜错了把两个包裹并成一个。
      *
      * 反复到达不会重复建。新建之后这条记录自己就带了全号，下一次富化再来时打分是 100，
      * 会走到上面的合并分支（配上但无新信息 → 不打日志直接返回），所以详情页开几次都只留一条。
@@ -192,17 +223,29 @@ object ExpressRecordStore {
      * @return true 表示存储内容确实变了（有字段被补上，或新增了一条）
      */
     fun enrich(context: Context, enrichment: ExpressRecord): Boolean = runCatching {
+        // 与 [upsert] 同一条准入规矩：没有强标识的富化数据既无法可靠匹配（站名信号
+        // 过不了匹配线），配不上时也只能建成又一张空壳卡片 —— 直接丢弃。
+        if (!enrichment.hasIdentity) {
+            ModuleAndroidLog.legacy(
+                LOG_TAG,
+                "enrich dropped (no identity): station=${enrichment.station ?: "-"}",
+            )
+            return@runCatching false
+        }
         val current = load(context)
         val result = applyEnrichment(current, enrichment) ?: return@runCatching false
 
         if (result.matchedIndex >= 0) {
-            val target = current[result.matchedIndex]
+            val target = result.target
             val merged = result.records[result.matchedIndex]
             ModuleAndroidLog.legacy(
                 LOG_TAG,
-                "enriched: tn=${target.trackingNumber} -> ${merged.trackingNumber} " +
+                "enriched: tn=${target?.trackingNumber} -> ${merged.trackingNumber} " +
                     "courier=${merged.courier.displayName} " +
-                    "station=${merged.station ?: "-"} pickup=${merged.pickupCode ?: "-"}",
+                    "station=${merged.station ?: "-"} pickup=${merged.pickupCode ?: "-"}" +
+                    // 收编是「首页少一张重复卡片」的唯一证据，必须看得见：这行出现 = 之前
+                    // 那几条强标识错位的记录已经被并进来了。
+                    if (result.absorbedCount > 0) " absorbed=${result.absorbedCount}" else "",
             )
         } else {
             logEnrichMiss(current, enrichment)
@@ -213,7 +256,8 @@ object ExpressRecordStore {
     }.getOrDefault(false)
 
     /**
-     * [enrich] 的纯逻辑：配得上就合并到命中那条上，配不上就**追加一条**。
+     * [enrich] 的纯逻辑：配得上就合并到命中那条上（**顺带收编**因为强标识错位而单独成条的重复，
+     * 见下方），配不上就**追加一条**。
      *
      * 单独抽出来是因为「该合并还是该新建」是这块唯一容易出错的地方，理由与取舍见 [enrich]；
      * [enrich] 本身只剩读写存储和打日志。
@@ -230,11 +274,54 @@ object ExpressRecordStore {
         val index = ExpressEnrichmentMatcher.indexOfTarget(current, enrichment)
         if (index >= 0) {
             val target = current[index]
-            val merged = target.mergeEnrichment(enrichment)
-            // 配上了但没有新信息（比如详情页被反复打开）：不改存储，让调用方也跳过日志，
-            // 否则每次点开详情页都留一行，真正有价值的那次反而被淹掉。
-            if (merged === target) return null
-            return EnrichResult(current.toMutableList().also { it[index] = merged }, index)
+            var representative = target.mergeEnrichment(enrichment)
+
+            // 这一段是 2026-09-26 真机现场补的，修的是「通知和富化各自成条、首页两张卡」。
+            //
+            // 起因：记录的身份靠**共同的强标识**（运单号 / 取件码）认，而两边常常只剩一个。
+            // 富化第一次到达时宿主可能还没给 `authCode`（真机日志 04:27 那次 pickup/station
+            // 都是 null），于是库里那条只有运单号；13:20 通知到达时只有取件码 —— 两边没有
+            // 任何可比的东西，只能各自成条。13:21 富化补齐取件码，匹配到的**却是自己那条**
+            // （运单号精确 100 分 > 取件码 50 分），通知那条就孤零零留下了。
+            //
+            // 合并让代表记录把两边强标识都拿到了。此时再回头比一次，之前「够不着」的那几条
+            // 现在够得着了（`JT… + 1-1-6004` vs `1-1-6004`）—— 收编掉，重复当场消失。
+            //
+            // 判定用的仍是 [ExpressRecord.isSamePackageAs] 的严格语义（共同标识必须相等，
+            // 冲突的运单号一律不合），所以不会把无关包裹卷进来。
+            val absorbed = mutableListOf<Int>()
+            for ((i, other) in current.withIndex()) {
+                if (i == index) continue
+                if (!representative.isSamePackageAs(other)) continue
+                representative = representative.mergeEnrichment(other)
+                absorbed += i
+            }
+
+            if (absorbed.isEmpty()) {
+                // 配上了但没有新信息（比如详情页被反复打开）：不改存储，让调用方也跳过日志，
+                // 否则每次点开详情页都留一行，真正有价值的那次反而被淹掉。
+                if (representative === target) return null
+                return EnrichResult(
+                    records = current.toMutableList().also { it[index] = representative },
+                    matchedIndex = index,
+                    target = target,
+                )
+            }
+
+            val absorbedSet = absorbed.toHashSet()
+            val next = ArrayList<ExpressRecord>(current.size)
+            var representativeIndex = NO_MATCH
+            for ((i, record) in current.withIndex()) {
+                when {
+                    i == index -> {
+                        representativeIndex = next.size
+                        next += representative
+                    }
+                    i in absorbedSet -> Unit
+                    else -> next += record
+                }
+            }
+            return EnrichResult(next, representativeIndex, target, absorbed.size)
         }
 
         val next = applyUpsert(current, enrichment) ?: return null
@@ -244,8 +331,12 @@ object ExpressRecordStore {
     /** [applyEnrichment] 的结果。 */
     internal data class EnrichResult(
         val records: List<ExpressRecord>,
-        /** 命中的已有记录下标；[NO_MATCH] 表示这条是新建的。 */
+        /** 命中记录在 [records] 里的下标；[NO_MATCH] 表示这条是新建的。 */
         val matchedIndex: Int,
+        /** 命中前的那条记录，只用于日志对比「补了什么」；新建时 null。 */
+        val target: ExpressRecord? = null,
+        /** 这次顺带收编掉的重复条数（合并补上强标识之后才认出来的那几条）。 */
+        val absorbedCount: Int = 0,
     )
 
     /**
@@ -364,6 +455,13 @@ object ExpressRecordStore {
                     put("hours", record.stationHours ?: JSONObject.NULL)
                     // 用户在界面上确认的「已取件」。同样是后加的键，缺失即「没取过」。
                     put("picked", record.pickedUpAt ?: JSONObject.NULL)
+                    // 轨迹接口补出来的三个字段。键名同样取短；**旧 JSON 里没有这些键**，
+                    // parse 侧对缺失一律退回默认值 —— 升级不丢历史记录。
+                    // 轨迹直接存成编码后的字符串（`[["时间","文案"],…]`），
+                    // 编解码只有 ExpressTraceCodec 一处在做。
+                    put("saddr", record.stationAddress ?: JSONObject.NULL)
+                    put("trace", record.trace.takeIf { it.isNotEmpty() }?.let { ExpressTraceCodec.encode(it) } ?: JSONObject.NULL)
+                    put("gimg", record.goodsImage ?: JSONObject.NULL)
                 },
             )
         }
@@ -403,6 +501,11 @@ object ExpressRecordStore {
                     stationHours = obj.optStringOrNull("hours"),
                     // 同上：0 不是合法时间戳，缺键（旧 JSON）就读成「没取过」。
                     pickedUpAt = obj.optLong("picked").takeIf { it > 0L },
+                    // 轨迹接口补出来的字段。旧 JSON 里没有这几个键 ——
+                    // 缺 "trace" 解出空表、缺另两个解出 null，都不会让历史记录读不出来。
+                    stationAddress = obj.optStringOrNull("saddr"),
+                    trace = ExpressTraceCodec.decode(obj.optStringOrNull("trace")),
+                    goodsImage = obj.optStringOrNull("gimg"),
                 )
             }
         }.getOrDefault(emptyList())
@@ -421,15 +524,17 @@ object ExpressRecordStore {
 /**
  * 首页的展示分组。
  *
- * 对齐菜鸟首页的结构：**到站包裹按取件地点聚合**，运输中的平铺在下面。
+ * 对齐菜鸟首页的结构：**到站包裹按取件地点聚合**，在途的平铺在下面。
  * 这个分组不是纯按状态切的 —— 到站/待取件才是用户要去取的东西，所以它们按地点聚合成卡片组，
- * 而运输中的用户只是「知道一下」，平铺即可。
+ * 而在途的（派送中、运输中）用户只是「知道一下」，平铺即可。
+ *
+ * 档位由近到远排列：到站包裹 → 派送中 → 运输中 → 其他 → 已签收 / 异常。
  */
 data class ExpressHomeSection(
     val title: String,
-    /** 该分组下的驿站子分组（到站包裹用）。运输中分组为空，直接看 [records]。 */
+    /** 该分组下的驿站子分组（到站包裹用）。其余分组为空，直接看 [records]。 */
     val stationGroups: List<ExpressStationGroup> = emptyList(),
-    /** 不按驿站聚合的记录（运输中、已签收）。 */
+    /** 不按驿站聚合的记录（派送中、运输中、其他、已签收）。 */
     val records: List<ExpressRecord> = emptyList(),
 ) {
     val count: Int get() = stationGroups.sumOf { it.records.size } + records.size
@@ -497,13 +602,21 @@ object ExpressHomeGrouper {
         ExpressStatus.READY_FOR_PICKUP,
     )
 
-    /** 在途。 */
+    /**
+     * 在途。
+     *
+     * [ExpressStatus.DELIVERING] **不在这里** —— 它自己一档（见 [group]）。
+     * 理由：快递员正在送的件是「今天可能就到」的，用户看这一屏的期待和纯在途件不同
+     * （一个要留意电话，一个只是知道一下）；混在两三十件运输中里等于没显示。
+     */
     private val TRANSIT_STATUSES = setOf(
         ExpressStatus.CREATED,
         ExpressStatus.PICKED_UP,
         ExpressStatus.IN_TRANSIT,
-        ExpressStatus.DELIVERING,
     )
+
+    /** 派送中：单独一档，摆在「运输中」上面。 */
+    private val DELIVERING_STATUSES = setOf(ExpressStatus.DELIVERING)
 
     /** 已结束。 */
     private val DONE_STATUSES = setOf(
@@ -548,9 +661,31 @@ object ExpressHomeGrouper {
             )
         }
 
+        // 派送中排在「运输中」**上面**：越靠上越接近「今天要动手」。档位顺序就是这屏的
+        // 阅读顺序，不用再给 section 加权重字段 —— 排列即语义。
+        val delivering = records.filter { it.status in DELIVERING_STATUSES }
+        if (delivering.isNotEmpty()) {
+            // 抬头直接取状态名：卡片右上角显示的也是这个词，两处各写一份字符串迟早会飘。
+            sections += ExpressHomeSection(
+                title = ExpressStatus.DELIVERING.displayName,
+                records = delivering,
+            )
+        }
+
         val transit = records.filter { it.status in TRANSIT_STATUSES }
         if (transit.isNotEmpty()) {
-            sections += ExpressHomeSection(title = "运输中", records = transit)
+            sections += ExpressHomeSection(
+                title = "运输中",
+                // 组内按**状态推进度**排（已在路上的在前、还没揽收的垫底），同档内再按时间
+                // 新的在前。纯时间序会把「包裹正在等待揽收」插在两件已上路中间 —— 用户扫
+                // 这一档时关心的是「到哪了」，不是一个绝对时间戳（2026-09-26 用户点名的顺序）。
+                // 其他档不这么排：到站档用户看的是取件码，派送中 / 已签收档内本来就没有
+                // 状态分层。
+                records = transit.sortedWith(
+                    compareByDescending<ExpressRecord> { it.status.order }
+                        .thenByDescending { it.timestamp },
+                ),
+            )
         }
 
         // 未知状态的单独一档：可能是解析没抽到状态词，但确实是快递通知。

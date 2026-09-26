@@ -3,6 +3,7 @@ package io.github.YGHFv.ReaPressExtend.core
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -40,6 +41,23 @@ class ExpressClassifierTest {
         // 「订单」「发货」这类词刻意不在关键词表里 —— 否则营销推送会被误拦
         val verdict = classify("您的订单已发货，点击查看详情")
         assertFalse(verdict.isExpress)
+    }
+
+    @Test
+    fun `揽件通知放行不拦截`() {
+        // 刚被快递员收走，离用户还好几天 —— 拦下来只会堆一张几天都不变的卡片。
+        // 注意这条文本本来够分（快递/顺丰/已揽收 → 60 分），是状态规则放的行。
+        val verdict = classify("您的顺丰快递 SF1234567890123 已揽收，点击查看物流")
+        assertFalse(verdict.isExpress)
+        assertEquals(ExpressStatus.PICKED_UP, verdict.ignoredStatus)
+    }
+
+    @Test
+    fun `到站通知不会被揽收规则误伤`() {
+        // 合并文案里两种状态同时出现：状态表有序，先命中的是「取件码」而不是「揽收」
+        val verdict = classify("您的包裹已到站，昨日下午已揽收，取件码 1-1-6004")
+        assertTrue(verdict.isExpress)
+        assertNull(verdict.ignoredStatus)
     }
 
     @Test

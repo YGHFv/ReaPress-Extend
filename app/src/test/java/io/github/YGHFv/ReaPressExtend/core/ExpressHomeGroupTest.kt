@@ -55,7 +55,7 @@ class ExpressHomeGroupTest {
     fun `运输中平铺不按驿站聚合`() {
         val records = listOf(
             record(tracking = "SF001", station = "某驿站", status = ExpressStatus.IN_TRANSIT),
-            record(tracking = "SF002", station = "另一驿站", status = ExpressStatus.DELIVERING),
+            record(tracking = "SF002", station = "另一驿站", status = ExpressStatus.IN_TRANSIT),
         )
         val sections = ExpressHomeGrouper.group(records)
 
@@ -63,6 +63,34 @@ class ExpressHomeGroupTest {
         assertEquals(2, transit.count)
         assertTrue("运输中不该按驿站分组", transit.stationGroups.isEmpty())
         assertEquals(2, transit.records.size)
+    }
+
+    @Test
+    fun `派送中单独成档且排在运输中上面`() {
+        // 快递员正在送的件是「今天可能就到」，混进几十件在途件里等于没显示
+        val records = listOf(
+            record(tracking = "SF001", status = ExpressStatus.IN_TRANSIT),
+            record(tracking = "SF002", status = ExpressStatus.DELIVERING),
+        )
+        val sections = ExpressHomeGrouper.group(records)
+
+        assertEquals(listOf("派送中", "运输中"), sections.map { it.title })
+        assertEquals(1, sections.first().count)
+        assertEquals("SF002", sections.first().records.single().trackingNumber)
+        assertTrue("派送中不该按驿站分组", sections.first().stationGroups.isEmpty())
+    }
+
+    @Test
+    fun `待发货与已揽件归入运输中`() {
+        // 菜鸟宿主的状态名，解析侧补上之后必须真的出现在首页，而不是掉进「其他」
+        val records = listOf(
+            record(tracking = "SF001", status = ExpressParser.parseStatus("待发货")),
+            record(tracking = "SF002", status = ExpressParser.parseStatus("已揽件")),
+        )
+        val sections = ExpressHomeGrouper.group(records)
+
+        assertEquals(listOf("运输中"), sections.map { it.title })
+        assertEquals(2, sections.single().count)
     }
 
     @Test
@@ -109,15 +137,17 @@ class ExpressHomeGroupTest {
     }
 
     @Test
-    fun `分组顺序固定为 到站 运输中 其他 已签收`() {
+    fun `分组顺序固定为 到站 派送中 运输中 其他 已签收`() {
+        // 档位顺序 = 这屏的阅读顺序：越靠上越接近「今天要动手」
         val records = listOf(
             record(tracking = "A", status = ExpressStatus.SIGNED),
             record(tracking = "B", status = ExpressStatus.IN_TRANSIT),
+            record(tracking = "D", status = ExpressStatus.DELIVERING),
             record(pickup = "1", station = "站", status = ExpressStatus.READY_FOR_PICKUP),
             record(tracking = "C", status = ExpressStatus.UNKNOWN),
         )
         val titles = ExpressHomeGrouper.group(records).map { it.title }
-        assertEquals(listOf("到站包裹", "运输中", "其他", "已签收 / 异常"), titles)
+        assertEquals(listOf("到站包裹", "派送中", "运输中", "其他", "已签收 / 异常"), titles)
     }
 
     @Test
@@ -683,5 +713,48 @@ class ExpressRecordStoreTest {
         val a = record().copy(trackingNumber = null, pickupCode = "1-1-1111")
         val b = record().copy(trackingNumber = null, pickupCode = "2-2-2222")
         assertFalse(a.isSamePackageAs(b))
+    }
+
+    @Test
+    fun `运输中档内按状态推进度排_待揽收垫底`() {
+        val records = listOf(
+            record(tracking = "SF001", status = ExpressStatus.CREATED, at = 3000L),
+            record(tracking = "SF002", status = ExpressStatus.IN_TRANSIT, at = 1000L),
+            record(tracking = "SF003", status = ExpressStatus.PICKED_UP, at = 2000L),
+            record(tracking = "SF004", status = ExpressStatus.IN_TRANSIT, at = 4000L),
+        )
+        val transit = ExpressHomeGrouper.group(records).first { it.title == "运输中" }
+        assertEquals(
+            listOf("SF004", "SF002", "SF003", "SF001"),
+            transit.records.map { it.trackingNumber },
+        )
+    }
+
+    @Test
+    fun `物流动态跟随较新的一方而不是只填空`() {
+        // 状态都「派送中」了，正文还停在第一次落下的转运中心文案 —— 时序字段必须跟随最新
+        val old = record(tracking = "SF001", status = ExpressStatus.DELIVERING, at = 1000L)
+            .copy(logisticsDetail = "快件离开【南宁转运中心】")
+        val fresh = record(tracking = "SF001", status = ExpressStatus.DELIVERING, at = 9000L)
+            .copy(logisticsDetail = "快件已到达【蚌埠转运中心】")
+        assertEquals("快件已到达【蚌埠转运中心】", old.mergeEnrichment(fresh).logisticsDetail)
+        // 反方向合并（self 更新）不回退
+        assertEquals("快件已到达【蚌埠转运中心】", fresh.mergeEnrichment(old).logisticsDetail)
+        // 新的一方没给 detail 就保留旧值
+        val noDetail = record(tracking = "SF001", at = 9000L)
+        assertEquals("快件离开【南宁转运中心】", old.mergeEnrichment(noDetail).logisticsDetail)
+    }
+
+    @Test
+    fun `待揽收纠正运输中_经upsert两趟合并不被反转`() {
+        // 真机实证：宿主 statusDesc 对未揽收件笼统写「运输中」，detail 却是「包裹正在等待揽收」。
+        // 先落了一条 IN_TRANSIT，后来更具体的 CREATED 行要能把它纠正回来。
+        val existing = record(tracking = "JT001", status = ExpressStatus.IN_TRANSIT, at = 1000L)
+            .copy(logisticsDetail = "包裹正在等待揽收")
+        val incoming = record(tracking = "JT001", status = ExpressStatus.CREATED, at = 9000L)
+            .copy(logisticsDetail = "包裹正在等待揽收")
+        val next = ExpressRecordStore.applyUpsert(listOf(existing), incoming)
+        assertNotNull(next)
+        assertEquals(ExpressStatus.CREATED, next!!.single().status)
     }
 }

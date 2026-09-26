@@ -1,7 +1,9 @@
 package io.github.YGHFv.ReaPressExtend.core
 
 import java.time.Instant
+import java.time.LocalDateTime
 import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
 
 /**
@@ -37,23 +39,67 @@ object ExpressFormatter {
     }
 
     /**
-     * 通知正文。
+     * 通知**收起态**那句 —— 一件包裹「最重要的一句话」。
      *
-     * 字段顺序按「用户最关心的」排：取件码 > 驿站 > 运单号 > 状态描述。
-     * 缺失的字段整行省略，不留「运单号：null」这种噪音。
+     * 分岔点只有一个：**这件东西要不要用户动手**。
+     * - 有取件码 / 驿站 → 说「去哪取、取什么」（`取件码 8-2-3021 · 文一西路店`）
+     * - 都没有（还在路上）→ 说「现在在哪」（运单动态）加「哪一件」（公司 + 运单号）
+     *
+     * ## 为什么把标签砍了
+     *
+     * 旧版写的是 `取件码：8-2-3021` / `地点：文一西路店` / `运单号：SF…` / `状态：待取件` ——
+     * 每个字段配一个标签，五行全是标签，真正的内容被挤成一小截，通知栏一眼扫过去什么都抓不住。
+     * 现在：**只有「取件码」保留标签**（光一串 `8-2-3021` 用户不知道那是什么），
+     * 「地点 / 运单号 / 状态」三个标签全去掉 —— 驿站名自带辨识度，运单号长得就像运单号，
+     * 状态已经在标题里说过了（[title]）。
+     *
+     * @return 一个字段都没有时返回 null，由 [body] 退回原文首行
+     */
+    fun summaryLine(record: ExpressRecord): String? {
+        val pickup = record.pickupCode?.takeIf { it.isNotBlank() }
+        val station = record.station?.takeIf { it.isNotBlank() }
+        if (pickup != null || station != null) {
+            return listOfNotNull(pickup?.let { "取件码 $it" }, station).joinToString(" · ")
+        }
+        val detail = record.logisticsDetail?.takeIf { it.isNotBlank() }
+        return listOfNotNull(detail, trackingLine(record))
+            .takeIf { it.isNotEmpty() }
+            ?.joinToString(" · ")
+    }
+
+    /**
+     * 「公司简称 运单号」。公司认不出时只留运单号。
+     *
+     * 这两样必须**连在一起**出现（`顺丰 SF1234567890123`）才算完整：单独一串数字用户认不出
+     * 是哪家，单独一个「顺丰」又对不上是哪一件。
+     */
+    fun trackingLine(record: ExpressRecord): String? =
+        record.trackingNumber?.takeIf { it.isNotBlank() }?.let { tracking ->
+            if (record.courier == Courier.UNKNOWN) tracking else "${record.courier.shortName} $tracking"
+        }
+
+    /**
+     * 通知**展开态**正文（也是投递审计里存的那份）。
+     *
+     * 行序即重要性：摘要（去哪取）→ 哪一件（公司 + 全号）→ 现在在哪（运单动态）→ 买的是什么。
+     * 逐行去重：摘要行已经吃下运单动态时（路上那些件），后面不再重复一遍。
+     *
+     * 一个字段都没抽到时退回原文 —— 宁可给用户看原始文案，也不要一条空通知。
      */
     fun body(record: ExpressRecord): String {
+        val pickup = record.pickupCode?.takeIf { it.isNotBlank() }
+        val station = record.station?.takeIf { it.isNotBlank() }
         val lines = mutableListOf<String>()
-        record.pickupCode?.takeIf { it.isNotBlank() }?.let { lines += "取件码：$it" }
-        record.station?.takeIf { it.isNotBlank() }?.let { lines += "地点：$it" }
-        // 商品行把「哪个平台买的」和「买的什么」拼一起 —— 和菜鸟首页卡片同一行同一种写法，
-        // 用户在两个界面之间来回看时不会对不上。
-        goodsLine(record)?.let { lines += it }
-        record.trackingNumber?.takeIf { it.isNotBlank() }?.let { lines += "运单号：$it" }
-        if (record.status != ExpressStatus.UNKNOWN) {
-            lines += "状态：${record.status.displayName}"
+        summaryLine(record)?.let { lines += it }
+        // 摘要行只可能是两种组合之一：有取件码时是「取件码 + 驿站」，没有时是「运单动态 + 运单号」。
+        // 只有前者需要把运单号、动态补在后面；后者摘要里已经有了，再补就是把同一句话拆开重说一遍。
+        if (pickup != null || station != null) {
+            trackingLine(record)?.let { lines += it }
+            record.logisticsDetail?.takeIf { it.isNotBlank() }?.let { lines += it }
         }
-        // 一个字段都没抽到时退回原文 —— 宁可给用户看原始文案，也不要一条空通知。
+        // 商品行（`淘宝 · 云南白糖`）和首页卡片同一行同一种写法，两个界面之间来回看不会对不上。
+        // 这里不带「商品：」前缀 —— 卡片上也没有，而它读了就知道是什么。
+        goodsSummary(record)?.takeIf { it !in lines }?.let { lines += it }
         if (lines.isEmpty()) {
             return record.rawText.lineSequence().firstOrNull { it.isNotBlank() }.orEmpty()
         }
@@ -141,6 +187,66 @@ object ExpressFormatter {
         val hour = match.groupValues[1].toIntOrNull() ?: return match.value
         val minute = match.groupValues[2].toIntOrNull() ?: 0
         return "$hour:${minute.toString().padStart(2, '0')}"
+    }
+
+    /**
+     * 「x小时前」—— 运输中 / 派送中卡片状态前面的相对时间。
+     *
+     * 起算点用 [statusSince]（当前状态是从哪次事件开始的），不是直接拿 [ExpressRecord.timestamp]。
+     * 口径：不足 1 分钟不显示（「0分钟前」是错误观感）；1 小时内说分钟，一天内说小时，
+     * 再往上说天。`now` 由调用方注入 —— core 层不碰系统时钟（与 [inStationLabel] 同一条规矩）。
+     *
+     * @return null = 时间异常（时钟回拨 / 两处来源都没有），整段不显示。
+     */
+    fun relativeAge(timestamp: Long, now: Long): String? {
+        val elapsed = now - timestamp
+        if (elapsed <= 0L) return null
+        val minutes = elapsed / 60_000L
+        return when {
+            minutes < 1L -> null
+            minutes < 60L -> "${minutes}分钟前"
+            minutes < 24 * 60L -> "${minutes / 60L}小时前"
+            else -> "${ChronoUnit.DAYS.between(Instant.ofEpochMilli(timestamp), Instant.ofEpochMilli(now))}天前"
+        }
+    }
+
+    /** 轨迹点时间的两种写法：秒级是接口原样，分钟级是个别快递公司给的缩水版。 */
+    private val TRACE_TIME_FULL = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+    private val TRACE_TIME_MINUTE = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+
+    /**
+     * 轨迹点时间字符串 → epoch 毫秒。
+     *
+     * 轨迹里存的是宿主原样给的「2026-09-26 13:54:00」（见 [ExpressTracePoint]）：排序可以
+     * 按字符串比（同源格式固定），但要跟 [ExpressRecord.timestamp]（epoch）比新旧、
+     * 要算「几小时前」，就必须真正解析一次。解析不出返回 null —— 宁可没有这个时间，
+     * 不能编一个出来。
+     */
+    fun tracePointTime(raw: String, zone: ZoneId = ZoneId.systemDefault()): Long? = try {
+        LocalDateTime.parse(raw.trim(), TRACE_TIME_FULL).atZone(zone).toInstant().toEpochMilli()
+    } catch (e: Throwable) {
+        try {
+            LocalDateTime.parse(raw.trim(), TRACE_TIME_MINUTE).atZone(zone).toInstant().toEpochMilli()
+        } catch (e: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * 「x小时前」该从哪个时刻起算：**当前状态是从哪次事件开始的**。
+     *
+     * 只用 [ExpressRecord.timestamp]（宿主 `logistics_gmt_modified`）有一个真实缺陷：
+     * 宿主自己几小时不刷新时它就停在旧值 —— 真机实证（2026-09-26）：13:54 已派送的件
+     * 显示「11小时前」，因为 gmt_modified 停在凌晨；而真正的派送时刻轨迹里写着
+     * （13:54 那条「正在派件」）。所以两个来源取**较新者**：
+     * 轨迹最新节点是最新的事件清单，宿主 gmt_modified 兜底（轨迹没拉到、或拉得比宿主还旧时仍有值）。
+     *
+     * @return null = 两处都给不出有效时间（timestamp 为 0 且轨迹为空 / 时间解析不出）。
+     */
+    fun statusSince(record: ExpressRecord, zone: ZoneId = ZoneId.systemDefault()): Long? {
+        val fromTrace = record.trace.lastOrNull()?.let { tracePointTime(it.time, zone) }
+        val fromRecord = record.timestamp.takeIf { it > 0L }
+        return listOfNotNull(fromTrace, fromRecord).maxOrNull()
     }
 
     /**

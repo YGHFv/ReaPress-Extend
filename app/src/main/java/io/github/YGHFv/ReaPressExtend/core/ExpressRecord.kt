@@ -67,6 +67,28 @@ data class ExpressRecord(
      */
     val stationHours: String? = null,
     /**
+     * 驿站**完整地址**，如 `颖滨23号楼109颖滨花园菜拼多多驿站`。
+     *
+     * 与 [station] 是两回事，**不要合并**：[station] 是驿站名，参与首页的地点聚类；
+     * 这个是「照着去哪儿取」的门牌。把完整地址塞进 [station] 会让 [ExpressStationName]
+     * 归一化出另一个名字，同一个驿站在首页被劈成两组。
+     *
+     * 来源是轨迹接口末条记录上的 `address`（见 `CainiaoTraceParser`），只在到站类状态下才取 ——
+     * 运输中件的那个字段是转运中心地址。
+     */
+    val stationAddress: String? = null,
+    /**
+     * 全轨迹（最早 → 最新）。
+     *
+     * 宿主首页只给一句 `lastLogisticDetail`（最新那条），完整节点要单独查。
+     * 文案在解析时已经 [ExpressTraceText.clean] 过（去掉快递公司夹的广告话术）。
+     *
+     * 与其它外部字段不同，它是**会变的**（新节点会追加），合并规则见 [mergeEnrichment]。
+     */
+    val trace: List<ExpressTracePoint> = emptyList(),
+    /** 商品图 URL。宿主只给标题，图要单独查。 */
+    val goodsImage: String? = null,
+    /**
      * 用户在本模块里**手动确认已取件**的时间（毫秒）。null = 还没取。
      *
      * ## 为什么必须有这个字段
@@ -101,6 +123,20 @@ data class ExpressRecord(
 ) {
     /** 用户是不是已经确认取走了这件（见 [pickedUpAt]）。 */
     val isPickedUp: Boolean get() = pickedUpAt != null
+
+    /**
+     * 这条记录有没有**强标识**（运单号 / 取件码，至少其一）。
+     *
+     * 身份判定是「运单号 > 取件码 > 原文」，前两级都没有的记录只能靠原文认自己：
+     * 去重会随文案措辞漂移、富化永远配不上（[ExpressEnrichmentMatcher] 的站名信号
+     * 只有 15 分，过不了 50 分线）、界面上也只剩一块「快递包裹 / 未知」的空壳卡片
+     * （真机 2026-09-26：一条只有「📦 揽件通知」的推送被记成了包裹）。
+     *
+     * 所以存储层把它当成**准入条件**（见 `ExpressRecordStore` 的读写两处守卫）：
+     * 没有强标识的东西不是包裹，是一条噪音通知。
+     */
+    val hasIdentity: Boolean
+        get() = !trackingNumber.isNullOrBlank() || !pickupCode.isNullOrBlank()
 
     /**
      * 主键。用于日志与诊断，以及 [ExpressDedupe] 需要「一个」字符串时。
@@ -181,29 +217,72 @@ data class ExpressRecord(
             // 也不要把可能是别的包裹的号写进来。
             else -> trackingNumber
         }
-        val mergedStatus =
-            if (other.status.isAdvanceFrom(status)) other.status else status
+        val mergedStatus = when {
+            // 常规：状态只允许推进（复用 [ExpressStatus.isAdvanceFrom]），乱序送达不回退。
+            other.status.isAdvanceFrom(status) -> other.status
+            // 特例：CREATED **纠正** IN_TRANSIT。宿主的 `logisticsStatusDesc` 对还没揽收的件
+            // 也笼统地写「运输中」，而 lastLogisticDetail 是「包裹正在等待揽收」—— 前者把
+            // 这类件抬进了「运输中」档，用户看到的却是没揽收的真相（2026-09-26 真机实证，
+            // 极兔 JT3188…）。CREATED 只来自明确文案（等待揽收/待发货/已下单），是更具体的
+            // 证据，不是乱序回退。**不带时间条件**：mergeVersions 的两趟合并方向相反，
+            // 带时间条件会在第二趟被反转回去。
+            status == ExpressStatus.IN_TRANSIT && other.status == ExpressStatus.CREATED ->
+                ExpressStatus.CREATED
+            else -> status
+        }
 
         val merged = copy(
             trackingNumber = mergedTracking,
             courier = if (courier == Courier.UNKNOWN) other.courier else courier,
-            station = station ?: other.station,
+            // 驿站名比别的字段多一条规则：**没有地点信息的写法要让位**。
+            // 淘宝通知只写「已送达代收点」，解析出来是个占位词 —— 它非空，按纯粹的「只填空」
+            // 会把宿主给的真名（`颍滨花园驿站`）挡在外面，于是合并之后首页仍然只显示「代收点」，
+            // 用户白装了这个模块。占位词在解析层已经被丢掉一部分（见 [ExpressStationName]），
+            // 但**历史记录里已经存下的那些改不掉**，所以这里再兜一层。
+            station = station?.takeIf { ExpressStationName.hasLocation(it) } ?: other.station,
             pickupCode = pickupCode ?: other.pickupCode,
             // 这几个只有宿主富化给得出（通知文案里没有），所以走同一套「只填空」规则：
             // 本记录已经有值就不动，没有才吸收。
             platform = platform ?: other.platform,
             goodsName = goodsName ?: other.goodsName,
             arrivalAt = arrivalAt ?: other.arrivalAt,
-            logisticsDetail = logisticsDetail ?: other.logisticsDetail,
+            // 物流动态是**时序字段**，与上面那些静态字段规则不同：它随包裹推进而变化，
+            // 旧的那句迟早过期。只填空的话，第一次落下的「快件离开【南宁转运中心】」会
+            // 永久盖住后来宿主刷新出的新动态 —— 状态都「派送中」了，正文还停在三天前的
+            // 转运中心（2026-09-26 真机实证）。两边都有值时谁的时间戳新就听谁的；
+            // 较新的一方没给就保留旧值。
+            //
+            // 但「本条还没有」时必须**无条件收下**另一边的 —— 通知记录天生没有动态
+            // （通知文案里没这句），若也按时间比，宿主 gmt_modified 停在旧值（宿主自己
+            // 几小时不刷新很常见）、比通知到达时刻旧时，富化带来的动态会被整条丢掉，
+            // 卡片右列状态下面永远是空白（2026-09-26 真机：13:54 已派送的件就是这条路丢的）。
+            logisticsDetail = when {
+                logisticsDetail == null -> other.logisticsDetail
+                other.timestamp >= timestamp -> other.logisticsDetail ?: logisticsDetail
+                else -> logisticsDetail
+            },
             stationHours = stationHours ?: other.stationHours,
+            stationAddress = stationAddress ?: other.stationAddress,
+            goodsImage = goodsImage ?: other.goodsImage,
+            // 轨迹是这张字段表里**唯一会被更替**的 —— 其它字段只会从 null 变成有值，
+            // 而轨迹本身随时间增长，新查到的那份就是更全的。
+            //
+            // 但仍不能无条件覆盖：接口偶发返回残缺列表（网络抖动、服务端截断）时，
+            // 直接替换会把已经攒下的十几条轨迹冲成两三条。取「新的不少于旧的」才换，
+            // 语义是**只增不减**。
+            trace = if (other.trace.size >= trace.size) other.trace else trace,
             // 手机尾号的来源只有通知一处，富化值恒为 null，这条写在这里只是让「只填空」的
             // 规则在这张字段表上不留缺口。
             phoneTail = phoneTail ?: other.phoneTail,
             // 用户的「已取件」确认不能被合并冲掉 —— 合并的两边都是通知/富化数据，
             // 它们从来不带这个字段，所以「只填空」在此处等价于「原样保留」。
             pickedUpAt = pickedUpAt ?: other.pickedUpAt,
-            status = mergedStatus,
             title = title ?: other.title,
+            // ⚠️ status 必须在这份 copy 里：底下的 `merged == this` 是**全字段相等**判定，
+            // 如果 status 拿出去最后再补，其他字段恰好全同时就会提前返回 this，
+            // CREATED 纠正 IN_TRANSIT 那一步被整个吞掉（2026-09-26 真机：JT317893… 永远
+            // applied=false，待揽收一直显示运输中，就是这个原因）。
+            status = mergedStatus,
         )
         return if (merged == this) this else merged
     }

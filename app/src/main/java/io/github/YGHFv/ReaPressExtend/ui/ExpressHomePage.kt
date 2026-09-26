@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -32,7 +33,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  * 首页。
  *
  * 布局对齐菜鸟首页：**到站包裹按取件地点聚合成卡片组**（那是用户真正要去取的东西），
- * 运输中的平铺在下面（用户只是「知道一下」）。
+ * 派送中、运输中平铺在下面（用户只是「知道一下」，派送中单独一档、排在运输中上面）。
  *
  * 聚合这件事的意义在于：同一个驿站常有多个包裹，分开列会让用户在一个驿站和另一个驿站之间
  * 来回找；聚在一起则「去一趟驿站，这几件一起拿」。
@@ -43,12 +44,16 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  *   不用另开一个布尔参数：手势开不开和回调有没有是同一件事，两个参数能互相矛盾。
  *   关掉它只是**挂不上手势**：已经标记过的记录照旧变灰、照旧参与整站确认、照旧排在后面
  *   （那些标记是存下来的数据，不该因为关掉开关就变个样子）。
+ * @param onOpenDetail 单击卡片进包裹详情页（看全轨迹 / 驿站完整地址 / 商品图）。
+ *   传 null 表示不提供入口 —— 与 [onTogglePickup] 同一种约定，且两者互相独立：
+ *   取件开关关掉之后，单击进详情仍然应该可用。
  */
 @Composable
 internal fun HomePage(
     records: List<ExpressRecord>,
     rules: ExpressStationRules = ExpressStationRules.EMPTY,
     onTogglePickup: ((ExpressRecord) -> Unit)?,
+    onOpenDetail: ((ExpressRecord) -> Unit)? = null,
 ) {
     if (records.isEmpty()) {
         EmptyHome()
@@ -70,14 +75,16 @@ internal fun HomePage(
         GroupTitle("${section.title} · ${section.count}件")
         if (section.stationGroups.isNotEmpty()) {
             for (group in section.stationGroups) {
-                StationGroupCard(group, now, onTogglePickup)
+                StationGroupCard(group, now, onTogglePickup, onOpenDetail)
             }
         }
         for (record in section.records) {
             ParcelCard(
                 record = record,
                 stationLabel = ExpressHomeGrouper.stationLabelOf(record, stationLabels),
+                now = now,
                 onTogglePickup = onTogglePickup,
+                onOpenDetail = onOpenDetail,
             )
         }
     }
@@ -125,6 +132,7 @@ private fun StationGroupCard(
     group: ExpressStationGroup,
     now: Long,
     onTogglePickup: ((ExpressRecord) -> Unit)?,
+    onOpenDetail: ((ExpressRecord) -> Unit)?,
 ) {
     SettingsCard {
         // 地点抬头：菜鸟首页把驿站名放在最显眼的位置，因为它决定了「去哪取」。
@@ -177,7 +185,7 @@ private fun StationGroupCard(
         }
         for ((index, record) in group.records.withIndex()) {
             if (index > 0) RowDivider()
-            PickupCardBody(record, now, onTogglePickup)
+            PickupCardBody(record, now, onTogglePickup, onOpenDetail)
         }
     }
 }
@@ -185,7 +193,9 @@ private fun StationGroupCard(
 /**
  * 不按地点聚合时的单条卡片（运输中、已签收、用户已确认取件移出待取件的）。
  *
- * 双击还原只对**已标记过已取件**的记录开放，理由见 [pickupToggleTarget] 的调用点。
+ * 双击还原只对**已标记过已取件**的记录开放，理由见 [cardTapTarget] 的调用点。
+ * 单击进详情则是**所有**卡片都开的 —— 想知道「件现在到底到哪了」的场合，运输中的件
+ * 比到站件更需要这条入口。
  *
  * @param stationLabel 该记录该显示的驿站名（用户改过名就是改后的名字），未知传 null。
  *   由调用方用 [ExpressHomeGrouper.stationLabels] 算好传进来，**不要在卡片里读
@@ -195,7 +205,9 @@ private fun StationGroupCard(
 private fun ParcelCard(
     record: ExpressRecord,
     stationLabel: String?,
+    now: Long,
     onTogglePickup: ((ExpressRecord) -> Unit)?,
+    onOpenDetail: ((ExpressRecord) -> Unit)?,
 ) {
     // 运输中 / 已签收的普通卡片本来就没有「确认取件」这个动作，给它们挂双击是凭空多出一个
     // 可操作区，误触的代价大于收益 —— 所以这里按记录本身过滤，而不是照搬到站卡片那套。
@@ -204,7 +216,7 @@ private fun ParcelCard(
     // 剩下的撤销入口（单件驿站误触一下就直接移档，没有灰态窗口可以退回去）。
     val target = if (record.isPickedUp) onTogglePickup else null
     SettingsCard {
-        ParcelCardBody(record, stationLabel, target)
+        ParcelCardBody(record, stationLabel, now, target, onOpenDetail)
     }
 }
 
@@ -233,25 +245,29 @@ private val PICKUP_COLUMN_WIDTH = 124.dp
  * 确认之后再扫右边「是哪件、放了几天」。原来的上下结构里这两类信息挤在同一列，
  * 取件码只靠字号突出，不如左右分栏一眼分层。
  *
- * 左列同时是**双击确认取件的落点**，而且落点是**整行**（左列 + 右列两行文字）：
+ * 左列同时是**单击 / 双击的落点**，而且落点是**整行**（左列 + 右列两行文字）：
  * 取件码只有 6~8 个字符、字号虽大但也只是百来 dp 宽的一条，让用户去精确戳它太苛刻；
  * 整行是这个卡片里唯一有意义的操作目标，列内和右列都没有别的可点区域，不会和谁抢手势。
- * 把双击范围限定在左列还有个实际毛病：用户的手势习惯落在卡片中部偏右（右列文字上），
- * 那里点不动会让人以为功能坏了。详见 [pickupToggleTarget]。
+ * 把落点限定在左列还有个实际毛病：用户的手势习惯落在卡片中部偏右（右列文字上），
+ * 那里点不动会让人以为功能坏了。详见 [cardTapTarget]。
+ *
+ * @param onOpenDetail 单击进详情。与 [onTogglePickup] 互相独立：取件开关关掉后
+ *   单击进详情仍然有效（两件事在 [cardTapTarget] 里各装各的）。
  */
 @Composable
 private fun PickupCardBody(
     record: ExpressRecord,
     now: Long,
     onTogglePickup: ((ExpressRecord) -> Unit)?,
+    onOpenDetail: ((ExpressRecord) -> Unit)?,
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            // 手势挂在 padding **之前**：这样双击区域含那圈 16dp/12dp 的留白，
+            // 手势挂在 padding **之前**：这样点击区域含那圈 16dp/12dp 的留白，
             // 也就是真正的「整行」。挂在 padding 之后的话，卡片边缘那一圈点不动 ——
             // 而用户的手指常常正落在那里。
-            .pickupToggleTarget(record, onTogglePickup)
+            .cardTapTarget(record, onOpenDetail, onTogglePickup)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -323,6 +339,13 @@ private fun PickupCardBody(
  * 而它和公司名是同一件事（哪家的哪一单）。驿站名 2026-09-26 同理并进标题行
  * （见 [ParcelTitleRow]），卡片再少一行。
  *
+ * ## 副行 / 商品行为什么在状态行**下面**占整行宽
+ *
+ * 最早它们和标题一起被关在状态左侧的那一栏里（Row 两栏结构），右上角状态的正下方
+ * 永远是一块空白。2026-09-26 用户明确要求「改回原本的布局，文本显示延申到空白」——
+ * 所以只有标题行需要给状态让位（避免重叠），副行和商品行排在状态这一行之下、
+ * **占整行宽度**：文本自然延伸进那块空白，卡片不因为留白白高一截。
+ *
  * 用户整站确认取件后移出「到站包裹」的记录也走这里（进了「已签收 / 异常」那一档）。
  * 对它们不用 [PickupCardBody]：那个左列是为「到驿站念一串码」服务的，而这些件已经取回来了 ——
  * 再摆一个大号取件码是在提示一个已经做完的动作。状态文案由
@@ -333,60 +356,86 @@ private fun PickupCardBody(
  *   字号与颜色都跟运单号同档（不再是原来那行蓝色）。
  * @param onTogglePickup 双击整张卡片撤销「已取件」。**只有已标记过的记录会传非 null**（见
  *   [ParcelCard]）—— 否则每一张运输中的卡片都会变成一个隐藏的双击区。
+ * @param onOpenDetail 单击进详情。所有卡片都开。
  */
 @Composable
 private fun ParcelCardBody(
     record: ExpressRecord,
     stationLabel: String?,
+    now: Long,
     onTogglePickup: ((ExpressRecord) -> Unit)?,
+    onOpenDetail: ((ExpressRecord) -> Unit)?,
 ) {
     Column(
         modifier = Modifier
-            // 和到站卡片同一条规矩：手势在 padding 之前，双击区域含整张卡片的留白。
-            .pickupToggleTarget(record, onTogglePickup)
+            // 和到站卡片同一条规矩：手势在 padding 之前，点击区域含整张卡片的留白。
+            .cardTapTarget(record, onOpenDetail, onTogglePickup)
             .padding(horizontal = 16.dp, vertical = 12.dp),
     ) {
+        // 标题行 + 状态，同一行：这是唯一需要给右上角状态让位的一行（状态贴着它排）。
         Row(verticalAlignment = Alignment.Top) {
             Column(modifier = Modifier.weight(1f)) {
                 // 驿站名一并交给标题行：它和运单号是同一类信息（这一单是哪个、归哪儿），
                 // 单独占一行时卡片白高一截（见 ParcelTitleRow 的注释）。
                 ParcelTitleRow(record, stationLabel)
-                // 副行：手机尾号 + 运单动态。规则的取舍（为什么不显示运单号尾号）在
-                // ExpressFormatter.detailLine 里，那边是纯函数、可单测。
-                parcelSubtitle(record)?.let { subtitle ->
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        text = subtitle,
-                        fontSize = 13.sp,
-                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                // 商品行：和菜鸟卡片同一行的写法（「淘宝 · 云南一级白糖…」）。
-                // **强制一行**：商品名动辄三十字，换行会让卡片高度随标题长短乱跳，
-                // 上下几张卡片就对不齐了。
-                ExpressFormatter.goodsSummary(record)?.let { goods ->
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        text = goods,
-                        fontSize = 12.sp,
-                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
             }
             Text(
-                // 用 statusLabel：整站确认取件后这些记录会落到「已签收 / 异常」这一档，
-                // 而它们的 status 还是「待取件」（用户确认取件不改写宿主状态）——
-                // 这里显示用户做过的事，不显示那个已经过期的外部状态。
-                text = ExpressFormatter.statusLabel(record),
+                text = transitStatusLabel(record, now),
                 fontSize = 13.sp,
                 color = statusColor(record),
             )
         }
+        // 副行：手机尾号 · 运单动态。与商品行**同一个字号（12sp）、各自一行** —— 两行是
+        // 同一档的次要信息，一大一小就分出了本不存在的层级（2026-09-26 用户指出）。
+        // 占整行宽后，文本延伸进右上角状态下面那块空白（上面的结构注释）；
+        // 超出仍截尾 —— 完整动态在详情页看。
+        parcelSubtitle(record)?.let { subtitle ->
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = subtitle,
+                fontSize = 12.sp,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        // 商品行：和菜鸟卡片同一行的写法（「淘宝 · 云南一级白糖…」）。
+        // **强制一行**：商品名动辄三十字，换行会让卡片高度随标题长短乱跳，
+        // 上下几张卡片就对不齐了。
+        ExpressFormatter.goodsSummary(record)?.let { goods ->
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = goods,
+                fontSize = 12.sp,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
+}
+
+/**
+ * 运输中 / 派送中卡片右上角的状态文案：相对时间 + 状态（「2小时前 派送中」）。
+ *
+ * 起算点用 [ExpressFormatter.statusSince]（轨迹最新节点与宿主 gmt_modified 取较新者），
+ * 不直接拿 [ExpressRecord.timestamp]：宿主几小时不刷新时 gmt_modified 停在旧值 ——
+ * 真机实证：13:54 已派送的件显示「11小时前」。轨迹里那次事件才是状态真正的开始时刻。
+ *
+ * 只对**还在路上**的件显示：已签收的状态本身就是结论，再算「多久前签收」没有决策价值；
+ * 用户标记过「已取件」的同理（statusLabel 会显示「已取件」，不叠加时间）。
+ *
+ * 拿不到时间（时钟回拨 / 两处来源都没有）就退回纯状态，整段不会开天窗。
+ */
+private fun transitStatusLabel(record: ExpressRecord, now: Long): String {
+    val status = ExpressFormatter.statusLabel(record)
+    val onTheWay = record.status == ExpressStatus.IN_TRANSIT ||
+        record.status == ExpressStatus.PICKED_UP ||
+        record.status == ExpressStatus.DELIVERING
+    if (!onTheWay || record.isPickedUp) return status
+    val since = ExpressFormatter.statusSince(record) ?: return status
+    val age = ExpressFormatter.relativeAge(since, now) ?: return status
+    return "$age $status"
 }
 
 /**
@@ -464,7 +513,8 @@ private fun ParcelTitleRow(record: ExpressRecord, stationLabel: String?) {
 /**
  * 运输中卡片的副行：公司简称（**仅当标题被取件码占了**）+ 手机尾号 + 运单动态。
  *
- * 公司名只在标题没显示它时才重复 —— 和到站卡片第一行是同一条规矩。
+ * 动态拼装规则（为什么手机尾号在前、动态在后）在 ExpressFormatter.detailLine 里，
+ * 那边是纯函数、可单测。公司名只在标题没显示它时才重复 —— 和到站卡片第一行是同一条规矩。
  *
  * 三样都凑不出来时退回原文首行：那是「其他」分组里解析失败的记录，卡片上总得有点什么，
  * 空着比给一句原文更糟。只有原文也没有（理论上不该发生）才返回 null，整行省略。
@@ -481,30 +531,49 @@ private fun parcelSubtitle(record: ExpressRecord): String? {
 }
 
 /**
- * 双击切换「已取件」的落点。
+ * 卡片上的单击 / 双击落点：**单击进详情、双击切换「已取件」**。
  *
  * 挂在**整行**上而不是取件码那串字上：取件码 6~8 个字符，让用户精确戳它太苛刻；
  * 而整行是这个卡片里唯一有意义的操作目标 —— 左列和右列都没有别的可点区域，
  * 不存在和谁抢手势的问题。
  *
- * 用 `detectTapGestures` 而不是 `combinedClickable`：后者必须挂一个 `onClick`，
- * 而这里单击没有任何合适的行为 —— 挂个空实现等于「能点但点不动」，比不可点更让人困惑。
+ * ## 为什么用 `detectTapGestures` 而不是 `combinedClickable`
+ *
+ * 一条理由是按下不留痕：`combinedClickable` 自带一层 indication，整张卡片按下时会闪一下。
+ * 这里两个动作（看详情 / 标记取件）都不需要「按到了」的反馈，闪一下反而像是「选中了」。
+ *
+ * 另一条更要紧：**单击必须等双击窗口过期再触发**。两个回调并存时 `detectTapGestures` 会先等
+ * 约 300ms 看有没有第二下，没有才回调 `onTap` —— 这正是要的行为，否则双击的第一下就直接跳进
+ * 详情页，取件手势永远触发不了。反过来说，当 `onDoubleTap` 为 null（取件开关关着、
+ * 或这张卡片本来就不支持取件）时那个等待一并省掉，单击立刻响应。
+ *
  * 也不会拖累列表纵向滚动：手势识别器在指针移动超出 slop 时就把这一串 event 放给父级。
  *
- * key 用 [ExpressRecord.dedupeKey]：列表刷新后这一行可能被复用给另一条记录，不重置手势块
- * 会让它继续按旧记录的回调跑。开关切换（[onTogglePickup] 为 null ⟺ 功能关着）不需要进 key ——
- * 那时整个 modifier 变成空操作，手势节点会被移除，没有「留着旧回调」的机会。
+ * ## key 的取法
  *
- * @param onTogglePickup null = 功能关着，连手势都不挂
+ * 用 [ExpressRecord.dedupeKey] **加两个「开没开」的布尔**，而不是把回调本身放进 key：
+ * lambda 每次重组都是新对象，拿它当 key 会让手势块不停重启、把进行中的手势掐断；
+ * 而只按 dedupeKey 做 key 又会在开关切换后留着旧回调。列表刷新后这一行可能被复用给
+ * 另一条记录，dedupeKey 变了就重置。
+ *
+ * @param onOpenDetail 单击进详情。null = 不提供这个入口
+ * @param onTogglePickup 双击切换「已取件」。null = 这张卡片没有这个动作（功能关着，
+ *   或它本来就不支持 —— 见 [ParcelCard]）
  */
-private fun Modifier.pickupToggleTarget(
+private fun Modifier.cardTapTarget(
     record: ExpressRecord,
+    onOpenDetail: ((ExpressRecord) -> Unit)?,
     onTogglePickup: ((ExpressRecord) -> Unit)?,
-): Modifier = if (onTogglePickup == null) {
+): Modifier = if (onOpenDetail == null && onTogglePickup == null) {
     this
 } else {
-    pointerInput(record.dedupeKey) {
-        detectTapGestures(onDoubleTap = { onTogglePickup(record) })
+    pointerInput(record.dedupeKey, onOpenDetail != null, onTogglePickup != null) {
+        detectTapGestures(
+            // 显式标出 `Offset` 参数：没有它这两个 lambda 会被推成 `() -> Unit`，
+            // 与 `onTap` / `onDoubleTap` 要求的 `(Offset) -> Unit` 对不上。
+            onTap = onOpenDetail?.let { detail -> { _: Offset -> detail(record) } },
+            onDoubleTap = onTogglePickup?.let { toggle -> { _: Offset -> toggle(record) } },
+        )
     }
 }
 

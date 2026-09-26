@@ -4,6 +4,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.time.LocalDateTime
+import java.time.ZoneId
 
 class ExpressFormatterTest {
 
@@ -44,7 +46,20 @@ class ExpressFormatterTest {
     }
 
     @Test
-    fun `正文字段按取件码 地点 运单号 状态排序`() {
+    fun `摘要行是取件码加驿站`() {
+        // 只有「取件码」保留字段名 —— 光一串 `8-2-3021` 用户不知道那是什么；
+        // 「地点 / 运单号 / 状态」的标签全砍掉（驿站名、运单号都自带辨识度，状态在标题里）
+        val r = record(
+            courier = Courier.SHUNFENG,
+            status = ExpressStatus.READY_FOR_PICKUP,
+            pickup = "8-2-3021",
+            station = "菜鸟驿站(文一西路店)",
+        )
+        assertEquals("取件码 8-2-3021 · 菜鸟驿站(文一西路店)", ExpressFormatter.summaryLine(r))
+    }
+
+    @Test
+    fun `正文是摘要加运单号且不写状态`() {
         val r = record(
             courier = Courier.SHUNFENG,
             status = ExpressStatus.READY_FOR_PICKUP,
@@ -53,15 +68,40 @@ class ExpressFormatterTest {
             tracking = "SF1234567890123",
         )
         assertEquals(
-            "取件码：8-2-3021\n地点：菜鸟驿站(文一西路店)\n运单号：SF1234567890123\n状态：待取件",
+            "取件码 8-2-3021 · 菜鸟驿站(文一西路店)\n顺丰 SF1234567890123",
             ExpressFormatter.body(r),
         )
     }
 
     @Test
-    fun `缺失字段整行省略`() {
-        val r = record(status = ExpressStatus.DELIVERING)
-        assertEquals("状态：派送中", ExpressFormatter.body(r))
+    fun `有取件码时运单号与动态另起两行`() {
+        // 到站件的摘要只说「去哪取」，运单号和动态是另外两件事，各占一行
+        val r = record(
+            courier = Courier.SHUNFENG,
+            status = ExpressStatus.READY_FOR_PICKUP,
+            pickup = "8-2-3021",
+            station = "文一西路店",
+            tracking = "SF1234567890123",
+        ).copy(logisticsDetail = "包裹已到站")
+        assertEquals(
+            "取件码 8-2-3021 · 文一西路店\n顺丰 SF1234567890123\n包裹已到站",
+            ExpressFormatter.body(r),
+        )
+    }
+
+    @Test
+    fun `路上那些件的摘要退到运单动态加运单号`() {
+        val r = record(courier = Courier.JITU, status = ExpressStatus.IN_TRANSIT, tracking = "JT123")
+            .copy(logisticsDetail = "已发往【上海转运中心】")
+        assertEquals("已发往【上海转运中心】 · 极兔 JT123", ExpressFormatter.summaryLine(r))
+        // 摘要行已经吃下动态，正文不该再重复一遍
+        assertEquals("已发往【上海转运中心】 · 极兔 JT123", ExpressFormatter.body(r))
+    }
+
+    @Test
+    fun `只有运单号时摘要不给公司名加戏`() {
+        val r = record(status = ExpressStatus.IN_TRANSIT, tracking = "SF1234567890123")
+        assertEquals("SF1234567890123", ExpressFormatter.summaryLine(r))
     }
 
     @Test
@@ -72,8 +112,14 @@ class ExpressFormatterTest {
 
     @Test
     fun `空白字段被忽略`() {
-        val r = record(status = ExpressStatus.SIGNED, pickup = "   ", station = "")
-        assertEquals("状态：已签收", ExpressFormatter.body(r))
+        val r = record(
+            courier = Courier.SHUNFENG,
+            status = ExpressStatus.SIGNED,
+            pickup = "   ",
+            station = "",
+            tracking = "SF123",
+        )
+        assertEquals("顺丰 SF123", ExpressFormatter.body(r))
     }
 
     @Test
@@ -161,5 +207,54 @@ class ExpressFormatterTest {
     fun `没标记时就是宿主状态`() {
         val r = record(status = ExpressStatus.READY_FOR_PICKUP)
         assertEquals("待取件", ExpressFormatter.statusLabel(r))
+    }
+
+    @Test
+    fun `relativeAge 分段口径`() {
+        val now = 1_800_000_000_000L
+        // 30 秒内不显示（「0分钟前」是错误观感）
+        assertNull(ExpressFormatter.relativeAge(now - 30_000L, now))
+        // 一小时内说分钟
+        assertEquals("5分钟前", ExpressFormatter.relativeAge(now - 5 * 60_000L, now))
+        assertEquals("59分钟前", ExpressFormatter.relativeAge(now - 59 * 60_000L, now))
+        // 一天内说小时
+        assertEquals("1小时前", ExpressFormatter.relativeAge(now - 60 * 60_000L, now))
+        assertEquals("23小时前", ExpressFormatter.relativeAge(now - 23 * 3_600_000L, now))
+        // 再往上说天
+        assertEquals("2天前", ExpressFormatter.relativeAge(now - 2 * 86_400_000L, now))
+        // 时钟回拨 / 宿主给错时间：null，整段不显示
+        assertNull(ExpressFormatter.relativeAge(now + 1, now))
+    }
+
+    @Test
+    fun `statusSince 取轨迹与宿主时间里较新的`() {
+        // 真机 2026-09-26：13:54 已派送的件显示「11小时前」—— 宿主 gmt_modified 停在凌晨，
+        // 而真正的派送时刻轨迹里写着。起算点必须两个来源取较新者。
+        val zone = ZoneId.of("Asia/Shanghai")
+        val dawn = LocalDateTime.parse("2026-09-26T04:47:00").atZone(zone).toInstant().toEpochMilli()
+        val dispatch = LocalDateTime.parse("2026-09-26T13:54:00").atZone(zone).toInstant().toEpochMilli()
+
+        // 轨迹更新 → 用轨迹的（13:54 派送 vs 凌晨 gmt_modified）
+        val freshTrace = record().copy(timestamp = dawn).copy(
+            trace = listOf(
+                ExpressTracePoint("2026-09-25 09:00:00", "快件已到达【转运中心】"),
+                ExpressTracePoint("2026-09-26 13:54:00", "快递员正在派件"),
+            ),
+        )
+        assertEquals(dispatch, ExpressFormatter.statusSince(freshTrace, zone))
+
+        // 轨迹是旧的（两天前拉的）→ 宿主时间兜底
+        val staleTrace = record().copy(timestamp = dispatch).copy(
+            trace = listOf(ExpressTracePoint("2026-09-24 09:00:00", "快件已发出")),
+        )
+        assertEquals(dispatch, ExpressFormatter.statusSince(staleTrace, zone))
+
+        // 没轨迹没时间 → null（整段不显示，不编造）
+        assertNull(ExpressFormatter.statusSince(record().copy(timestamp = 0L), zone))
+        // 时间格式不对（解析不出）→ 当它不存在
+        val badTime = record().copy(timestamp = dawn).copy(
+            trace = listOf(ExpressTracePoint("9月26日 下午", "快递员正在派件")),
+        )
+        assertEquals(dawn, ExpressFormatter.statusSince(badTime, zone))
     }
 }

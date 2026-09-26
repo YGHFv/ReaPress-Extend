@@ -3,6 +3,7 @@ package io.github.YGHFv.ReaPressExtend.core
 import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
 import java.time.ZoneId
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -302,6 +303,7 @@ class ExpressRecordStoreEnrichTest {
     private fun enrichment(
         tracking: String? = "SF1234567890123",
         station: String? = "杭州文一西路店",
+        pickupCode: String? = null,
         status: ExpressStatus = ExpressStatus.READY_FOR_PICKUP,
         at: Long = 2000L,
     ) = ExpressRecord(
@@ -309,6 +311,7 @@ class ExpressRecordStoreEnrichTest {
         rawText = "菜鸟富化",
         trackingNumber = tracking,
         station = station,
+        pickupCode = pickupCode,
         status = status,
         origin = ExpressOrigin.ENRICHMENT,
         timestamp = at,
@@ -355,6 +358,18 @@ class ExpressRecordStoreEnrichTest {
             station = "杭州文一西路店",
         )
         assertNull(ExpressRecordStore.applyEnrichment(listOf(already), enrichment()))
+    }
+
+    @Test
+    fun `没有强标识的记录没有身份`() {
+        // 判据在 ExpressRecord.hasIdentity，存储层（upsert / enrich / load）拿它当准入条件：
+        // 连运单号和取件码都没有的推送（真机 2026-09-26 的「📦 揽件通知」）记进来只会变成
+        // 首页上一块「快递包裹 / 未知」的空壳卡片 —— 它去重靠原文、富化永远配不上。
+        assertFalse(notification(tracking = null, pickup = null).hasIdentity)
+        assertTrue(notification(tracking = null, pickup = "8-2-3021").hasIdentity)
+        assertTrue(notification(tracking = "SF1234567890123", pickup = null).hasIdentity)
+        // 富化侧同一条规矩：宿主行只要了站点、没带单号和取件码的，同样进不了存储
+        assertFalse(enrichment(tracking = null, pickupCode = null).hasIdentity)
     }
 
     @Test
@@ -415,6 +430,125 @@ class ExpressRecordStoreEnrichTest {
                 ),
             ),
         )
+    }
+}
+
+/**
+ * 「同一个包裹被拆成两条」的回归测试。
+ *
+ * 现场是 2026-09-26 用户报的：首页「代收点 5 件」和「颍滨花园驿站 6 件」加起来 11 件，
+ * 而实际只有 6 件包裹 —— 每条通知记录都多了一份。
+ *
+ * 根因不是「取件码比不出来」，而是**两边各缺一个强标识、且缺的正好是对方有的那个**：
+ * 富化第一次到达时宿主没下发 `authCode`（真机 04:27 那批 pickup/station 全是 null），
+ * 库里那条只有运单号；通知 13:20 到达，只有取件码 —— 没有任何可比的东西，只能各自成条。
+ * 13:21 富化补齐取件码时，匹配到的是**自己那条**（运单号精确 100 分 > 取件码 50 分），
+ * 通知那条就成了孤儿。
+ *
+ * 修法见 [ExpressRecordStore.applyEnrichment]：合并让代表记录把两边的强标识都拿到之后，
+ * 再回头收编那些原本够不着的记录。
+ */
+class ExpressRecordStoreAbsorbTest {
+
+    private fun notification(
+        tracking: String? = null,
+        pickup: String? = null,
+        station: String? = null,
+        rawText: String = "您的包裹已到站，取件码 $pickup",
+        at: Long = 3000L,
+    ) = ExpressRecord(
+        sourcePackage = "com.taobao.taobao",
+        rawText = rawText,
+        trackingNumber = tracking,
+        pickupCode = pickup,
+        station = station,
+        status = ExpressStatus.READY_FOR_PICKUP,
+        timestamp = at,
+    )
+
+    private fun fromHost(
+        tracking: String? = "JT3178691239988",
+        pickup: String? = null,
+        station: String? = "颍滨花园驿站",
+        at: Long = 2000L,
+    ) = ExpressRecord(
+        sourcePackage = "com.cainiao.wireless",
+        rawText = "运单号 $tracking",
+        trackingNumber = tracking,
+        courier = Courier.JITU,
+        pickupCode = pickup,
+        station = station,
+        status = ExpressStatus.READY_FOR_PICKUP,
+        origin = ExpressOrigin.ENRICHMENT,
+        timestamp = at,
+    )
+
+    @Test
+    fun `真机现场：富化补齐取件码后把孤儿通知记录收编回来`() {
+        // ① 富化先到，宿主当时没给取件码 → 只有运单号
+        // ② 通知后到，只有取件码 → 两边没有共同强标识，只能新建（这一步的行为不变）
+        val late = notification(pickup = "1-1-6004", station = "代收点")
+        val seeded = ExpressRecordStore.applyUpsert(listOf(fromHost()), late)!!
+        assertEquals(2, seeded.size)
+
+        // ③ 富化补齐取件码 → 收编，首页从两张卡变回一张
+        val result = ExpressRecordStore.applyEnrichment(
+            seeded,
+            fromHost(pickup = "1-1-6004"),
+        )!!
+
+        assertEquals(1, result.records.size)
+        assertEquals(1, result.absorbedCount)
+        val merged = result.records.single()
+        assertEquals("JT3178691239988", merged.trackingNumber)
+        assertEquals("1-1-6004", merged.pickupCode) // 通知独有的字段留住了
+        // 通知里的「代收点」是个占位词，没有地点信息 —— 必须让位给宿主给的真名
+        assertEquals("颍滨花园驿站", merged.station)
+    }
+
+    @Test
+    fun `富化内容没变也照样收编已存在的重复`() {
+        // 用户设备上先于本修复产生的重复，不该要求「再来一条新数据」才合 ——
+        // 富化反复送达时内容完全一样，但收编判定必须照跑，否则两张卡片永远消不掉。
+        // 这也是升级后不用清数据、打开一次菜鸟首页就自愈的原因。
+        val host = fromHost(pickup = "1-1-6004")
+        val current = listOf(notification(pickup = "1-1-6004", station = "代收点"), host)
+
+        val result = ExpressRecordStore.applyEnrichment(current, host)!!
+        assertEquals(1, result.records.size)
+        assertEquals(1, result.absorbedCount)
+    }
+
+    @Test
+    fun `收编不会把运单号冲突的记录并进来`() {
+        // 同一货架格先后放过两件是真实存在的：取件码相同，但运单号不同就是两件。
+        // 收编用的是 isSamePackageAs 的严格语义，运单号冲突一律不合 —— 合错了用户会取错件。
+        val host = fromHost(pickup = "1-1-6004")
+        val other = notification(tracking = "YT9999999999999", pickup = "1-1-6004")
+
+        // 富化这条带一点新信息，否则「无变化」会走静默返回，测不到收编那一支
+        val result = ExpressRecordStore.applyEnrichment(
+            listOf(other, host),
+            host.copy(goodsName = "海天上等蚝油"),
+        )!!
+        assertEquals(2, result.records.size)
+        assertEquals(0, result.absorbedCount)
+    }
+
+    @Test
+    fun `收编后仍能正常合并后续的富化`() {
+        // 收编会重建列表（代表记录换到新的下标），后续富化必须还能找到它，
+        // 否则一次收编之后这段数据就成了没人认领的孤儿
+        val late = notification(pickup = "1-1-6004", station = "代收点")
+        val seeded = ExpressRecordStore.applyUpsert(listOf(fromHost()), late)!!
+        val absorbed = ExpressRecordStore.applyEnrichment(seeded, fromHost(pickup = "1-1-6004"))!!
+
+        val next = ExpressRecordStore.applyEnrichment(
+            absorbed.records,
+            fromHost(pickup = "1-1-6004").copy(goodsName = "海天上等蚝油"),
+        )!!
+        assertEquals(1, next.records.size)
+        assertEquals("海天上等蚝油", next.records.single().goodsName)
     }
 }
 
@@ -580,12 +714,41 @@ class ExpressHostFieldsTest {
             ),
         )
 
-        // 已有值不动，缺的那个才吸收 —— 和 station / pickupCode 同一套规则
+        // 已有值不动，缺的那个才吸收 —— 和 station / pickupCode 同一套规则。
+        // logisticsDetail 是例外：它是时序字段，跟随较新的一方（见下一条测试），
+        // 两边 timestamp 相同时取 other，所以这里是「宿主里的动态」。
         assertEquals("淘宝", merged.platform)
         assertEquals("通知里的写法", merged.goodsName)
         assertEquals(123L, merged.arrivalAt)
-        assertEquals("通知里的动态", merged.logisticsDetail)
+        assertEquals("宿主里的动态", merged.logisticsDetail)
         assertEquals("09:00-20:00", merged.stationHours)
+    }
+
+    @Test
+    fun `物流动态是时序字段_跟随较新的一方`() {
+        // 2026-09-26 真机实证：状态都「派送中」了，正文还停在第一次落下的转运中心文案。
+        // 旧的「只填空」规则会让过时的动态永久盖住宿主刷新出的新值。
+        val stale = host(logisticsDetail = "快件离开【南宁转运中心】")
+        val fresh = host(logisticsDetail = "快件已到达【蚌埠转运中心】").copy(timestamp = 9000L)
+        assertEquals("快件已到达【蚌埠转运中心】", stale.mergeEnrichment(fresh).logisticsDetail)
+        // 反方向（self 更新）不回退
+        assertEquals("快件已到达【蚌埠转运中心】", fresh.mergeEnrichment(stale).logisticsDetail)
+        // 较新的一方没给 detail 就保留旧值
+        val bare = host().copy(timestamp = 9000L)
+        assertEquals("快件离开【南宁转运中心】", stale.mergeEnrichment(bare).logisticsDetail)
+    }
+
+    @Test
+    fun `本条没有动态时无条件收下_不看时间先后`() {
+        // 2026-09-26 真机：13:54 已派送的件，卡片状态下面永远是空白 —— 就是这条路丢的。
+        // 通知记录天生没有 logisticsDetail（通知文案里没这句）；宿主 gmt_modified（富化
+        // timestamp）常常比通知到达时刻旧（宿主自己几小时不刷新）。时序规则若在这里也生效，
+        // 富化带来的动态会被整条丢掉 —— 「时序取舍」的前提是两边都有值可比。
+        val fromNotification = host().copy(timestamp = 9000L)
+        val merged = fromNotification.mergeEnrichment(host(logisticsDetail = "快递员正在派件"))
+        assertEquals("快递员正在派件", merged.logisticsDetail)
+        // 反方向同理：富化记录自己没动态、通知侧也没有，合并结果仍是 null（不编造）。
+        assertNull(host().mergeEnrichment(host()).logisticsDetail)
     }
 
     @Test
@@ -618,9 +781,10 @@ class ExpressHostFieldsTest {
     @Test
     fun `通知正文包含商品行`() {
         val body = ExpressFormatter.body(host(platform = "淘宝", goodsName = "云南白糖"))
-        assertTrue(body.contains("商品：淘宝 · 云南白糖"))
+        // 正文里不带「商品：」前缀（卡片上也没有）—— 读了就知道是什么，前缀只白占宽度
+        assertTrue(body.contains("淘宝 · 云南白糖"))
         // 取件码要排在商品前面 —— 用户在驿站第一眼要看的是它
-        assertTrue(body.indexOf("取件码").let { it >= 0 && it < body.indexOf("商品") })
+        assertTrue(body.indexOf("取件码").let { it >= 0 && it < body.indexOf("淘宝") })
     }
 
     @Test

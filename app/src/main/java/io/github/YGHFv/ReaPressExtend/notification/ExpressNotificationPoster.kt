@@ -12,6 +12,7 @@ import android.os.Build
 import io.github.YGHFv.ReaPressExtend.R
 import io.github.YGHFv.ReaPressExtend.core.ExpressFormatter
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
+import io.github.YGHFv.ReaPressExtend.core.ExpressStatus
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
 import io.github.YGHFv.ReaPressExtend.relay.ExpressRelay
 
@@ -31,6 +32,13 @@ import io.github.YGHFv.ReaPressExtend.relay.ExpressRelay
  *
  * Android 13+ 没有 `POST_NOTIFICATIONS` 就发不出去。这里**不弹窗**（Receiver 里弹不出来），
  * 只记日志并落一条审计 —— 用户会在模块界面上看到权限提示和一条「发送失败」记录。
+ *
+ * ## 通知形态
+ *
+ * 一条通知走哪套样式由**设备能力**决定（[FocusNotificationCapability]）：系统支持焦点通知
+ * 且本应用有权限时附加 `miui.focus.param`（小米焦点通知 / 超级岛，见 [MiuiFocusPayload]），
+ * 否则就是普通通知。两种情况下标题与正文是同一份（[ExpressFormatter]）——
+ * 「按版本走不同渠道」只该改**呈现形态**，不该改内容。
  */
 object ExpressNotificationPoster {
 
@@ -64,7 +72,12 @@ object ExpressNotificationPoster {
             ensureChannel(manager)
 
             val title = ExpressFormatter.title(record)
+            // 收起态只给一行「最重要的话」，展开态才铺开全量：
+            // 通知栏里那行原本是整段正文的首行，而正文首行是「取件码：8-2-3021」这种被标签
+            // 切碎的东西；现在首行本身就是一句完整的短语（见 ExpressFormatter.summaryLine）。
+            val summary = ExpressFormatter.summaryLine(record) ?: ExpressFormatter.body(record)
             val body = ExpressFormatter.body(record)
+            val focus = FocusNotificationCapability.probe(context)
 
             val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 Notification.Builder(context, CHANNEL_ID)
@@ -76,11 +89,15 @@ object ExpressNotificationPoster {
             builder
                 .setSmallIcon(R.drawable.ic_notification_express)
                 .setContentTitle(title)
-                .setContentText(body)
+                .setContentText(summary)
                 .setStyle(Notification.BigTextStyle().bigText(body))
                 .setAutoCancel(true)
+                // 显示的是**事件时间**（拦截到原通知的那一刻）而不是「刚刚」：
+                // 状态推进时用户要能看出这是几点发生的事，而不是刷新的时间。
+                .setShowWhen(true)
+                .setWhen(record.timestamp.takeIf { it > 0L } ?: System.currentTimeMillis())
                 // 同一个包裹反复更新时不要每次都响铃 —— 状态推进才值得提醒。
-                .setOnlyAlertOnce(record.status != io.github.YGHFv.ReaPressExtend.core.ExpressStatus.READY_FOR_PICKUP)
+                .setOnlyAlertOnce(record.status != ExpressStatus.READY_FOR_PICKUP)
                 .setContentIntent(contentIntent(context, record))
 
             // 递归防护第一重：给通知打上模块来源标记。
@@ -88,8 +105,27 @@ object ExpressNotificationPoster {
             // 「拦截 → 重发 → 又被拦截」会无限循环。
             builder.extras.putBoolean(ExpressRelay.EXTRA_MODULE_ORIGIN, true)
 
+            // 小米焦点通知 / 超级岛：**只有探测到系统认这套参数、且本应用有权限时**才附加。
+            // 见 FocusNotificationCapability（依据是小米官方《开发指南》的三个查询接口）。
+            // 非小米设备、老系统、没授权这三种情况下这里一次都不会进 —— 通知照旧是普通通知。
+            if (focus.canAttachFocusParam) {
+                runCatching {
+                    builder.extras.putString(
+                        MiuiFocusPayload.EXTRA_PARAM,
+                        MiuiFocusPayload.build(record, focus.protocol),
+                    )
+                }.onFailure {
+                    // 参数有问题不该让整条通知发不出去：丢掉焦点参数，退回普通通知。
+                    ModuleAndroidLog.error(TAG, "focus param build failed, fallback to plain", it)
+                }
+            }
+
             manager.notify(notificationId(record), builder.build())
-            ModuleAndroidLog.legacy(TAG, "replacement notification posted key=${record.dedupeKey} title=$title")
+            ModuleAndroidLog.legacy(
+                TAG,
+                "replacement notification posted key=${record.dedupeKey} title=$title " +
+                    "focus=${focus.protocol}/${focus.canShowFocus}",
+            )
             ExpressNotificationLog.record(context, record, delivered = true)
             true
         }.getOrElse {

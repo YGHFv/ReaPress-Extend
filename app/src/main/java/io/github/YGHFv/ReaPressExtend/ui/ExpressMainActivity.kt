@@ -1,6 +1,10 @@
 package io.github.YGHFv.ReaPressExtend.ui
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.drawable.ColorDrawable
@@ -53,14 +57,18 @@ import io.github.YGHFv.ReaPressExtend.config.ExpressSettings
 import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsKeys
 import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsSnapshot
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
+import io.github.YGHFv.ReaPressExtend.hook.CainiaoTraceApi
 import io.github.YGHFv.ReaPressExtend.core.ExpressRule
 import io.github.YGHFv.ReaPressExtend.core.ExpressStationRules
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
 import io.github.YGHFv.ReaPressExtend.logging.ModuleLogBuffer
+import io.github.YGHFv.ReaPressExtend.notification.ExpressHomeGrouper
 import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationLog
 import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationPoster
 import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
 import io.github.YGHFv.ReaPressExtend.notification.ExpressStationRuleStore
+import io.github.YGHFv.ReaPressExtend.relay.ExpressRelay
+import io.github.YGHFv.ReaPressExtend.relay.ModuleTraceFetcher
 import io.github.YGHFv.ReaPressExtend.relay.WatchdogReporter
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -383,6 +391,49 @@ private fun ExpressApp(
     var stationRules by remember { mutableStateOf(ExpressStationRuleStore.load(context)) }
     var stationAdminOpen by remember { mutableStateOf(false) }
 
+    // 包裹详情页（全轨迹 / 驿站完整地址 / 商品图）。存的是**记录快照**而不是它的 dedupeKey：
+    // 富化把通知里截断的尾号补成全号时 dedupeKey 会跟着变（它是 `tn:`/`pc:`/`raw:` 拼出来的），
+    // 只存 key 的话那一刻详情页会凭空关掉。渲染时再拿快照去最新列表里配一份更全的。
+    var detailRecord by remember { mutableStateOf<ExpressRecord?>(null) }
+    // 详情页自己的刷新指示器状态（与 homeRefreshing / recordRefreshing 同一套约定）。
+    var detailRefreshing by remember { mutableStateOf(false) }
+
+    /**
+     * 按需拉取当前包裹的全轨迹（「点击时获取」模式）。
+     *
+     * 优先走模块进程静默拉（[ModuleTraceFetcher.onDemand]，cookie 在内存缓存里就行，
+     * **不依赖菜鸟活着**）；没有缓存 cookie 才广播给菜鸟进程兜底 —— 那边拉到后照旧
+     * 经 ACTION_ENRICH 落库，且会顺带把 cookie 同步过来，下次就走本进程了。
+     *
+     * 结果何时到不归这里管：`ACTION_TRACE_ARRIVED` 广播（本地重读收位）或 [DETAIL_REFRESH_TIMEOUT_MS]
+     * 超时，两条路都会结束刷新指示器。请求被闸门（成功表 / 风控退避）挡下时静默 ——
+     * 详情页显示的「暂无物流轨迹」就是它的降级表现。
+     */
+    fun requestTraceForDetail(record: ExpressRecord) {
+        val tracking = record.trackingNumber?.takeIf { it.isNotBlank() } ?: return
+        val served = ModuleTraceFetcher.onDemand(context, tracking)
+        if (!served) {
+            context.sendBroadcast(
+                Intent(ExpressRelay.ACTION_TRACE_REQUEST)
+                    .setPackage(ExpressRelay.HOST_PACKAGE)
+                    .putExtra(ExpressRelay.EXTRA_TRACE_TRACKING, tracking),
+            )
+        }
+        // 超时收位兜底：正常路径是 ARRIVED 广播提前收位；广播没来（菜鸟不在、闸门挡下）
+        // 时指示器不能永远转着。
+        scope.launch { delay(DETAIL_REFRESH_TIMEOUT_MS); detailRefreshing = false }
+    }
+
+    val onDetailRefresh: () -> Unit = {
+        // 先重读一遍本地：轨迹落库是异步的，刷新时把已经到的先显示出来。
+        homeRecords = ExpressRecordStore.load(context)
+        if (ExpressSettings.read(context).traceFetchMode == ExpressSettingsKeys.MODE_TRACE_ON_DEMAND) {
+            // 「点击时获取」模式才主动发请求；「自动更新」模式由富化链路自己拉。
+            detailRecord?.let(::requestTraceForDetail)
+        }
+        detailRefreshing = true
+    }
+
     // 运行时不支持 RuntimeShader（Android 13 以下）时，模糊与液态玻璃都没有效果。
     // 不隐藏开关而是置灰：用户能看到这些功能存在、知道为什么现在用不了。
     val blurSupported = remember { isRuntimeShaderSupported() }
@@ -439,6 +490,68 @@ private fun ExpressApp(
                 stationRules = ExpressStationRuleStore.load(context)
             },
             onBack = { stationAdminOpen = false },
+        )
+        return
+    }
+
+    // 包裹详情同样是二级页。整页替换而不是弹窗：一屏轨迹能到二三十行，弹窗里滚不动。
+    val detail = detailRecord
+    if (detail != null) {
+        // 「点击时获取」模式：每次进详情都发一次拉取请求。重复请求由引擎的闸门去重
+        // （成功过的单号直接跳过），这里不用记「上次拉过谁」。
+        LaunchedEffect(detail) {
+            if (ExpressSettings.read(context).traceFetchMode ==
+                ExpressSettingsKeys.MODE_TRACE_ON_DEMAND
+            ) {
+                requestTraceForDetail(detail)
+            }
+        }
+
+        // 拉取结果落库后（本进程直拉或菜鸟兜底回来的）会发内部广播 —— 收到就重读，
+        // 详情页上的轨迹 / 地址 / 商品图原地更新。二选一收位：这里提前收，
+        // 或者 requestTraceForDetail 里的超时兜底。
+        DisposableEffect(Unit) {
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(ctx: Context?, intent: Intent?) {
+                    homeRecords = ExpressRecordStore.load(context)
+                    detailRefreshing = false
+                }
+            }
+            val filter = IntentFilter(ExpressRelay.ACTION_TRACE_ARRIVED)
+            if (Build.VERSION.SDK_INT >= 33) {
+                context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                context.registerReceiver(receiver, filter)
+            }
+            onDispose { context.unregisterReceiver(receiver) }
+        }
+
+        // 在有同样内容的那条记录里挑**最新**的一份：详情页开着的时候，轨迹富化可能刚落到
+        // 存储里、主列表刚被重读过。用 isSamePackageAs 而不是 dedupeKey 相等，正是为了兜住
+        // 「运单号从尾号补成全号」这种主键发生变化的合并 —— 否则那一刻会退回旧快照，
+        // 详情页上刚拉到的轨迹看不见。
+        val latest = homeRecords.firstOrNull { it.isSamePackageAs(detail) } ?: detail
+        val labels = remember(homeRecords, stationRules) {
+            ExpressHomeGrouper.stationLabels(homeRecords, stationRules)
+        }
+        // 轨迹拉取被风控挡下时，把真实原因透给用户（而不是干等超时后显示误导性的
+        // 「确认菜鸟在后台」）。计算很便宜（两个 volatile 读），不做 remember。
+        val traceHint = if (!CainiaoTraceApi.riskBlocked()) {
+            null
+        } else {
+            val minutes =
+                ((CainiaoTraceApi.riskBlockedUntil - System.currentTimeMillis()) / 60_000L)
+                    .coerceAtLeast(1)
+            "拉取被淘宝风控暂时拦住（按请求频率保护），约 $minutes 分钟后下拉重试。"
+        }
+        ExpressDetailPage(
+            record = latest,
+            stationLabel = ExpressHomeGrouper.stationLabelOf(latest, labels),
+            isRefreshing = detailRefreshing,
+            onRefresh = onDetailRefresh,
+            onBack = { detailRecord = null },
+            traceHint = traceHint,
         )
         return
     }
@@ -578,6 +691,13 @@ private fun ExpressApp(
                             records = homeRecords,
                             rules = stationRules,
                             onTogglePickup = if (doubleTapPickup) togglePickup else null,
+                            onOpenDetail = { record ->
+                                detailRecord = record
+                                // 顺手重读一遍列表：到站件的轨迹是异步拉回来的（宿主进程发请求
+                                // → 广播回模块进程 → 落库），用户看到卡片时它可能刚好落库。
+                                // 不重读这一下，详情页首次打开经常是空的，得退出去再进来。
+                                scope.launch { homeRecords = ExpressRecordStore.load(context) }
+                            },
                         )
                         TAB_RECORDS -> RecordPage(recordEntries)
                         TAB_ABOUT -> AboutPage(
@@ -677,9 +797,6 @@ private fun RefreshablePage(
     )
 }
 
-/** 刷新指示器的四段文案（下拉 / 松手 / 刷新中 / 完成）。miuix 默认是英文，必须覆盖。 */
-private val REFRESH_TEXTS = listOf("下拉刷新", "松手刷新", "正在刷新…", "刷新成功")
-
 /**
  * 下拉刷新的指示器**最短**显示时长。
  *
@@ -687,6 +804,13 @@ private val REFRESH_TEXTS = listOf("下拉刷新", "松手刷新", "正在刷新
  * 用户看不到任何「刷新发生了」的反馈。取值刚好够看清，不追求「像在忙」。
  */
 private const val MIN_REFRESH_VISIBLE_MS = 400L
+
+/**
+ * 详情页按需拉取的**收位超时**。正常路径是轨迹落库后的内部广播提前收位；广播没来
+ * （菜鸟不在后台兜底失败、请求被风控退避挡下）时，指示器不能永远转着 —— 到点就收，
+ * 页面上「暂无物流轨迹」的提示就是降级结果。
+ */
+private const val DETAIL_REFRESH_TIMEOUT_MS = 6_000L
 
 /**
  * 设置页「驿站管理」那一行的摘要。
@@ -726,7 +850,6 @@ private fun SettingsPage(
     SettingsCard {
         OverlayDropdownPreference(
             title = "主题",
-            summary = "跟随系统，或固定为日间/夜间",
             items = ExpressUiPrefs.THEME_LABELS,
             selectedIndex = themeMode.coerceIn(
                 ExpressUiPrefs.THEME_FOLLOW_SYSTEM,
@@ -735,30 +858,23 @@ private fun SettingsPage(
             onSelectedIndexChange = onThemeModeChange,
         )
         SwitchPreference(
+            // summary 只在不支持时出现 —— 那是必要信息（开关为什么点不动）；支持时
+            // 开关本身已经自说明，副标题只是噪音。
             title = "模糊",
-            summary = if (blurSupported) {
-                "启用顶栏和底栏的模糊效果"
-            } else {
-                "当前系统版本不支持（需 Android 13 及以上）"
-            },
+            summary = if (blurSupported) null else "需 Android 13 及以上",
             checked = blurBars,
             enabled = blurSupported,
             onCheckedChange = onBlurBarsChange,
         )
         SwitchPreference(
             title = "悬浮底栏",
-            summary = "使用 Apple 风格的悬浮底栏",
             checked = floatingNavBar,
             onCheckedChange = onFloatingNavBarChange,
         )
         if (floatingNavBar) {
             SwitchPreference(
                 title = "液态玻璃",
-                summary = if (blurSupported) {
-                    "启用悬浮底栏的液态玻璃效果"
-                } else {
-                    "当前系统版本不支持（需 Android 13 及以上）"
-                },
+                summary = if (blurSupported) null else "需 Android 13 及以上",
                 checked = liquidGlass,
                 enabled = blurSupported,
                 onCheckedChange = onLiquidGlassChange,
@@ -772,14 +888,9 @@ private fun SettingsPage(
         // 也不投影给 system_server（见 ExpressUiPrefs 的类注释）。
         SwitchPreference(
             title = "双击确认取件",
-            summary = "在到站卡片上双击取件码那一行，标记这件已取走",
+            summary = "双击到站卡片标记已取件",
             checked = doubleTapPickup,
             onCheckedChange = onDoubleTapPickupChange,
-        )
-        HintText(
-            "双击范围是整行，不用对准那串数字。\n" +
-                "同一驿站有多件时，已确认的会变灰、沉到卡片下面；全部确认后才一起移出「到站包裹」。\n" +
-                "再双击一次可以撤销。标记只存在本机，不会同步给菜鸟或快递公司。",
         )
         CardDivider()
         // 驿站管理放在「取件」组里而不是单开一组：它服务的就是取件（去哪个驿站、认哪几张卡片），
@@ -791,52 +902,56 @@ private fun SettingsPage(
         )
     }
 
+    GroupTitle("包裹详情")
+    SettingsCard {
+        // 轨迹什么时候拉：一次点击一次请求（默认，另有低速保底）还是富化到达时批量自动拉。
+        // 选项名已把语义说清；风控细节属于「出问题时才看」，在关于页诊断里。
+        SegmentedRow(
+            options = listOf(
+                ExpressSettingsKeys.MODE_TRACE_ON_DEMAND to "点击时获取",
+                ExpressSettingsKeys.MODE_TRACE_AUTO to "自动更新",
+            ),
+            selected = settings.traceFetchMode,
+            onSelect = { mode -> update { it.copy(traceFetchMode = mode) } },
+        )
+    }
+
     GroupTitle("工作模式")
     SettingsCard {
         // 一个三态控件，不再有「总开关 + 模式」两个能互相矛盾的入口。
-        // 以前那个开关在 system_server 侧压根没被读过，是个纯装饰。
-        // 不再另起一行写「当前：xx」—— 分段的选中态已经把它说清楚了，重复一行只是噪音。
+        // 不再逐态写说明 —— 选项名已自明；唯一值得占一行的是拦截模式的**不可逆警告**：
+        // 原通知被吞后如果模块自己发不出去，那条通知就永远丢了。
         SegmentedRow(
             options = ExpressSettingsKeys.MODE_OPTIONS,
             selected = settings.mode,
             onSelect = { mode -> update { it.copy(mode = mode) } },
         )
-        HintText(
-            when (settings.mode) {
-                ExpressSettingsKeys.MODE_OFF ->
-                    "模块不处理任何通知，原通知原样显示。"
-                ExpressSettingsKeys.MODE_PASSTHROUGH ->
-                    "命中快递通知时额外发一条，原通知照常显示。建议先用这个模式跑几天。"
-                else ->
-                    "命中快递通知时吞掉原通知，只留模块发的那条。\n" +
-                        "模块的通知发不出去时原通知已经没了，所以先确认放行模式下收得到再切。"
-            },
-        )
+        if (settings.mode == ExpressSettingsKeys.MODE_INTERCEPT) {
+            HintText("原通知会被吞掉，请先在放行模式确认通知能收到。")
+        }
     }
 
     GroupTitle("来源")
     SettingsCard {
         SwitchPreference(
             title = "菜鸟",
-            summary = "com.cainiao.wireless",
             checked = settings.sourceCainiao,
             onCheckedChange = { on -> update { it.copy(sourceCainiao = on) } },
         )
         SwitchPreference(
             title = "拼多多",
-            summary = "com.xunmeng.pinduoduo（仅通知文案，未做富化）",
+            summary = "仅通知文案",
             checked = settings.sourcePinduoduo,
             onCheckedChange = { on -> update { it.copy(sourcePinduoduo = on) } },
         )
         SwitchPreference(
             title = "淘宝",
-            summary = "com.taobao.taobao（仅通知文案，未做富化）",
+            summary = "仅通知文案",
             checked = settings.sourceTaobao,
             onCheckedChange = { on -> update { it.copy(sourceTaobao = on) } },
         )
         SwitchPreference(
             title = "快递短信",
-            summary = "跟随短信通知，无需额外读短信权限",
             checked = settings.sourceSms,
             onCheckedChange = { on -> update { it.copy(sourceSms = on) } },
         )
@@ -954,6 +1069,12 @@ private fun clockLabel(at: Long): String =
 
 // ---------------------------------------------------------------- 关于页（含诊断）
 
+/** 构建时间显示串：gradle 在构建时写进 [BuildConfig.BUILD_TIME]（epoch 毫秒）。 */
+private val BUILD_TIME_DISPLAY: String = java.text.SimpleDateFormat(
+    "yyyy-MM-dd HH:mm",
+    java.util.Locale.CHINA,
+).format(java.util.Date(BuildConfig.BUILD_TIME))
+
 /**
  * 关于页。诊断信息也放在这里 —— 它本来就是「出问题时才看」的内容，
  * 单独占一个页签不值得，但也不能藏起来（模块常年无界面，没有这些信息就无从排查）。
@@ -969,6 +1090,9 @@ private fun AboutPage(settings: ExpressSettingsSnapshot, onOpenLog: () -> Unit) 
     GroupTitle("模块状态")
     SettingsCard {
         InfoRow("版本", "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
+        // 构建时间紧跟版本：多台设备 / 多个渠道装的是哪一包，「版本号相同但构建不同」
+        // 的排查场景里是唯一可靠的对账依据。格式在 gradle 里生成时就定好了。
+        InfoRow("构建时间", BUILD_TIME_DISPLAY)
         InfoRow("构建模式", if (BuildConfig.DEBUG) "debug" else "release")
         InfoRow(
             "观察模式",

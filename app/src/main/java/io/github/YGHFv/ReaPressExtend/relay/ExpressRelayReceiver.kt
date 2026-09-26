@@ -3,10 +3,13 @@ package io.github.YGHFv.ReaPressExtend.relay
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import io.github.YGHFv.ReaPressExtend.config.ExpressSettings
 import io.github.YGHFv.ReaPressExtend.core.Courier
 import io.github.YGHFv.ReaPressExtend.core.ExpressOrigin
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
 import io.github.YGHFv.ReaPressExtend.core.ExpressStatus
+import io.github.YGHFv.ReaPressExtend.core.ExpressTraceCodec
+import io.github.YGHFv.ReaPressExtend.hook.CainiaoTraceApi
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
 import io.github.YGHFv.ReaPressExtend.logging.ModuleLogBuffer
 import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationPoster
@@ -36,6 +39,7 @@ class ExpressRelayReceiver : BroadcastReceiver() {
         when (intent.action) {
             ExpressRelay.ACTION_DELIVER -> handleDeliver(app, intent)
             ExpressRelay.ACTION_ENRICH -> handleEnrich(app, intent)
+            ExpressRelay.ACTION_COOKIE_SYNC -> handleCookieSync(app, intent)
             WatchdogReporter.ACTION_WATCHDOG_STATUS -> {
                 WatchdogReporter.persistLocally(app, intent)
                 val installed = intent.getBooleanExtra(WatchdogReporter.EXTRA_INSTALLED, false)
@@ -84,6 +88,47 @@ class ExpressRelayReceiver : BroadcastReceiver() {
                 "tn=${enrichment.trackingNumber} pickup=${enrichment.pickupCode} " +
                 "station=${enrichment.station} applied=$applied",
         )
+        // 「自动更新」模式：富化到达时对到站 / 派送中的件主动拉全轨迹。
+        // 「点击时获取」模式也留一条**极低速保底**（每 3 分钟最多一件）：菜鸟运行时
+        // 数据自己慢慢补齐，详情页多半在点开前就有数了。两种模式都受同一套引擎闸门
+        // 约束（成功表 / 冷却 / 风控退避），叠加不会重复请求。设置只在模块进程读，
+        // hook 侧不掺和（拉取已收拢到模块，hook 只同步 cookie + 兜底 receiver）。
+        if (ExpressSettings.read(app).isTraceAutoFetch) {
+            ModuleTraceFetcher.maybeAutoFetch(app, enrichment)
+        } else {
+            ModuleTraceFetcher.maybeBackstopFetch(app, enrichment)
+        }
+        // 详情页正等着的信号（模块进程内部广播）：本进程直拉、自动拉、以及菜鸟兜底拉
+        // 回来的结果都汇到这条路上 —— UI 收到就重读。只在真有轨迹数据时发，
+        // 否则每次普通富化都会让详情页白重读一遍。
+        if (applied && (enrichment.trace.isNotEmpty() || enrichment.stationAddress != null)) {
+            app.sendBroadcast(
+                Intent(ExpressRelay.ACTION_TRACE_ARRIVED).setPackage(app.packageName),
+            )
+        }
+    }
+
+    /**
+     * 宿主同步过来的淘宝登录态 cookie（[ExpressRelay.ACTION_COOKIE_SYNC]）。
+     *
+     * 只进内存缓存（[TraceCookieCache]），**不落盘、不打内容日志** —— 它是登录态，
+     * 任何静态留痕都会放大泄露面。extras 为空直接忽略：宿主侧读不到时不会发，
+     * 防御性起见这里也拦一道。
+     */
+    private fun handleCookieSync(app: Context, intent: Intent) {
+        val cookie = intent.getStringExtra(ExpressRelay.EXTRA_COOKIE)?.takeIf { it.isNotBlank() }
+        if (cookie == null) {
+            ModuleAndroidLog.error(LOG_TAG, "cookie sync with empty payload, dropped")
+            return
+        }
+        TraceCookieCache.put(
+            cookie,
+            intent.getStringExtra(ExpressRelay.EXTRA_COOKIE_UA)?.takeIf { it.isNotBlank() },
+        )
+        // UA 交给请求引擎：让 MTOP 请求的 UA 与这批登录态的画像（菜鸟 WebView）一致，
+        // 浏览器 UA 配菜鸟 cookie 是风控眼里的异常组合。
+        CainiaoTraceApi.preferredUa = TraceCookieCache.hostUa
+        ModuleAndroidLog.legacy(LOG_TAG, "cookie synced: ${TraceCookieCache.describe()}")
     }
 
     private fun parseRecord(intent: Intent): ExpressRecord? {
@@ -118,6 +163,10 @@ class ExpressRelayReceiver : BroadcastReceiver() {
             logisticsDetail = intent.getStringExtra(ExpressRelay.EXTRA_LOGISTICS_DETAIL)?.takeIf { it.isNotBlank() },
             stationHours = intent.getStringExtra(ExpressRelay.EXTRA_STATION_HOURS)?.takeIf { it.isNotBlank() },
             phoneTail = intent.getStringExtra(ExpressRelay.EXTRA_PHONE_TAIL)?.takeIf { it.isNotBlank() },
+            stationAddress = intent.getStringExtra(ExpressRelay.EXTRA_STATION_ADDRESS)?.takeIf { it.isNotBlank() },
+            goodsImage = intent.getStringExtra(ExpressRelay.EXTRA_GOODS_IMAGE)?.takeIf { it.isNotBlank() },
+            // 轨迹编在字符串里，解码失败退化为空表（「没有轨迹」）而不是丢整条记录。
+            trace = ExpressTraceCodec.decode(intent.getStringExtra(ExpressRelay.EXTRA_TRACE)),
         )
     }
 

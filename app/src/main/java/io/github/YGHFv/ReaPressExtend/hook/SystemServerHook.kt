@@ -350,8 +350,12 @@ internal object SystemServerHook {
             // 防止长期运行后 map 无限增长：条目上限远超实际不同文案数，超出就整体清空。
             if (missLogTimes.size > MISS_LOG_MAX_ENTRIES) missLogTimes.clear()
         }
+        // 带一行「为什么放行」：`ignored=` 表示关键词其实命中了、是状态规则放的行
+        // （见 ExpressClassifier.SILENT_STATUSES）。没有它的话，日志上「揽件通知不拦」
+        // 和「关键词没命中」长得一模一样，排查时会往错的方向找。
+        val ignored = verdict.ignoredStatus?.let { " ignored=${it.displayName}" }.orEmpty()
         XposedBridge.logAlways(
-            "EXPRESS MISS pkg=$pkg conf=${verdict.confidence} text=${text.take(50)}",
+            "EXPRESS MISS pkg=$pkg conf=${verdict.confidence}$ignored text=${text.take(50)}",
         )
     }
 

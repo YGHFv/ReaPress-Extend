@@ -1,10 +1,17 @@
 package io.github.YGHFv.ReaPressExtend.hook
 
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.os.Build
 import io.github.YGHFv.ReaPressExtend.core.Courier
 import io.github.YGHFv.ReaPressExtend.core.ExpressOrigin
 import io.github.YGHFv.ReaPressExtend.core.ExpressParser
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
 import io.github.YGHFv.ReaPressExtend.core.ExpressStatus
+import io.github.YGHFv.ReaPressExtend.relay.ExpressRelay
 import io.github.YGHFv.ReaPressExtend.xposed.XC_MethodHook
 import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
 import io.github.YGHFv.ReaPressExtend.xposed.XposedHelpers
@@ -269,11 +276,77 @@ internal object CainiaoPackageHook {
 
         hooked = count > 0
         installed = true
+        // 顺手把「按需拉轨迹」的请求通道立起来。拿不到 context 也不影响主 hook ——
+        // deliver 时 [ensureTraceReceiver] 还会再试一次（Application 那时已创建）。
+        runCatching { HostContextHolder.acquire() }
+            .getOrNull()
+            ?.let { ensureTraceReceiver(it) }
         XposedBridge.logAlways(
             "cainiao package hook installed: $DORADO_API hooked=$count " +
                 "(this layer is not on the class-loading path, safe to keep)",
         )
         return hooked
+    }
+
+    /** 模块 App 点开详情页时发来的轨迹拉取请求（`ACTION_TRACE_REQUEST`）落在这里。 */
+    private val traceRequestReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != ExpressRelay.ACTION_TRACE_REQUEST) return
+            val tracking = intent.getStringExtra(ExpressRelay.EXTRA_TRACE_TRACKING)
+                ?.takeIf { it.isNotBlank() } ?: return
+            // 跑在主线程 —— 拉取本身是网络 IO，必须丢给 Fetcher 自己的 executor。
+            // 全包住：这条链路任何异常都不该带崩宿主。
+            runCatching {
+                CainiaoTraceFetcher.requestFetch(
+                    cookieProvider = { CainiaoCookieSource.cookie(context) },
+                    tracking = tracking,
+                    deliver = { ExpressRelaySender.sendEnrichment(it, context) },
+                )
+            }.onFailure { XposedBridge.logError("cainiao trace request dispatch failed", it) }
+        }
+    }
+
+    @Volatile private var traceReceiverRegistered = false
+
+    /**
+     * 注册轨迹请求 receiver（幂等）。
+     *
+     * 注册要求**发送方持有** [ExpressRelay.PERMISSION_TRACE_REQUEST]（signature 级，定义在
+     * 模块 APK 里、只有模块自己签得出）—— 没有这道闸，设备上任何 app 都能拿用户的菜鸟
+     * 登录态替自己查任意单号的轨迹。
+     *
+     * 注册时机铺了两条路（[install] 时一次 + 每次 deliver 时补一次）：Application 创建的
+     * 早晚不确定，而 deliver 时 context 一定在手。
+     */
+    private fun ensureTraceReceiver(context: Context) {
+        if (traceReceiverRegistered) return
+        synchronized(this) {
+            if (traceReceiverRegistered) return
+            val filter = IntentFilter(ExpressRelay.ACTION_TRACE_REQUEST)
+            runCatching {
+                if (Build.VERSION.SDK_INT >= 33) {
+                    context.registerReceiver(
+                        traceRequestReceiver,
+                        filter,
+                        ExpressRelay.PERMISSION_TRACE_REQUEST,
+                        /* scheduler = */ null,
+                        Context.RECEIVER_EXPORTED,
+                    )
+                } else {
+                    @Suppress("UnspecifiedRegisterReceiverFlag")
+                    context.registerReceiver(
+                        traceRequestReceiver,
+                        filter,
+                        ExpressRelay.PERMISSION_TRACE_REQUEST,
+                        /* scheduler = */ null,
+                    )
+                }
+                traceReceiverRegistered = true
+                XposedBridge.logAlways("cainiao trace request receiver registered")
+            }.onFailure {
+                XposedBridge.logError("cainiao trace request receiver register failed", it)
+            }
+        }
     }
 
     /**
@@ -426,13 +499,30 @@ internal object CainiaoPackageHook {
             arrivalAt = arrivalAt,
             logisticsDetail = logisticsDetail,
             stationHours = stationHours,
-            status = statusDesc?.let { ExpressParser.parseStatus(it) } ?: ExpressStatus.UNKNOWN,
+            status = resolveStatus(statusDesc, logisticsDetail),
             origin = ExpressOrigin.ENRICHMENT,
             // 这条是从宿主自己的数据库里读出来的，不是推断 —— 置信度给满分，
             // 让它能作为独立记录落库（通知缺失时它是唯一来源）。
             confidence = 100,
             timestamp = System.currentTimeMillis(),
         )
+    }
+
+    /**
+     * 状态判定：`logisticsStatusDesc` 为主，lastLogisticDetail 在它失真时纠偏。
+     *
+     * 真机实证（2026-09-26，极兔 JT3188…）：宿主对**还没揽收**的件，statusDesc 也笼统写
+     * 「运输中」，而同行的 logisticsDetail 是「包裹正在等待揽收」。后者是更具体的证据 ——
+     * detail 判出 CREATED 且 desc 判成 IN_TRANSIT / UNKNOWN 时，信 detail。其他组合不动：
+     * 「派送中」+ 旧 detail 的情形 detail 落后于 desc，反过来才对。
+     */
+    private fun resolveStatus(statusDesc: String?, logisticsDetail: String?): ExpressStatus {
+        val fromDesc = statusDesc?.let { ExpressParser.parseStatus(it) } ?: ExpressStatus.UNKNOWN
+        if (fromDesc == ExpressStatus.IN_TRANSIT || fromDesc == ExpressStatus.UNKNOWN) {
+            val fromDetail = logisticsDetail?.let { ExpressParser.parseStatus(it) }
+            if (fromDetail == ExpressStatus.CREATED) return ExpressStatus.CREATED
+        }
+        return fromDesc
     }
 
     /**
@@ -473,6 +563,11 @@ internal object CainiaoPackageHook {
         }
 
         ExpressRelaySender.sendEnrichment(record, context)
+        // 轨迹拉取收拢到模块进程（按需 / 自动都由模块侧跑），cookie 由这里同步过去
+        // （30 分钟节流，只进对方内存）。同时把请求 receiver 立起来做兜底：
+        // 模块进程还没收到 cookie 时，菜鸟活着也能替它拉。
+        ExpressRelaySender.sendCookieSync(context)
+        ensureTraceReceiver(context)
         return true
     }
 
