@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    # 只在影响构建产物或 CI 本身的变更时触发，纯文档改动不浪费构建。
+    paths:
+      - "app/**"
+      - "gradle/**"
+      - "gradle.properties"
+      - "gradlew"
+      - "gradlew.bat"
+      - "settings.gradle.kts"
+      - "build.gradle.kts"
+      - ".github/workflows/ci.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Test and build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # 统一解析模块版本号，产物命名与 Release 标题都读这里。
+      - name: Resolve module version
+        run: |
+          VERSION_NAME="$(grep -oE 'versionName[[:space:]]*=[[:space:]]*"[^"]+"' app/build.gradle.kts | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          VERSION_CODE="$(grep -oE 'versionCode[[:space:]]*=[[:space:]]*[0-9]+' app/build.gradle.kts | head -n 1 | grep -oE '[0-9]+')"
+          if [ -z "$VERSION_NAME" ] || [ -z "$VERSION_CODE" ]; then
+            echo "无法从 app/build.gradle.kts 解析 versionName / versionCode"
+            exit 1
+          fi
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "模块版本：${VERSION_CODE} / ${VERSION_NAME}"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Set up Android command-line tools
+        run: |
+          export ANDROID_HOME="$RUNNER_TEMP/android-sdk"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o "$RUNNER_TEMP/android-commandline-tools.zip"
+          unzip -q "$RUNNER_TEMP/android-commandline-tools.zip" -d "$ANDROID_HOME/cmdline-tools"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Install Android SDK packages
+        run: |
+          # 先接受全部许可，AGP 才能自动补齐缺的 SDK 组件（如 build-tools）。
+          yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses
+          sdkmanager --sdk_root="$ANDROID_HOME" "platform-tools" "platforms;android-37"
+
+      - name: Make Gradle executable
+        run: chmod +x ./gradlew
+
+      - name: Test
+        run: ./gradlew :app:testDebugUnitTest
+
+      - name: Build APKs
+        run: |
+          ./gradlew :app:assembleDebug :app:assembleRelease
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/debug/app-debug.apk "artifacts/ReaPress-Extend-${VERSION_NAME}-debug.apk"
+          if [ -f app/build/outputs/apk/release/app-release.apk ]; then
+            cp app/build/outputs/apk/release/app-release.apk "artifacts/ReaPress-Extend-${VERSION_NAME}-release.apk"
+          else
+            cp app/build/outputs/apk/release/app-release-unsigned.apk "artifacts/ReaPress-Extend-${VERSION_NAME}-unsigned.apk"
+          fi
+          (cd artifacts && sha256sum *.apk > apk.sha256)
+          ls -lah artifacts
+
+      - name: Upload CI APKs
+        uses: actions/upload-artifact@v5
+        with:
+          name: ReaPress-Extend-ci-apk
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+      # 每次推 main 都产出预发布，便于真机直接拉最新包；正式 release 留给手动发版。
+      - name: Create CI release
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="ci-${VERSION_NAME}-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          TITLE="${VERSION_NAME} · CI #${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" artifacts/ReaPress-Extend-*.apk artifacts/apk.sha256 \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
+            --notes "CI build ${VERSION_NAME} (versionCode ${VERSION_CODE}) from ${GITHUB_SHA}. debug APK 可直接安装；release APK 未签名，安装前需自行签名。" \
+            --prerelease
