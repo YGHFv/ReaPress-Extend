@@ -77,9 +77,22 @@ object ExpressParser {
         "派件中" to ExpressStatus.DELIVERING,
         "运输中" to ExpressStatus.IN_TRANSIT,
         "已发出" to ExpressStatus.IN_TRANSIT,
+        "已发货" to ExpressStatus.IN_TRANSIT,
         "已揽收" to ExpressStatus.PICKED_UP,
+        // 「已揽件」是**菜鸟宿主自己的状态名**（`logisticsStatusDesc` 的原话），
+        // 通知文案里一般写「已揽收」。两个都不收的话，这类件在首页会掉进「其他」——
+        // 用户看到的是「状态显示不出来」，而不是「我没写这个词」。
+        "已揽件" to ExpressStatus.PICKED_UP,
         "已收件" to ExpressStatus.PICKED_UP,
         "已下单" to ExpressStatus.CREATED,
+        // 同上，宿主用「待发货」表示还没交给快递。归到 CREATED（= 已下单）：
+        // 它是**下单之后的第一个状态**，语义就是「还没上路」，不是运输中。
+        "待发货" to ExpressStatus.CREATED,
+        // 「包裹正在等待揽收」是宿主 lastLogisticDetail 的原话。注意它必须排在
+        // 「已揽收」的前面判不到冲突（两者互不包含），放这里只是和 CREATED 组扎堆。
+        // 不收它的话，这类件的状态全靠 statusDesc 兜着 —— 而宿主对它们笼统写「运输中」。
+        "等待揽收" to ExpressStatus.CREATED,
+        "待揽收" to ExpressStatus.CREATED,
     )
 
     fun parseTrackingNumber(text: String): String? {

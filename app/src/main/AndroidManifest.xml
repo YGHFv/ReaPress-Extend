@@ -14,6 +14,15 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!--
+      轨迹拉取请求的发送凭证：菜鸟进程里的 receiver 只收**持有这个权限**的广播方
+      （signature 级 = 只有模块自己签得出），否则设备上任何 app 都能拿用户的菜鸟登录态
+      替自己查任意单号。声明与使用在同一 APK，签名必然匹配，安装即授予。
+    -->
+    <permission
+        android:name="io.github.YGHFv.ReaPressExtend.permission.TRACE_REQUEST"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="io.github.YGHFv.ReaPressExtend.permission.TRACE_REQUEST" />
 
     <queries>
         <package android:name="com.cainiao.wireless" />

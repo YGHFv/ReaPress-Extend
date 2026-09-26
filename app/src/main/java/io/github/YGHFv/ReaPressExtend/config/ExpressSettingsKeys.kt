@@ -98,6 +98,24 @@ object ExpressSettingsKeys {
     /** 四个来源默认全开 —— 用户装这个模块就是为了处理它们。 */
     const val DEFAULT_SOURCE_ENABLED = true
 
+    // ---- 包裹详情（轨迹）的获取模式 ----
+
+    const val KEY_TRACE_FETCH_MODE = "trace_fetch_mode"
+
+    /**
+     * 「自动更新」：模块收到宿主富化时，对到站 / 派送中的件**主动**批量拉全轨迹
+     * （内部仍按 2.5s 间隔串行 + 风控退避）。不点详情也常新，代价是请求多、风控压力更大。
+     */
+    const val MODE_TRACE_AUTO = "trace_auto"
+
+    /**
+     * 「点击时获取」（默认）：只在用户点开详情 / 下拉刷新时拉**当前**这一个单号。
+     * 一次点击就是一次请求，节奏和人手一致，风控压力最小。
+     */
+    const val MODE_TRACE_ON_DEMAND = "trace_on_demand"
+
+    const val DEFAULT_TRACE_FETCH_MODE = MODE_TRACE_ON_DEMAND
+
     /**
      * 从 SharedPreferences 读出全部设置。
      *
@@ -116,6 +134,9 @@ object ExpressSettingsKeys {
             excludeKeywords = splitKeywords(prefs.getString(KEY_EXCLUDE_KEYWORDS, null)),
             confidenceThreshold = prefs.getInt(KEY_CONFIDENCE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD),
             hookForceEnabled = prefs.getBoolean(KEY_HOOK_FORCE_ENABLED, false),
+            traceFetchMode = prefs.getString(KEY_TRACE_FETCH_MODE, DEFAULT_TRACE_FETCH_MODE)
+                ?.takeIf { it == MODE_TRACE_AUTO || it == MODE_TRACE_ON_DEMAND }
+                ?: DEFAULT_TRACE_FETCH_MODE,
         )
     }
 
@@ -162,6 +183,7 @@ object ExpressSettingsKeys {
             .putString(KEY_EXTRA_KEYWORDS, joinKeywords(snapshot.extraKeywords))
             .putString(KEY_EXCLUDE_KEYWORDS, joinKeywords(snapshot.excludeKeywords))
             .putInt(KEY_CONFIDENCE_THRESHOLD, snapshot.confidenceThreshold)
+            .putString(KEY_TRACE_FETCH_MODE, snapshot.traceFetchMode)
             .apply()
     }
 

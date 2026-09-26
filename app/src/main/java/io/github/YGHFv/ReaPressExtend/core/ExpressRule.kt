@@ -74,4 +74,11 @@ data class ExpressVerdict(
     val matchedKeywords: List<String>,
     /** 命中的排除词（非空时 [isExpress] 必为 false）。 */
     val excludedBy: String? = null,
+    /**
+     * 因状态不值得拦截而放行时的那个状态（见 [ExpressClassifier.SILENT_STATUSES]）。
+     *
+     * 与 [excludedBy] 分开：那个是**用户配的词**，这里是模块自己的规则。
+     * 混用一个字段的话，日志里看到「排除词：已揽件」会让人以为用户在设置页里配过它。
+     */
+    val ignoredStatus: ExpressStatus? = null,
 )

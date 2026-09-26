@@ -65,6 +65,21 @@ class ExpressStationNameTest {
         assertEquals("", ExpressStationName.normalize("   "))
     }
 
+    @Test
+    fun `只说了地点类型的词不算地址`() {
+        // 淘宝的通知只写「您购买的宝贝已送达代收点」，抽出来就是这三个字。它没说在哪 ——
+        // 拿它当驿站名会在首页凭空多出一个叫「代收点」的分组（2026-09-26 真机），
+        // 还会按「只填空不覆盖」把宿主富化的真名挡在外面。所以一律当作「不知道在哪」。
+        assertEquals("", ExpressStationName.normalize("代收点"))
+        assertEquals("", ExpressStationName.normalize(" 代收点 "))
+        assertEquals("", ExpressStationName.normalize("快递柜"))
+        assertFalse(ExpressStationName.hasLocation("代收点"))
+
+        // 带了地名就是有效地点，不能误伤 —— `南门小区代收点` 是能找得到的地方
+        assertEquals("南门小区代收点", ExpressStationName.normalize("南门小区代收点"))
+        assertTrue(ExpressStationName.hasLocation("南门小区代收点"))
+    }
+
     // ------------------------------------------------------------ 聚类
 
     @Test

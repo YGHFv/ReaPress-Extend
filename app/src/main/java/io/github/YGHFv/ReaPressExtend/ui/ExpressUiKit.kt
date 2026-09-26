@@ -59,6 +59,14 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 /** 副文本 / 说明文字的字号。全模块只有这一个「小字」。 */
 private val SECONDARY = 12.sp
 
+/**
+ * 刷新指示器的四段文案（下拉 / 松手 / 刷新中 / 完成）。miuix 默认是英文，必须覆盖。
+ *
+ * 放在 [ExpressUiKit] 而不是各页面自持一份：这是「模块里所有下拉刷新共用的一套话」，
+ * 分开写迟早有一处被改得跟别处不一样。
+ */
+internal val REFRESH_TEXTS = listOf("下拉刷新", "松手刷新", "正在刷新…", "刷新成功")
+
 /** 卡片水平外边距。与 [GroupTitle] 的对齐关系见文件头。 */
 private val CARD_MARGIN = 12.dp
 

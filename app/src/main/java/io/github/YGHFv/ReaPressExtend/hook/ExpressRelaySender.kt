@@ -3,6 +3,7 @@ package io.github.YGHFv.ReaPressExtend.hook
 import android.content.Context
 import android.content.Intent
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
+import io.github.YGHFv.ReaPressExtend.core.ExpressTraceCodec
 import io.github.YGHFv.ReaPressExtend.relay.ExpressRelay
 import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
 
@@ -46,6 +47,44 @@ internal object ExpressRelaySender {
         if (resolved == null) return logContextFailure()
         deliver(resolved, record, ExpressRelay.ACTION_ENRICH)
     }
+
+    /** cookie 同步的最小间隔。cookie 会轮换，但不值得追着每次投递都发 —— 半小时足够新。 */
+    private const val COOKIE_SYNC_INTERVAL_MS = 30 * 60_000L
+
+    @Volatile private var lastCookieSyncAt = 0L
+
+    /**
+     * 宿主 App 进程侧：把淘宝登录态 cookie 同步给模块进程（[ExpressRelay.ACTION_COOKIE_SYNC]）。
+     *
+     * 轨迹拉取收拢到模块进程的前提：模块进程自己发 MTOP 请求要有登录态，而 cookie 只在
+     * 菜鸟私有目录里，只能由这里读出来送。**只内存、不落盘**（接收侧 TraceCookieCache），
+     * 30 分钟节流 —— cookie 会轮换，但轮换周期远长于半小时，不值得每次投递都传一遍。
+     * 这是对「cookie 不外传」原则的修订，权衡见 relay 契约里该 action 的注释。
+     */
+    fun sendCookieSync(context: Context) {
+        val now = System.currentTimeMillis()
+        if (now - lastCookieSyncAt < COOKIE_SYNC_INTERVAL_MS) return
+        lastCookieSyncAt = now
+        runCatching {
+            val cookie = CainiaoCookieSource.cookie(context)
+            if (cookie.isNullOrBlank()) return
+            val intent = Intent(ExpressRelay.ACTION_COOKIE_SYNC)
+                .setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
+                .putExtra(ExpressRelay.EXTRA_COOKIE, cookie)
+                // 菜鸟 WebView 的真实 UA 随 cookie 一起送过去：模块进程发 MTOP 请求时用它，
+                // 让 UA 与 cookie 的画像一致（浏览器 UA 配菜鸟登录态本身就是风控特征）。
+                // getDefaultUserAgent 首次调用会起 WebView 进程，可能要几百毫秒 —— 但这条
+                // 链路 30 分钟才走一次，且在 hook 回调线程上，不卡宿主主线程。
+                .putExtra(ExpressRelay.EXTRA_COOKIE_UA, webviewUa(context))
+            context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+            XposedBridge.log("cookie synced to module (${cookie.length} chars)")
+        }.onFailure { XposedBridge.logError("cookie sync failed", it) }
+    }
+
+    /** 菜鸟进程内 WebView 的默认 UA；拿不到返回 null（模块侧退回内置的浏览器 UA）。 */
+    private fun webviewUa(context: Context): String? = runCatching {
+        android.webkit.WebSettings.getDefaultUserAgent(context)
+    }.getOrNull()
 
     private fun logContextFailure() {
         if (!contextFailureLogged) {
@@ -98,6 +137,14 @@ internal object ExpressRelaySender {
             putExtra(ExpressRelay.EXTRA_ARRIVAL_AT, record.arrivalAt ?: 0L)
             putExtra(ExpressRelay.EXTRA_LOGISTICS_DETAIL, record.logisticsDetail)
             putExtra(ExpressRelay.EXTRA_STATION_HOURS, record.stationHours)
+            putExtra(ExpressRelay.EXTRA_STATION_ADDRESS, record.stationAddress)
+            putExtra(ExpressRelay.EXTRA_GOODS_IMAGE, record.goodsImage)
+            // 轨迹条数不定，编成一个字符串传（编解码只有 ExpressTraceCodec 一处）。
+            // 空轨迹传 null —— 接收端解出来就是空表，与「没查过」等价。
+            putExtra(
+                ExpressRelay.EXTRA_TRACE,
+                record.trace.takeIf { it.isNotEmpty() }?.let { ExpressTraceCodec.encode(it) },
+            )
             putExtra(ExpressRelay.EXTRA_PHONE_TAIL, record.phoneTail)
             putExtra(ExpressRelay.EXTRA_ORIGIN, record.origin.name)
         }
