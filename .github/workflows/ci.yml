@@ -64,7 +64,9 @@ jobs:
         run: |
           # 先接受全部许可，AGP 才能自动补齐缺的 SDK 组件（如 build-tools）。
           yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses
-          sdkmanager --sdk_root="$ANDROID_HOME" "platform-tools" "platforms;android-37"
+          # API 36 起平台包改为小版本命名（37.0/37.1/37.2），不存在 "platforms;android-37"；
+          # compileSdk = 37 在 AGP 9.x 下解析到 android-37.0（与本机一致）。
+          sdkmanager --sdk_root="$ANDROID_HOME" "platform-tools" "platforms;android-37.0"
 
       - name: Make Gradle executable
         run: chmod +x ./gradlew
