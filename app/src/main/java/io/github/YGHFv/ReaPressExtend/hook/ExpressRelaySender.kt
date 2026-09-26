@@ -48,6 +48,34 @@ internal object ExpressRelaySender {
         deliver(resolved, record, ExpressRelay.ACTION_ENRICH)
     }
 
+    /**
+     * 宿主 App 进程侧：把「本地包裹表自查」的结论送回模块进程
+     * （[ExpressRelay.ACTION_HOST_QUERY_REPORT]）。
+     *
+     * ## 为什么这条日志不能就地打
+     *
+     * 自查跑在**宿主进程**里，那里的 `XposedBridge.logAlways` 走 libxposed 的出口 → logcat；
+     * 而 MIUI / HyperOS 上 logcat 读不出来（`logcat -g` 报 `0 B readable`），LSPosed 的
+     * 日志文件 adb 也碰不到。结果是「自查跑没跑成」在宿主侧完全不可观测 ——
+     * 而排查时需要的恰恰就是这一句：跑没跑 / 跑了但查成空 / 压根没跑，三种情况的修法不同。
+     *
+     * 所以走 relay 送回模块进程，由它记进 `files/module-log.txt`（唯一一处
+     * `adb shell run-as` 能直接读、且不受「简洁日志」开关影响的地方）。
+     *
+     * **只送结论，不送包裹内容** —— 数据走 [sendEnrichment] 那条老路。
+     * 失败只记日志：这是诊断信息，丢了不影响任何功能。
+     */
+    fun sendHostQueryReport(context: Context, text: String) {
+        runCatching {
+            val intent = Intent(ExpressRelay.ACTION_HOST_QUERY_REPORT)
+                .setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
+                .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                .putExtra(ExpressRelay.EXTRA_HOST_QUERY_REPORT, text)
+            context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+            XposedBridge.logAlways("host self query report sent: $text")
+        }.onFailure { XposedBridge.logError("host self query report failed", it) }
+    }
+
     /** cookie 同步的最小间隔。cookie 会轮换，但不值得追着每次投递都发 —— 半小时足够新。 */
     private const val COOKIE_SYNC_INTERVAL_MS = 30 * 60_000L
 
@@ -56,28 +84,50 @@ internal object ExpressRelaySender {
     /**
      * 宿主 App 进程侧：把淘宝登录态 cookie 同步给模块进程（[ExpressRelay.ACTION_COOKIE_SYNC]）。
      *
-     * 轨迹拉取收拢到模块进程的前提：模块进程自己发 MTOP 请求要有登录态，而 cookie 只在
-     * 菜鸟私有目录里，只能由这里读出来送。**只内存、不落盘**（接收侧 TraceCookieCache），
-     * 30 分钟节流 —— cookie 会轮换，但轮换周期远长于半小时，不值得每次投递都传一遍。
-     * 这是对「cookie 不外传」原则的修订，权衡见 relay 契约里该 action 的注释。
+     * 模块进程自己发 MTOP 请求要有登录态，而 cookie 只在菜鸟私有目录里，只能由这里读出来送。
+     * 接收侧落内存 + 模块私有目录（[io.github.YGHFv.ReaPressExtend.relay.TraceCookieCache]）。
+     *
+     * @param force 模块主动索要时传 true，跳过 [COOKIE_SYNC_INTERVAL_MS] 节流。
+     *
+     * **为什么需要 force**：节流是按「宿主什么时候刷新首页」算的，而模块可能**刚重启**
+     * （内存缓存归零、磁盘那份又过期或被清），此刻它是真没有登录态 —— 而节流不会因为
+     * 「接收方丢了」而放行。用户正站在驿站门口点「获取身份码」，等 30 分钟是不行的。
+     * 节流防的是「每次首页查询都传一遍登录态」，不是防「对方明确要了一次」。
      */
-    fun sendCookieSync(context: Context) {
+    fun sendCookieSync(context: Context, force: Boolean = false) {
         val now = System.currentTimeMillis()
-        if (now - lastCookieSyncAt < COOKIE_SYNC_INTERVAL_MS) return
+        if (!force && now - lastCookieSyncAt < COOKIE_SYNC_INTERVAL_MS) return
         lastCookieSyncAt = now
         runCatching {
-            val cookie = CainiaoCookieSource.cookie(context)
-            if (cookie.isNullOrBlank()) return
+            val cookie = HostCredentialSource.cookie(context)
             val intent = Intent(ExpressRelay.ACTION_COOKIE_SYNC)
                 .setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
-                .putExtra(ExpressRelay.EXTRA_COOKIE, cookie)
+            if (cookie.isNullOrBlank()) {
+                // 读不到也**发一条只带原因的广播**，而不是静默返回。
+                //
+                // 静默的代价（2026-09-26 实测）：模块侧看到的是一片空白 —— 没有 `cookie synced`、
+                // 没有轨迹、没有报错，与「宿主这半天没刷新过首页」完全同形，用户报的「这台设备
+                // 怎么都获取不了」就卡在无法区分上。带上原因之后，模块日志里能直接读到
+                // 「宿主说它没有登录态」，而不是继续猜。
+                intent.putExtra(
+                    ExpressRelay.EXTRA_COOKIE_ERROR,
+                    // 具体原因由读取侧给出（文件不见了 / 库里没有这个域 / 打开失败），
+                    // 这里只兜住「连原因都没记下来」的情况。
+                    HostCredentialSource.lastReason
+                        .ifBlank { "宿主侧没有可用登录态（读取方没记下原因）" },
+                )
+                context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+                XposedBridge.logAlways("cookie sync: 宿主侧没有可用登录态，已发回执")
+                return
+            }
+            intent.putExtra(ExpressRelay.EXTRA_COOKIE, cookie)
                 // 菜鸟 WebView 的真实 UA 随 cookie 一起送过去：模块进程发 MTOP 请求时用它，
                 // 让 UA 与 cookie 的画像一致（浏览器 UA 配菜鸟登录态本身就是风控特征）。
                 // getDefaultUserAgent 首次调用会起 WebView 进程，可能要几百毫秒 —— 但这条
                 // 链路 30 分钟才走一次，且在 hook 回调线程上，不卡宿主主线程。
                 .putExtra(ExpressRelay.EXTRA_COOKIE_UA, webviewUa(context))
             context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
-            XposedBridge.log("cookie synced to module (${cookie.length} chars)")
+            XposedBridge.log("cookie synced to module (${cookie.length} chars, force=$force)")
         }.onFailure { XposedBridge.logError("cookie sync failed", it) }
     }
 
@@ -137,6 +187,10 @@ internal object ExpressRelaySender {
             putExtra(ExpressRelay.EXTRA_ARRIVAL_AT, record.arrivalAt ?: 0L)
             putExtra(ExpressRelay.EXTRA_LOGISTICS_DETAIL, record.logisticsDetail)
             putExtra(ExpressRelay.EXTRA_STATION_HOURS, record.stationHours)
+            // 坐标用 NaN 表示「没有」：putExtra 收不了 null，而 NaN 本身也不是合法坐标
+            // （0 是几内亚湾上的一个点，接收端会把它当成有效值）。
+            putExtra(ExpressRelay.EXTRA_STATION_LAT, record.stationLat ?: Double.NaN)
+            putExtra(ExpressRelay.EXTRA_STATION_LNG, record.stationLng ?: Double.NaN)
             putExtra(ExpressRelay.EXTRA_STATION_ADDRESS, record.stationAddress)
             putExtra(ExpressRelay.EXTRA_GOODS_IMAGE, record.goodsImage)
             // 轨迹条数不定，编成一个字符串传（编解码只有 ExpressTraceCodec 一处）。

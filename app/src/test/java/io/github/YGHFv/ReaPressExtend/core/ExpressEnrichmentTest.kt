@@ -851,4 +851,70 @@ class ExpressHostFieldsTest {
         assertNull(ExpressFormatter.stationHoursLabel("   "))
         assertNull(ExpressFormatter.stationHoursLabel(null))
     }
+
+    // ------------------------------------------------- 来源字段的归一化
+
+    @Test
+    fun `收件类型词不算电商平台`() {
+        // 真机截图（2026-09-26，`17-5-8644` 那件）：非淘包裹的 `pkgSourceDesc` 写的是
+        // 「普通收件」—— 它说的是「哪一类收件」，不是「哪个平台」。
+        // 当成平台显示有两个后果：那句话零信息量；而且它会占住卡片 `平台 · 商品名` 的
+        // 前半段，商品名（`ZM-冰箱贴`）看起来就像没读出来。
+        assertNull(ExpressPlatform.normalize("普通收件"))
+        assertNull(ExpressPlatform.normalize("普通快递"))
+        assertNull(ExpressPlatform.normalize("其他"))
+        assertNull(ExpressPlatform.normalize("未知"))
+    }
+
+    @Test
+    fun `真平台名一律保留`() {
+        // 表外的值**原样返回**：多显示一个没用的词只是难看，吃掉一个真平台名是静默丢信息。
+        assertEquals("淘宝", ExpressPlatform.normalize("淘宝"))
+        assertEquals("天猫", ExpressPlatform.normalize("天猫"))
+        assertEquals("拼多多", ExpressPlatform.normalize("拼多多"))
+        // 将来菜鸟多一个平台，不该因为「不在表里」就消失
+        assertEquals("抖音商城", ExpressPlatform.normalize("抖音商城"))
+    }
+
+    @Test
+    fun `空白来源归一成没有来源`() {
+        assertNull(ExpressPlatform.normalize(null))
+        assertNull(ExpressPlatform.normalize(""))
+        assertNull(ExpressPlatform.normalize("   "))
+        // 宿主偶尔带空白，去空白后仍是平台名
+        assertEquals("淘宝", ExpressPlatform.normalize(" 淘宝 "))
+    }
+
+    @Test
+    fun `历史里存下的类型词在读路径上被洗掉`() {
+        // 旧版本把 `pkgSourceDesc` 原样存了下来。只在 hook 侧清洗的话，历史记录（以及
+        // 「只填空不覆盖」合并出来的结果）永远洗不掉 —— 所以读路径也要过一遍。
+        val legacy = """[{"pkg":"com.cainiao.wireless","raw":"旧记录","tn":"79030000000009",
+            "courier":"ZHONGTONG","pickup":"1-6-4011","station":"阳光花园菜拼多多驿站",
+            "status":"READY_FOR_PICKUP","title":"菜鸟","origin":"ENRICHMENT","kw":[],
+            "conf":100,"at":1000,"platform":"普通收件","goods":null}]"""
+            .replace("\n", "")
+
+        val restored = ExpressRecordStore.parse(legacy).single()
+        assertNull(restored.platform)
+        // 洗掉来源之后，卡片那一行就只剩商品名 —— 不再由泛称占位
+        assertNull(ExpressFormatter.goodsSummary(restored))
+    }
+
+    @Test
+    fun `商品名读不出来时卡片那行不再被泛称占住`() {
+        // 这是用户报的那个现象的最小复现：只有「普通收件」+ 没有商品名。
+        // 清洗之后整行省略（而不是显示一句看不出任何信息的话）。
+        val byTypeWordOnly = host(platform = "普通收件", goodsName = null)
+        assertNull(ExpressFormatter.goodsSummary(byTypeWordOnly))
+
+        // 有了商品名（不管是宿主 `packageItem[0].itemTitle` 还是轨迹的
+        // `packageItems[0].goodsName` 回填的），那行就该是纯商品名。
+        assertEquals("ZM-冰箱贴", ExpressFormatter.goodsSummary(byTypeWordOnly.copy(goodsName = "ZM-冰箱贴")))
+        // 真平台 + 商品名仍按原格式拼
+        assertEquals(
+            "淘宝 · ZM-冰箱贴",
+            ExpressFormatter.goodsSummary(byTypeWordOnly.copy(platform = "淘宝", goodsName = "ZM-冰箱贴")),
+        )
+    }
 }

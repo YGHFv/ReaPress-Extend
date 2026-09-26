@@ -78,6 +78,17 @@ data class ExpressRecord(
      */
     val stationAddress: String? = null,
     /**
+     * 驿站坐标（WGS84 度）。宿主 `packageStation.stationLat` / `stationLng`。
+     *
+     * 「身份码弹窗显示哪个驿站的码」靠它算距离（见 [GeoDistance]）。**很多行是空的** ——
+     * 宿主由服务端下发这两个字段，没下发就没有值，所以整条链路都必须能把「没有坐标」当正常情况：
+     * 弹窗选不到最近驿站时退回「件数最多的那个」，而不是报错。
+     *
+     * 与 [station] 同一条规矩：**只填空不覆盖**（坐标不随状态变，没有更替语义）。
+     */
+    val stationLat: Double? = null,
+    val stationLng: Double? = null,
+    /**
      * 全轨迹（最早 → 最新）。
      *
      * 宿主首页只给一句 `lastLogisticDetail`（最新那条），完整节点要单独查。
@@ -263,6 +274,9 @@ data class ExpressRecord(
             },
             stationHours = stationHours ?: other.stationHours,
             stationAddress = stationAddress ?: other.stationAddress,
+            // 坐标与地址同类：宿主不随状态改它，只填空。
+            stationLat = stationLat ?: other.stationLat,
+            stationLng = stationLng ?: other.stationLng,
             goodsImage = goodsImage ?: other.goodsImage,
             // 轨迹是这张字段表里**唯一会被更替**的 —— 其它字段只会从 null 变成有值，
             // 而轨迹本身随时间增长，新查到的那份就是更全的。

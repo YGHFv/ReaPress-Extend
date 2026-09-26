@@ -1,5 +1,6 @@
 package io.github.YGHFv.ReaPressExtend.core
 
+import io.github.YGHFv.ReaPressExtend.core.ExpressTracePoint
 import io.github.YGHFv.ReaPressExtend.notification.ExpressHomeGrouper
 import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
 import org.json.JSONArray
@@ -9,6 +10,8 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.time.LocalDateTime
+import java.time.ZoneId
 
 /**
  * 首页分组与记录存储的单测。
@@ -165,6 +168,63 @@ class ExpressHomeGroupTest {
         // 显示的是归一化后的名字：品牌前缀和外层括号在身份判定那一步就剥掉了
         assertEquals("A店", groups.first().station)
         assertEquals(ExpressHomeGrouper.UNKNOWN_STATION, groups.last().station)
+    }
+
+    @Test
+    fun `驿站排序_首页从少到多_管理页从多到少`() {
+        // 2026-09-26 用户同一天定的两条，方向相反但都经过确认：
+        // - 管理页「数量多和最近收件的驿站靠前」（问的是「哪一站最值得管」）；
+        // - 首页「待取件快递按从少到多排序」（问的是「我现在先看哪一站」——只剩一件的站顺手就能拿）。
+        // 旧规则（两边都按名字排 / 两边都件多靠前）在这组数据下都会验出失败：
+        // 名字序 A店 在 B店 前，件数序相反。
+        val records = listOf(
+            record(pickup = "1", station = "菜鸟驿站(A店)", status = ExpressStatus.READY_FOR_PICKUP),
+            record(pickup = "2", station = "菜鸟驿站(B店)", status = ExpressStatus.READY_FOR_PICKUP),
+            record(pickup = "3", station = "菜鸟驿站(B店)", status = ExpressStatus.READY_FOR_PICKUP),
+            record(pickup = "4", station = "菜鸟驿站(B店)", status = ExpressStatus.READY_FOR_PICKUP),
+        )
+        assertEquals(
+            listOf("A店", "B店"),
+            ExpressHomeGrouper.group(records).first().stationGroups.map { it.station },
+        )
+        assertEquals(
+            listOf("B店", "A店"),
+            ExpressHomeGrouper.stations(records).map { it.displayName },
+        )
+    }
+
+    @Test
+    fun `件数相同时最近到件的驿站排前面`() {
+        val records = listOf(
+            record(
+                pickup = "1",
+                station = "菜鸟驿站(A店)",
+                status = ExpressStatus.READY_FOR_PICKUP,
+                at = 1_000L,
+            ),
+            record(
+                pickup = "2",
+                station = "菜鸟驿站(B店)",
+                status = ExpressStatus.READY_FOR_PICKUP,
+                at = 9_000L,
+            ),
+        )
+        val groups = ExpressHomeGrouper.group(records).first().stationGroups
+        // 各 1 件（件数这一层分不出高低）→ 落到「最新一条谁更新」：B 店刚到的排前面
+        assertEquals(listOf("B店", "A店"), groups.map { it.station })
+    }
+
+    @Test
+    fun `未知地点件数再多也垫底`() {
+        // 「未知取件地点」不是一处真实地点，件再多也不该把真驿站挤下去
+        val records = listOf(
+            record(pickup = "1", station = null, status = ExpressStatus.READY_FOR_PICKUP),
+            record(pickup = "2", station = null, status = ExpressStatus.READY_FOR_PICKUP),
+            record(pickup = "3", station = null, status = ExpressStatus.READY_FOR_PICKUP),
+            record(pickup = "4", station = "菜鸟驿站(A店)", status = ExpressStatus.READY_FOR_PICKUP),
+        )
+        val groups = ExpressHomeGrouper.group(records).first().stationGroups
+        assertEquals(listOf("A店", ExpressHomeGrouper.UNKNOWN_STATION), groups.map { it.station })
     }
 
     @Test
@@ -401,7 +461,7 @@ class ExpressHomeGroupTest {
         val records = listOf(
             record(pickup = "1-1-1111", station = "A站", status = ExpressStatus.READY_FOR_PICKUP),
             record(tracking = "SF1", station = "B站", status = ExpressStatus.SIGNED),
-            record(tracking = "SF2", station = null, status = ExpressStatus.IN_TRANSIT),
+            record(pickup = "1-1-2222", status = ExpressStatus.READY_FOR_PICKUP),
         )
         val stations = ExpressHomeGrouper.stations(records)
 
@@ -409,6 +469,54 @@ class ExpressHomeGroupTest {
         // 未知地点垫底，和首页卡片同一个顺序
         assertEquals(ExpressHomeGrouper.UNKNOWN_STATION, stations.last().key)
         assertEquals(listOf("A站", "B站"), stations.dropLast(1).map { it.displayName })
+    }
+
+    @Test
+    fun `没有地点信息的在途件不占驿站管理的位置`() {
+        // 2026-09-26 用户报：运输中 / 送货上门 / 本人签收的记录被识别成「未知取件地点」。
+        // 宿主对这些状态本来就不下发 stationName，把它们算进来只会让列表底部永远挂着一行
+        // 说不出是哪的条目，用户既找不到地方也没法对它做什么。
+        // 只有**待取件**的缺名记录值得单独列一行 —— 那里能给它填默认取件码 / 精确地址。
+        val records = listOf(
+            record(tracking = "SF1", status = ExpressStatus.IN_TRANSIT),
+            record(tracking = "SF2", status = ExpressStatus.DELIVERING),
+            record(tracking = "SF3", status = ExpressStatus.UNKNOWN),
+            record(tracking = "SF4", status = ExpressStatus.SIGNED),
+        )
+        assertTrue(ExpressHomeGrouper.stations(records).isEmpty())
+    }
+
+    @Test
+    fun `合并到一处之后驿站管理只剩一行`() {
+        // 用户报的原话：「驿站管理已经合并的还是会显示两条」。
+        // 链式规则（A 并进 B、B 又改名）之后，两条链算出的显示名相同、簇身份却不同 ——
+        // 按身份分组会给出两行同名条目，用户看到的就是「合了跟没合一样」。
+        val records = listOf(
+            record(pickup = "1", station = "阜阳颍滨花园店", status = ExpressStatus.READY_FOR_PICKUP),
+            record(
+                pickup = "2",
+                station = "颖滨23号楼109颖滨花园菜拼多多驿站",
+                status = ExpressStatus.READY_FOR_PICKUP,
+            ),
+        )
+        val rules = ExpressStationRules(
+            mapOf(
+                "颖滨23号楼109颖滨花园菜拼多多驿站" to "颖滨花园驿站",
+                "阜阳颍滨花园店" to "颖滨23号楼109颖滨花园菜拼多多驿站",
+            ),
+        )
+        val station = ExpressHomeGrouper.stations(records, rules).single()
+
+        assertEquals("颖滨花园驿站", station.displayName)
+        assertEquals(2, station.count)
+        // key 取链头（组内没有别的键指向它的那一个）：规则写在这里，整条链跟着变
+        assertEquals("颖滨23号楼109颖滨花园菜拼多多驿站", station.key)
+        // 整行的规则键都要在 —— 改名 / 合并 / 恢复默认必须对整组一起做，只动一个键会当场裂回两行
+        assertEquals(
+            listOf("阜阳颍滨花园店", "颖滨23号楼109颖滨花园菜拼多多驿站"),
+            station.ruleKeys,
+        )
+        assertTrue(station.renamed)
     }
 
     @Test
@@ -716,7 +824,7 @@ class ExpressRecordStoreTest {
     }
 
     @Test
-    fun `运输中档内按状态推进度排_待揽收垫底`() {
+    fun `运输中档内按时间倒序_最近更新的在前`() {
         val records = listOf(
             record(tracking = "SF001", status = ExpressStatus.CREATED, at = 3000L),
             record(tracking = "SF002", status = ExpressStatus.IN_TRANSIT, at = 1000L),
@@ -724,9 +832,90 @@ class ExpressRecordStoreTest {
             record(tracking = "SF004", status = ExpressStatus.IN_TRANSIT, at = 4000L),
         )
         val transit = ExpressHomeGrouper.group(records).first { it.title == "运输中" }
+        // 纯时间倒序（2026-09-26 用户定的：「运输中和已签收快递都按时间排序，最近更新和
+        // 签收的在前面」），取代此前「状态推进度 + 时间」的混排 —— 状态差异由卡片自己的
+        // 状态词表达，位置只回答「哪件刚有动静」，所以待揽收（CREATED）不再垫底。
         assertEquals(
-            listOf("SF004", "SF002", "SF003", "SF001"),
+            listOf("SF004", "SF001", "SF003", "SF002"),
             transit.records.map { it.trackingNumber },
+        )
+    }
+
+    @Test
+    fun `已签收档内按签收时间倒序_最近签收的在前`() {
+        // 与运输中同一条规矩。异常件（FAILED）与已签收同档同序 —— 它要不要处理由状态
+        // 文案说明，不靠位置表达。
+        val records = listOf(
+            record(tracking = "SF001", status = ExpressStatus.SIGNED, at = 1000L),
+            record(tracking = "SF002", status = ExpressStatus.FAILED, at = 9000L),
+            record(tracking = "SF003", status = ExpressStatus.SIGNED, at = 5000L),
+        )
+        val done = ExpressHomeGrouper.group(records).first { it.title == "已签收 / 异常" }
+        assertEquals(
+            listOf("SF002", "SF003", "SF001"),
+            done.records.map { it.trackingNumber },
+        )
+    }
+
+    @Test
+    fun `已签收超过7天进归档_首页不再显示`() {
+        val day = 24L * 60L * 60L * 1000L
+        val now = 100L * day
+        val fresh = record(tracking = "SF001", status = ExpressStatus.SIGNED, at = now - 3 * day)
+        val stale = record(tracking = "SF002", status = ExpressStatus.SIGNED, at = now - 8 * day)
+        val all = listOf(fresh, stale)
+
+        // 首页：只剩 3 天前签收的那件；8 天前的不在（注意传 now，默认 0 = 不做归档切分，
+        // 旧调用点 / 其他测试不传 now 就还是全量显示 —— 这是有意的）。
+        val sections = ExpressHomeGrouper.group(all, now = now)
+        assertEquals(
+            listOf("SF001"),
+            sections.first { it.title == "已签收 / 异常" }.records.map { it.trackingNumber },
+        )
+        // 归档页：刚好那一件，最近归档的排最上面。
+        assertEquals(
+            listOf("SF002"),
+            ExpressHomeGrouper.archive(all, now).map { it.trackingNumber },
+        )
+        // 两处并集必须等于全部已完成记录 —— 一件既不在首页也不在归档页就是数据丢失。
+        assertEquals(
+            setOf("SF001", "SF002"),
+            (sections.first { it.title == "已签收 / 异常" }.records.map { it.trackingNumber } +
+                ExpressHomeGrouper.archive(all, now).map { it.trackingNumber }).toSet(),
+        )
+    }
+
+    @Test
+    fun `归档判据看的是完成时刻而不是入站时刻_刚取走的件不消失`() {
+        // 整站确认取走的件，timestamp 停在入站那一刻（可能八天前），但用户是**现在**取的。
+        // 归档判据若只看 timestamp，双击确认的瞬间卡片就消失，看着像操作失败。
+        val day = 24L * 60L * 60L * 1000L
+        val now = 100L * day
+        // 本测试类里的 record() 只有 tracking/status/at 三个参数（见上），其余字段用 copy 补。
+        val justPicked = record(status = ExpressStatus.READY_FOR_PICKUP, at = now - 9 * day)
+            .copy(pickupCode = "1-1-1111", station = "菜鸟驿站(A店)", pickedUpAt = now)
+        val archived = ExpressHomeGrouper.archive(listOf(justPicked), now)
+        assertTrue("刚确认取件的记录不该立刻归档", archived.isEmpty())
+    }
+
+    @Test
+    fun `归档判据不信被刷新过的timestamp_签收时刻以轨迹为准`() {
+        // 真机实证（2026-09-26）：宿主自查 / 富化合并会把 timestamp 刷到「今天」，而真实
+        // 签收时刻在轨迹里。completedAtOf 若含 timestamp，已签收件的「完成时刻」永远等于
+        // 今天 → `now - 完成时刻 >= 7 天` 永不成立 → 归档页永远「暂无」。
+        // 所以完成时刻只认「能证明它完成了」的三处：轨迹末节点 / arrival / pickedUpAt，
+        // 三处全空才兜底 timestamp（那条兜底路径由上面那条测试覆盖）。
+        val day = 24L * 60L * 60L * 1000L
+        val signedAt = LocalDateTime.parse("2020-01-01T00:00:00")
+            .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        val now = signedAt + 8 * day
+        // timestamp「今天」（= now，模拟被宿主刷新过），但轨迹停在 8 天前的签收节点。
+        val signed = record(status = ExpressStatus.SIGNED, at = now)
+            .copy(trace = listOf(ExpressTracePoint("2020-01-01 00:00:00", "快件已签收")))
+        assertEquals(
+            "8 天前签收的件该进归档，尽管 timestamp 被刷到了今天",
+            listOf("SF123"),
+            ExpressHomeGrouper.archive(listOf(signed), now).map { it.trackingNumber },
         )
     }
 

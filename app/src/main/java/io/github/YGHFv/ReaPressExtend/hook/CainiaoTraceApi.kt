@@ -34,8 +34,12 @@ import java.net.URLEncoder
  */
 internal object CainiaoTraceApi {
 
-    private const val BASE =
-        "https://acs.m.taobao.com/h5/mtop.taobao.logisticstracedetailservice.queryalltrace/1.0/"
+    /** MTOP 的 H5 通道入口。所有接口共用同一个 host 与同一套 appKey / 签名规则。 */
+    private const val HOST = "https://acs.m.taobao.com/h5/"
+
+    /** 全轨迹接口。 */
+    private const val TRACE_API = "mtop.taobao.logisticstracedetailservice.queryalltrace"
+    private const val TRACE_VERSION = "1.0"
 
     private const val APP_KEY = MtopSign.TAOBAO_H5_APP_KEY
 
@@ -118,55 +122,97 @@ internal object CainiaoTraceApi {
     private data class Token(val raw: String, val enc: String?)
 
     /**
-     * 菜鸟进程入口：cookie 从菜鸟自己的 WebView 库里读（[CainiaoCookieSource]）。
+     * **最近一次失败的原因**（人话，可直接展示），成功时清空。
+     *
+     * 为什么要把它留着：以前所有失败都只写进 hook 日志，而模块侧能看到的只有「详情页转了
+     * 几秒然后显示暂无轨迹」—— 用户报的「怎么都获取不了」和「风控退避中」在界面上长得一模一样。
+     * 现在详情页 / 身份码弹窗可以直接把这句话显示出来，`ExpressRelay` 那条链路之外也就不用再猜。
+     */
+    @Volatile
+    var lastError: String? = null
+        private set
+
+    private fun fail(reason: String): String? {
+        lastError = reason
+        return null
+    }
+
+    /**
+     * 菜鸟进程入口：cookie 从菜鸟自己的 WebView 库里读（[HostCredentialSource]）。
      * 模块进程走 [fetch] 的 cookie 直传重载 —— 那边读不到这个文件。
      */
     fun fetch(context: Context, trackingNumber: String): CainiaoTraceInfo? =
-        fetch(CainiaoCookieSource.cookie(context), trackingNumber)
+        fetch(HostCredentialSource.cookie(context), trackingNumber)
 
     /** [fetch] 的 cookie 直传入口（模块进程经 `TraceCookieCache` 调这里）。 */
     fun fetch(cookie: String?, trackingNumber: String): CainiaoTraceInfo? {
-        if (cookie.isNullOrBlank()) {
-            // 用户没在菜鸟里登录过淘宝系账号 —— 这不是错误，只是这条路走不通。
-            XposedBridge.logAlways("cainiao trace: 没有可用 cookie，跳过 ${trackingNumber.take(6)}…")
-            return null
-        }
-
-        // token 的三级来源：**cookie 里现成的**（菜鸟 WebView 跑过 H5 页面时写进 Cookies 库的，
-        // 随 cookie 一起同步过来）→ 内存缓存（上次预热拿的）→ 预热。每次 fetch 都预热等于
-        // 请求数翻倍（预热那发也会被风控计数），能省则省。
-        // cookie 里拿的不进缓存：它会随菜鸟的使用自己更新，缓存反而可能钉死一份过期的。
-        val token = tokenFromCookie(cookie) ?: cachedToken
-            ?: warmUp(cookie)?.also { cachedToken = it } ?: run {
-                XposedBridge.logAlways("cainiao trace: 预热没拿到 token，跳过 ${trackingNumber.take(6)}…")
-                return null
-            }
-
-        val data = requestBody(trackingNumber)
-        val timestamp = System.currentTimeMillis().toString()
-        val sign = MtopSign.wapSign(MtopSign.tokenOf(token.raw), timestamp, APP_KEY, data)
-
-        val url = BASE + "?jsv=2.3.18&appKey=" + APP_KEY + "&t=" + timestamp + "&sign=" + sign +
-            "&type=originaljson&data=" + URLEncoder.encode(data, "UTF-8")
-
-        val body = get(url, cookieWithTokens(cookie, token)).first
+        val body = callH5(TRACE_API, TRACE_VERSION, requestBody(trackingNumber), cookie)
+            ?: return null
         val info = CainiaoTraceParser.parse(body)
         if (info == null) {
             // 把响应开头打出来 —— 失败原因是「被风控拦了」还是「接口形状变了」，一眼可分。
-            // 预热通过了但正式请求被拦的情况同样存在（token 拿到了、请求节奏太密），
-            // 这里也要认风控，别让退避只覆盖一半链路。
-            if (isRiskResponse(body)) {
-                markRiskBlocked()
-                XposedBridge.logAlways("cainiao trace: 正式请求被风控，指数退避（档位=$backoffLevel）")
-            }
+            lastError = "轨迹接口返回的内容解析不出结果"
             XposedBridge.logAlways(
                 "cainiao trace: 解析不出结果 tn=${trackingNumber.take(6)}… resp=${body.take(120)}",
             )
-        } else {
-            // 成功是退避档位唯一归零的时刻 —— 说明当前节奏服务端能接受。
-            backoffLevel = 0
+            return null
         }
+        // 成功是退避档位唯一归零的时刻 —— 说明当前节奏服务端能接受。
+        backoffLevel = 0
+        lastError = null
         return info
+    }
+
+    /**
+     * 通用 MTOP H5 GET —— 三段式（预热拿 token → 算 sign → 正式请求）从 [fetch] 里抽出来。
+     *
+     * ⚠️ **它只对 H5 通道上开放的那些接口有效**。身份码（`mtop.cainiao.nbpickup.*identitycode*`）
+     * 曾经也走这里，2026-09-26 真机实证是死路：预热连 `_m_h5_tk` 都不下发，直接回
+     * `FAIL_SYS_SESSION_EXPIRED` —— 而同一时刻同一份 cookie 拉轨迹成功，说明不是登录态问题，
+     * 是那条接口只在 APP 通道可用。身份码现在改为请菜鸟用它自己的会话取
+     * （`CainiaoIdentityBridge`），别再往这里接。
+     *
+     * 共用同一份 `cachedToken` 是对的：`_m_h5_tk` 是按 **appKey + 域名** 下发的，
+     * 与具体接口无关；换个接口就重新预热等于把请求数翻倍，而请求数正是风控的触发条件。
+     *
+     * @return 响应体；cookie 缺失、预热失败、或网络异常时返回 null（原因写进 [lastError]）。
+     *   风控命中时会顺手进指数退避（[markRiskBlocked]），调用方不必自己判。
+     */
+    fun callH5(api: String, version: String, data: String, cookie: String?): String? {
+        if (cookie.isNullOrBlank()) {
+            // 用户没在菜鸟里登录过淘宝系账号 —— 这不是错误，只是这条路走不通。
+            XposedBridge.logAlways("cainiao h5: 没有可用 cookie，跳过 $api")
+            return fail("没有可用的淘宝登录态（请在菜鸟里登录后重试）")
+        }
+
+        val base = "$HOST$api/$version/"
+        // token 的三级来源：**cookie 里现成的**（菜鸟 WebView 跑过 H5 页面时写进 Cookies 库的，
+        // 随 cookie 一起同步过来）→ 内存缓存（上次预热拿的）→ 预热。每次请求都预热等于
+        // 请求数翻倍（预热那发也会被风控计数），能省则省。
+        // cookie 里拿的不进缓存：它会随菜鸟的使用自己更新，缓存反而可能钉死一份过期的。
+        val token = tokenFromCookie(cookie) ?: cachedToken
+            ?: warmUp(base, cookie)?.also { cachedToken = it }
+            ?: run {
+                XposedBridge.logAlways("cainiao h5: 预热没拿到 token，跳过 $api")
+                return fail(lastError ?: "预热没拿到 token（网络不通或被风控拦下）")
+            }
+
+        val timestamp = System.currentTimeMillis().toString()
+        val sign = MtopSign.wapSign(MtopSign.tokenOf(token.raw), timestamp, APP_KEY, data)
+
+        val url = base + "?jsv=2.3.18&appKey=" + APP_KEY + "&t=" + timestamp + "&sign=" + sign +
+            "&type=originaljson&data=" + URLEncoder.encode(data, "UTF-8")
+
+        val body = get(url, cookieWithTokens(cookie, token)).first
+        // 风控检查放在这里而不是「解析失败之后」：预热通过了但正式请求被拦同样存在
+        // （token 拿到了、请求节奏太密），而这两个接口的失败长相不同 ——
+        // 让退避只覆盖一半链路等于没覆盖。
+        if (isRiskResponse(body)) {
+            markRiskBlocked()
+            XposedBridge.logAlways("cainiao h5: 请求被风控，指数退避（档位=$backoffLevel）")
+            lastError = "被淘宝风控拦下（按请求频率保护），稍后再试"
+        }
+        return body
     }
 
     /** 风控响应的指纹：`ret` 数组里的这两个词。命中任何一处都算。 */
@@ -191,8 +237,8 @@ internal object CainiaoTraceApi {
     }
 
     /** 预热：一次不带 sign 的请求，目的只是让服务端把 `_m_h5_tk` / `_m_h5_tk_enc` 发下来。 */
-    private fun warmUp(cookie: String): Token? {
-        val (body, setCookies) = get("$BASE?appKey=$APP_KEY", cookie)
+    private fun warmUp(base: String, cookie: String): Token? {
+        val (body, setCookies) = get("${base}?appKey=$APP_KEY", cookie)
 
         var raw: String? = null
         var enc: String? = null
@@ -217,9 +263,11 @@ internal object CainiaoTraceApi {
         if (raw.isNullOrBlank()) {
             if (isRiskResponse(body)) {
                 markRiskBlocked()
-                XposedBridge.logAlways("cainiao trace: 撞到风控，指数退避（档位=$backoffLevel）")
+                XposedBridge.logAlways("cainiao h5: 预热撞到风控，指数退避（档位=$backoffLevel）")
+                fail("被淘宝风控拦下（按请求频率保护），稍后再试")
             } else {
-                XposedBridge.logAlways("cainiao trace: 预热响应无 token，resp=${body.take(120)}")
+                XposedBridge.logAlways("cainiao h5: 预热响应无 token，resp=${body.take(120)}")
+                lastError = "预热响应里没有 token（接口形状可能变了）"
             }
             return null
         }

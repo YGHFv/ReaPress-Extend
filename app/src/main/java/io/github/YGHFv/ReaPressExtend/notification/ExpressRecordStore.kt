@@ -3,12 +3,18 @@ package io.github.YGHFv.ReaPressExtend.notification
 import android.content.Context
 import io.github.YGHFv.ReaPressExtend.core.Courier
 import io.github.YGHFv.ReaPressExtend.core.ExpressEnrichmentMatcher
+import io.github.YGHFv.ReaPressExtend.core.ExpressFormatter
 import io.github.YGHFv.ReaPressExtend.core.ExpressOrigin
+import io.github.YGHFv.ReaPressExtend.core.ExpressPlatform
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
 import io.github.YGHFv.ReaPressExtend.core.ExpressStationName
 import io.github.YGHFv.ReaPressExtend.core.ExpressStationRules
 import io.github.YGHFv.ReaPressExtend.core.ExpressStatus
 import io.github.YGHFv.ReaPressExtend.core.ExpressTraceCodec
+import io.github.YGHFv.ReaPressExtend.core.GeoDistance
+import io.github.YGHFv.ReaPressExtend.core.GeoPoint
+import io.github.YGHFv.ReaPressExtend.core.IdentitySource
+import io.github.YGHFv.ReaPressExtend.core.geoPointOf
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
 import org.json.JSONArray
 import org.json.JSONObject
@@ -460,6 +466,9 @@ object ExpressRecordStore {
                     // 轨迹直接存成编码后的字符串（`[["时间","文案"],…]`），
                     // 编解码只有 ExpressTraceCodec 一处在做。
                     put("saddr", record.stationAddress ?: JSONObject.NULL)
+                    // 驿站坐标。同样是后加的键、短名，旧 JSON 缺键 → null。
+                    put("lat", record.stationLat ?: JSONObject.NULL)
+                    put("lng", record.stationLng ?: JSONObject.NULL)
                     put("trace", record.trace.takeIf { it.isNotEmpty() }?.let { ExpressTraceCodec.encode(it) } ?: JSONObject.NULL)
                     put("gimg", record.goodsImage ?: JSONObject.NULL)
                 },
@@ -492,7 +501,10 @@ object ExpressRecordStore {
                     }.orEmpty(),
                     confidence = obj.optInt("conf"),
                     timestamp = obj.optLong("at"),
-                    platform = obj.optStringOrNull("platform"),
+                    // 归一化放在**读路径**上：旧版本把宿主的 `pkgSourceDesc` 原样存下来了 ——
+                    // 非淘包裹那份是「普通收件」这种收件类型词，不是平台名。清洗只写在
+                    // hook 侧的话，历史记录（以及「只填空不覆盖」的合并结果）永远洗不掉。
+                    platform = ExpressPlatform.normalize(obj.optStringOrNull("platform")),
                     goodsName = obj.optStringOrNull("goods"),
                     // 缺键时 optLong 给 0，0 不是合法时间戳（发送端也用它表示「没有」）。
                     arrivalAt = obj.optLong("arrival").takeIf { it > 0L },
@@ -504,6 +516,10 @@ object ExpressRecordStore {
                     // 轨迹接口补出来的字段。旧 JSON 里没有这几个键 ——
                     // 缺 "trace" 解出空表、缺另两个解出 null，都不会让历史记录读不出来。
                     stationAddress = obj.optStringOrNull("saddr"),
+                    // 坐标用 optDouble：缺键得到 NaN（不是 0）——0 是几内亚湾上的一个点，
+                    // 当成有效坐标会让「最近的驿站」永远算到非洲去。NaN 一律当「没有」。
+                    stationLat = obj.optDouble("lat").takeIf { !it.isNaN() },
+                    stationLng = obj.optDouble("lng").takeIf { !it.isNaN() },
                     trace = ExpressTraceCodec.decode(obj.optStringOrNull("trace")),
                     goodsImage = obj.optStringOrNull("gimg"),
                 )
@@ -567,8 +583,11 @@ data class ExpressStationGroup(
  */
 data class ExpressStationSummary(
     /**
-     * 规则表的键 —— [ExpressStationRules.renames] 用的就是这个字符串。
-     * 也是这站所有记录「代表了它们」的那个归一化名。
+     * 这一行的**主键**：规则表里代表整行的那一个键（[ExpressStationRules.renames] 用的字符串）。
+     *
+     * 「合并到其他驿站」把这个字符串写成目标 —— 它取的是**链头**（没有任何别的键指向它的
+     * 那一个），所以规则写在这里，整条链跟着变（理由与实现见 [ExpressHomeGrouper.stations]）。
+     * 单键的行（绝大多数）它就是那个唯一的键。
      */
     val key: String,
     /** 当前该显示的名字（用户的规则生效之后）。没改过时等于 [key]。 */
@@ -577,8 +596,20 @@ data class ExpressStationSummary(
     val rawNames: List<String>,
     /** 这个驿站名下的记录（不分状态）。详情页拿它列出「这站是哪几件」。 */
     val records: List<ExpressRecord>,
-    /** 用户手工改过名 / 合并过。界面据此决定要不要显示「恢复默认」。 */
+    /** 用户手工改过名 / 合并过 / 填过默认码、精确地址、现场指纹。界面据此决定要不要显示「恢复默认」。 */
     val renamed: Boolean,
+    /**
+     * 这一行覆盖的**全部**规则键（归一化名，去重后的顺序与记录顺序一致）。
+     *
+     * 一行只有在用户把几处**合并**到一起之后才会多于一个键 —— 那时 [key] 只是链头，
+     * 剩下的键是顺着链并进来的。写规则（改名 / 合并 / 默认码 / 精确地址）和清规则
+     * （恢复默认）都必须**对整组一起做**：只动链头的话，链里另一条会当场裂回独立的一行，
+     * 正是 2026-09-26 用户看到的「合并了还是两条」。
+     *
+     * 默认值给 [key] 是为了让单键的构造点不必都写一遍 —— 但 [ExpressHomeGrouper.stations]
+     * 总是显式传整组。
+     */
+    val ruleKeys: List<String> = listOf(key),
 ) {
     /** 这个驿站名下有多少条记录。 */
     val count: Int get() = records.size
@@ -627,10 +658,17 @@ object ExpressHomeGrouper {
     /**
      * @param rules 用户在「驿站管理」里做的合并 / 改名。默认空规则 = 只靠自动归一化分组，
      *   这也是单测里最常传的那一种。
+     * @param now 首页当前时刻（毫秒）。**只用于归档切分**：已完成超过 [ARCHIVE_RETENTION_MS]
+     *   的记录不再出现在「已签收 / 异常」这一档里 —— 它们进了「归档快递」二级页（[archive]）。
+     *
+     *   默认 `0L` = **不做归档切分**（now 为 0 时任何记录都不可能超期），所有已完成记录都留在
+     *   这一档。只关心分组结构的调用方（多数单测）用这个默认值即可；真正的首页那一处调用传的是
+     *   真实时钟 —— core 层刻意不碰系统时钟，所以时间必须从这里注入。
      */
     fun group(
         records: List<ExpressRecord>,
         rules: ExpressStationRules = ExpressStationRules.EMPTY,
+        now: Long = 0L,
     ): List<ExpressHomeSection> {
         val sections = mutableListOf<ExpressHomeSection>()
 
@@ -676,15 +714,16 @@ object ExpressHomeGrouper {
         if (transit.isNotEmpty()) {
             sections += ExpressHomeSection(
                 title = "运输中",
-                // 组内按**状态推进度**排（已在路上的在前、还没揽收的垫底），同档内再按时间
-                // 新的在前。纯时间序会把「包裹正在等待揽收」插在两件已上路中间 —— 用户扫
-                // 这一档时关心的是「到哪了」，不是一个绝对时间戳（2026-09-26 用户点名的顺序）。
-                // 其他档不这么排：到站档用户看的是取件码，派送中 / 已签收档内本来就没有
-                // 状态分层。
-                records = transit.sortedWith(
-                    compareByDescending<ExpressRecord> { it.status.order }
-                        .thenByDescending { it.timestamp },
-                ),
+                // **纯时间倒序**：最近有动静的排前面。2026-09-26 用户第二次定的规则 ——
+                // 此前这里按「状态推进度」排（已在路上的在前、还没揽收的垫底），那是他上一轮
+                // 点名的顺序；现在的原话是「运输中和已签收快递都按时间排序，最近更新和签收的
+                // 在前面」。不要用「推进度 + 时间」两层混合：用户扫这一档时问的是「哪件刚更新」。
+                //
+                // 时间取 [updatedAtOf]（轨迹最新节点 / 到站时间 / 宿主 gmt_modified 取最新）——
+                // 与卡片右上角那个「2小时前」依据的是同一个值（`ExpressFormatter.statusSince`
+                // 是它的一部分），**排序依据必须和用户看到的相对时间一致**，否则会出现
+                // 「它排在『3分钟前』上面，自己却写着『5小时前』」这种一眼就看出错的顺序。
+                records = transit.sortedWith(compareByDescending { updatedAtOf(it) }),
             )
         }
 
@@ -698,12 +737,19 @@ object ExpressHomeGrouper {
         // 整站确认取件的记录也归到这一档：用户已经取走了，它不该再留在「待取件」里，
         // 但它仍然是一条真实存在的包裹，直接删掉会让用户以为模块把数据弄丢了。
         // 等宿主推来「已签收」，它会自然留在这里；拿它当一条「已取」的凭据也不错。
-        val done = records.filter {
-            it.status in DONE_STATUSES ||
-                (it.status in PICKUP_STATUSES && identityOf(it, ids) in confirmed)
-        }
+        //
+        // 超过 [ARCHIVE_RETENTION_MS] 的那些**不在这里**：它们进了「归档快递」二级页。
+        // 首页这一档于是恒等于「最近一周内结束的件」—— 用户回头核对的就是这些，
+        // 再往前的只会让列表一直长下去（2026-09-26 用户要求）。
+        val done = finishedRecords(records, ids).filterNot { isArchived(it, now) }
         if (done.isNotEmpty()) {
-            sections += ExpressHomeSection(title = "已签收 / 异常", records = done)
+            sections += ExpressHomeSection(
+                title = "已签收 / 异常",
+                // 最近签收的在前 —— 与「运输中」同一条规矩（用户点名的「运输中和已签收快递
+                // 都按时间排序」）。异常件（投递失败）与已签收件同档同序：它是不是要处理，
+                // 由状态文案说明，不靠位置表达。
+                records = done.sortedWith(compareByDescending { completedAtOf(it) }),
+            )
         }
 
         return sections
@@ -715,8 +761,27 @@ object ExpressHomeGrouper {
      * 跟 [group] 用的是同一套归一化 + 聚类：界面上列出来的驿站，和首页卡片上的驿站，
      * 保证是同一批 —— 两边各算一次的话，用户会在管理页看到首页上不存在的条目。
      *
-     * 返回的 [ExpressStationSummary.key] 就是 [ExpressStationRules.renames] 的键，
+     * 返回的 [ExpressStationSummary.ruleKeys] 就是 [ExpressStationRules] 几张表的键空间，
      * 界面显示什么名字、规则表用什么键，是同一个字符串，中间不做转换。
+     *
+     * ## 分组键是**显示名**，不是簇身份（2026-09-26 修）
+     *
+     * 用户报过「驿站管理已经合并的还是会显示两条」。现场规则是链式的：
+     * `阜阳颍滨花园店 → 颖滨23号楼109… → 颖滨花园驿站`。两条链路算出的**显示名相同**、
+     * **簇身份不同**（一个是链头、一个是被并进来的那条），按身份分组就给出两行同名条目。
+     *
+     * 列表回答的是「我这台机器上有几处取件点」，同一处只能有一行 —— 所以按显示名归并。
+     * 而 [group] 里的分组归类、整站确认仍然按**簇身份**算，两者不能混：那两件事关心的是
+     * 「哪几件是同一个物理地点」，和用户给它起了什么名字无关（见 [identityOf]）。
+     *
+     * ## 缺地名的记录只看取件候选
+     *
+     * 宿主对运输中 / 派送中的包裹本来就不下发 `stationName`，「本人签收」这类状态识别不出的
+     * 更是连驿站都没有。它们进不了这一页 —— 否则列表底部永远挂着一行「未知取件地点」，
+     * 用户既不知道那是哪、也没法对它做什么（2026-09-26 用户报的原话）。
+     *
+     * 待取件的缺名记录**要**列出来：那是唯一能给它填「默认取件码 / 精确地址」的地方，
+     * 也是「手动添加取件码」那个功能将来的入口。
      *
      * **不筛状态**：管理页要能管到所有驿站（包括只有已签收包裹的那些）—— 用户想合并
      * 两个名字，不该因为其中一个暂时没有待取件就找不到入口。
@@ -727,26 +792,52 @@ object ExpressHomeGrouper {
     ): List<ExpressStationSummary> {
         val ids = stationIdentities(records)
         val labels = labelsOf(ids, rules)
-        val byKey = LinkedHashMap<String, MutableList<ExpressRecord>>()
+
+        val grouped = LinkedHashMap<String, MutableList<ExpressRecord>>()
         for (record in records) {
-            byKey.getOrPut(identityOf(record, ids)) { mutableListOf() } += record
+            val identity = identityOf(record, ids)
+            val display = labels[identity] ?: identity
+            // 见上方「缺地名的记录只看取件候选」。
+            if (display == UNKNOWN_STATION && record.status !in PICKUP_STATUSES) continue
+            grouped.getOrPut(display) { mutableListOf() } += record
         }
-        return byKey
-            .map { (key, items) ->
+
+        return grouped
+            .map { (display, items) ->
+                // 整行的全部规则键。写规则 / 清规则都要对整组一起做，理由见 [ExpressStationSummary.ruleKeys]。
+                val keys = items.map { normalizedKey(it) }.distinct()
                 ExpressStationSummary(
-                    // key 是**簇代表名**，也正是规则表用的键 —— 用户在详情页改名时写进
-                    // [ExpressStationRules.renames] 的就是它。
-                    key = key,
+                    // 「链头」= 组内**唯一没有指向组内别的键**的那个键，也就是这条改名链的终点。
+                    // 规则写在这里，链上所有键都会经由它到达同一个显示名（`apply` 是链式解析）。
+                    //
+                    // 判据不能反过来写「没有任何键指向它」：真机现场是 `阜阳颍滨花园店 →
+                    // 颖滨23号楼109…`、而 `颖滨23号楼109… → 颖滨花园驿站`，链的终点是后者 ——
+                    // 写在前者上只会让前半段改掉、后半段留在原地，一行又裂成两行。
+                    // 一个都挑不出来（用户的规则互相指成环）时退回第一个：环是输入错误，
+                    // 界面不该因此打不开，退回哪个键至少能让用户进去改掉。
+                    key = keys.firstOrNull { key ->
+                        keys.none { other -> other == rules.renames[key] }
+                    } ?: keys.first(),
                     // 走和首页同一张显示名表：管理页里看到的名字，必须和首页卡片上的名字一样。
-                    displayName = labels[key] ?: key,
+                    displayName = display,
                     // 归一化**之前**的原始写法：用户要在这行里认出「哦，这两个名字原来是同一处」。
                     rawNames = items.mapNotNull { it.station?.takeIf(String::isNotBlank) }.distinct(),
                     records = items,
-                    renamed = rules.hasRule(key),
+                    // 几张表任一有值都算「动过」—— 只记下一份位置指纹而没有改名，同样该给「恢复默认」。
+                    renamed = keys.any { rules.hasRule(it) },
+                    ruleKeys = keys,
                 )
             }
-            // 有名字的驿站排前面，未知的垫底 —— 和首页卡片同一个顺序。
-            .sortedWith(compareBy({ it.key == UNKNOWN_STATION }, { it.displayName }))
+            // 与首页卡片**同一套**排序规则（[stationOrder]），只有**件数方向**不同 ——
+            // 管理页这边是「件多的靠前」，首页那边是「件少的靠前」（见那里的 ⚠️）。
+            .sortedWith(
+                stationOrder<ExpressStationSummary>(
+                    isUnknown = { it.key == UNKNOWN_STATION },
+                    records = { it.records },
+                    name = { it.displayName },
+                    countDescending = true,
+                ),
+            )
     }
 
     /**
@@ -775,6 +866,179 @@ object ExpressHomeGrouper {
         pickup.groupBy { identityOf(it, ids) }
             .filterValues { items -> items.all { it.isPickedUp } }
             .keys
+
+    /**
+     * 已完成的记录在首页停留多久，超过就进「归档快递」（毫秒）。
+     *
+     * 7 天是用户定的（2026-09-26 原话：「已签收超过 7 天的快递自动进入归档快递的二级页面」）。
+     * 依据是这一档的用途 —— 用户回头翻「已签收 / 异常」只可能是核对最近几天的事；
+     * 一周以前的签收记录既不需要动作、也早已不在驿站了，留在首页只是把列表越拖越长。
+     */
+    const val ARCHIVE_RETENTION_MS = 7L * 24L * 60L * 60L * 1000L
+
+    /**
+     * 「归档快递」二级页要显示的那些记录：**已完成、且超过 [ARCHIVE_RETENTION_MS] 没再动过**的。
+     *
+     * 按 [completedAtOf] 倒序 —— 最近归档的排最上面。归档件是「历史」，用户翻它的动机通常是
+     * 「上周那件到底签收没有」，所以新的一般比旧的更常被找。
+     *
+     * ## 为什么传的是**全部**记录
+     *
+     * 和 [group] 同一条理由：驿站名要先做聚类（[stationIdentities]），而聚类的输入必须是完整集合
+     * —— 只喂归档件的话，某个驿站的简称在全量里是被折叠到全名上的，在这里却会当场独立成一个
+     * 代表名，归档页和首页就会对同一个驿站印出两个名字。
+     *
+     * @param now 当前时刻（毫秒）。与 [group] 的 `now` 是同一个值 —— 两处若不一致，
+     *   会出现「一件既不在首页、也不在归档页」的空窗（恰好卡在两次调用之间的那件）。
+     */
+    fun archive(
+        records: List<ExpressRecord>,
+        now: Long,
+        retentionMs: Long = ARCHIVE_RETENTION_MS,
+    ): List<ExpressRecord> =
+        finishedRecords(records, stationIdentities(records))
+            .filter { isArchived(it, now, retentionMs) }
+            .sortedWith(compareByDescending { completedAtOf(it) })
+
+    /**
+     * 「已完成」的记录：宿主推来的已签收 / 投递失败，加上**用户整站确认取走**的到站件。
+     *
+     * 这是首页「已签收 / 异常」那一档的完整候选集，[group] 与 [archive] 共用同一份 ——
+     * 两处各写一遍迟早会飘，而飘的后果是同一件包裹同时出现在两个页面、或者同时在两个页面消失
+     * （用户只会觉得「模块把数据弄丢了」）。
+     */
+    private fun finishedRecords(
+        records: List<ExpressRecord>,
+        ids: Map<String, String>,
+    ): List<ExpressRecord> {
+        val confirmed = confirmedStations(records.filter { it.status in PICKUP_STATUSES }, ids)
+        return records.filter {
+            it.status in DONE_STATUSES ||
+                (it.status in PICKUP_STATUSES && identityOf(it, ids) in confirmed)
+        }
+    }
+
+    /**
+     * 这件是不是该归档了。判据只有一条：**完成之后过了 [retentionMs]**。
+     *
+     * `>=` 而不是 `>`：「超过 7 天」按整天算，正好第 7 天那一刻归档是符合直觉的。
+     *
+     * ⚠️ 传 `now = 0` 时（见 [group] 的默认值）任何记录都不算归档 —— 差值恒为负。
+     * 这正是「不做归档切分」想要的效果，不是巧合。
+     */
+    private fun isArchived(
+        record: ExpressRecord,
+        now: Long,
+        retentionMs: Long = ARCHIVE_RETENTION_MS,
+    ): Boolean = now - completedAtOf(record) >= retentionMs
+
+    /**
+     * 这件「最后有动静」是什么时候（毫秒）：轨迹最新节点、到站时间、宿主 `gmt_modified` 取最新。
+     *
+     * 三处都要：轨迹最新节点是「真正发生了什么」的时刻（宿主几小时不刷新时 `gmt_modified`
+     * 会停在旧值 —— 真机实证：13:54 已派送的件显示「11小时前」）；[ExpressRecord.arrivalAt]
+     * 是宿主物流记录的最后变更时间；[ExpressRecord.timestamp] 兜底（旧记录 / 没有轨迹的件）。
+     *
+     * 三条来源都没有（`timestamp` 为 0 的构造）时返回 0：排序里自然垫底，不会抛异常。
+     */
+    private fun updatedAtOf(record: ExpressRecord): Long = maxOf(
+        ExpressFormatter.statusSince(record) ?: 0L,
+        record.arrivalAt ?: 0L,
+        record.timestamp,
+    )
+
+    /**
+     * 这件**结束**是什么时候（毫秒）。
+     *
+     * ## 为什么不能走 [updatedAtOf]（真机实证：2026-09-26）
+     *
+     * updatedAtOf 含 [ExpressRecord.timestamp]，而 timestamp 的语义是「这条记录最后一次
+     * 被数据源更新」—— 宿主自查 / 富化合并 / 推送都可能把它刷新到**今天**。真机上一条
+     * 9 月 16 日就签收的件，`at` 停在 9 月 26 日（宿主自查灌库），于是归档判据
+     * `now - 完成时刻 >= 7 天` 永远不成立 → 归档页永远「暂无」，超期件永远占着首页。
+     *
+     * 「完成时刻」要的是**能证明它完成了**的时刻，取三处较新者：
+     * - 轨迹最后一个节点的时间（真实签收/失败时刻，`ExpressFormatter.tracePointTime` 解析）；
+     * - [ExpressRecord.arrivalAt]（宿主物流记录的最后变更时间，签收后不再变）；
+     * - [ExpressRecord.pickedUpAt]（用户确认取件的时刻 —— 整站确认的到站件可能没有
+     *   签收轨迹，这一笔就是它唯一的完成凭据；只看前两处会把刚取走的件当场归档）。
+     *
+     * 三处都缺（旧记录没有轨迹也没有 arrivalAt）才兜底 [ExpressRecord.timestamp]：
+     * 判不了就别乱归档，宁可让它在首页多待一会儿。
+     */
+    private fun completedAtOf(record: ExpressRecord): Long {
+        val proof = maxOf(
+            record.trace.lastOrNull()?.let { ExpressFormatter.tracePointTime(it.time) } ?: 0L,
+            record.arrivalAt ?: 0L,
+            record.pickedUpAt ?: 0L,
+        )
+        return if (proof > 0L) proof else record.timestamp
+    }
+
+    /**
+     * 驿站之间的排序：**件多的靠前，同件数时最近还有新件到的靠前**。
+     *
+     * 2026-09-26 用户定的规则（原话：「驿站按最近的快递在那个驿站和驿站快递数量排序，
+     * 数量多和最近收件的驿站靠前」）。服务的场景是「一趟能拿几件、什么时候去」——
+     * 件多的那一站值得排最上面，而刚到的件比躺了半个月的件更值得现在跑一趟。
+     *
+     * ⚠️ **件数那一层的方向是可配的，两处调用点方向相反**（同一天用户第二次要求）：
+     * - **首页卡片组**：件数**少**的靠前（「首页待取件快递按从少到多排序」）。
+     * - **驿站管理列表**：件数**多**的靠前（上面那句原话，用户 2026-09-26 明确「首页改，
+     *   管理页保持」）。
+     *
+     * 两处方向不同不是矛盾，问的问题本来就不同：首页是「我现在先看哪一站」（待取件里那些
+     * 只剩一件的站，往往就是顺手拿一下、最省事的），管理页是「哪一站最值得管」。
+     * 「最近到件」那一层两边都保持**新的靠前**。
+     *
+     * ## 为什么做成一个带取值函数的比较器
+     *
+     * 首页的卡片组（[ExpressStationGroup]）和驿站管理列表（[ExpressStationSummary]）是两个
+     * 不同的类型，但除了件数方向外**其余规则必须是同一个顺序** —— 以前两边各写一遍
+     * `compareBy({ 未知 }, { 名字 })`，注释里写着「和首页卡片同一个顺序」，实际靠人肉对齐，
+     * 改一边忘一边就飘了。这里把规则收在一处，两个调用点只负责把字段取出来、把方向传进来。
+     *
+     * ## 四层键
+     *
+     * 1. **未知取件地点永远垫底**：它不是一处真实地点（见 [UNKNOWN_STATION]），
+     *    份量再多也不该挤掉真驿站；
+     * 2. 件数（方向见上，[countDescending]）；
+     * 3. 同件数时，该站**最新一条**的时间新的在前（「最近收件的靠前」）；
+     * 4. 兜底按名字 —— **这一层不能省**：件数和时间都相同时必须给出全序，否则列表顺序
+     *    跟着底层容器的迭代序抖，用户看着像「它自己跳了一下」。
+     *
+     * @param countDescending 件数那一层是否降序（true = 多的靠前）。见上面那条 ⚠️。
+     */
+    private fun <T> stationOrder(
+        isUnknown: (T) -> Boolean,
+        records: (T) -> List<ExpressRecord>,
+        name: (T) -> String,
+        countDescending: Boolean,
+    ): Comparator<T> {
+        // 方向要拼进比较器链里，不能靠 `.reversed()`：那会把**整条链**都翻过来，
+        // 连「未知地点垫底」和「名字兜底」一起反掉。
+        val byCount = if (countDescending) {
+            compareByDescending<T> { records(it).size }
+        } else {
+            compareBy<T> { records(it).size }
+        }
+        return compareBy<T> { isUnknown(it) }
+            .then(byCount)
+            .thenByDescending { latestAtOf(records(it)) }
+            .thenBy { name(it) }
+    }
+
+    /**
+     * 一组记录里**最新一条**的时间，供 [stationOrder] 第 3 层用。
+     *
+     * [ExpressRecord.arrivalAt] 优先 —— 那是「这件什么时候躺进驿站」的直接答案；
+     * 没有则退回 [ExpressRecord.timestamp]（宿主最后更新时刻）。运输中 / 派送中的件本来
+     * 就没有到站时间，不兜底的话「刚揽收的件」在这一层等于永远垫底。
+     *
+     * 整组都没有时间（旧记录 / 时钟异常）时返回 0：不参与排序，交给下一层的名字。
+     */
+    private fun latestAtOf(records: List<ExpressRecord>): Long =
+        records.maxOfOrNull { it.arrivalAt ?: it.timestamp } ?: 0L
 
     /**
      * 按驿站聚合。
@@ -809,8 +1073,16 @@ object ExpressHomeGrouper {
                     ),
                 )
             }
-            // 有名字的驿站排前面，未知的垫底。
-            .sortedWith(compareBy({ it.station == UNKNOWN_STATION }, { it.station }))
+            // 驿站之间的顺序：未知地点垫底、**件少的靠前**、最近到件的靠前（见 [stationOrder]）。
+            // 首页这一层刻意与管理页相反（那边件多的靠前）—— 理由在那个函数的 ⚠️ 里。
+            .sortedWith(
+                stationOrder<ExpressStationGroup>(
+                    isUnknown = { it.station == UNKNOWN_STATION },
+                    records = { it.records },
+                    name = { it.station },
+                    countDescending = false,
+                ),
+            )
     }
 
     /**
@@ -878,5 +1150,205 @@ object ExpressHomeGrouper {
     fun stationLabelOf(record: ExpressRecord, labels: Map<String, String>): String? =
         labels[normalizedKey(record)]?.takeIf { it != UNKNOWN_STATION }
 
+    /**
+     * 一条记录**最终该念出来**的取件码。
+     *
+     * 记录自己有码就用它；没有就回退到用户在「驿站管理」里给该站设的默认码
+     * （[ExpressStationRules.pickupCodeFor]，会顺着改名链找）。
+     *
+     * 为什么需要这一层：菜鸟对一部分包裹（`普通收件` / 末端非淘包裹）根本不下发 `authCode`，
+     * 而那些包裹在驿站小程序里是有码的。让用户填一次，之后这一站的缺码件**都能显示出来**
+     * —— 这是「默认取件码」的全部意义，也是将来「手动添加取件码」的地基。
+     *
+     * 刻意**不写回** [ExpressRecord.pickupCode]：那是宿主/通知说的事实，规则只是本机显示。
+     * 用户删掉规则，卡片就该回到「没有码」的样子（和改驿站名同一条边界）。
+     */
+    fun pickupCodeOf(record: ExpressRecord, rules: ExpressStationRules): String? =
+        record.pickupCode?.takeIf { it.isNotBlank() }
+            ?: rules.pickupCodeFor(normalizedKey(record))
+
+    /** 一条记录该显示的精确地址：记录自己的优先，缺了回退到该站用户填的精确地址。 */
+    fun stationAddressOf(record: ExpressRecord, rules: ExpressStationRules): String? =
+        record.stationAddress?.takeIf { it.isNotBlank() }
+            ?: rules.addressFor(normalizedKey(record))
+
+    /**
+     * 该站出示哪个平台的**身份码**；没设过返回 null（调用方按默认平台处理）。
+     *
+     * 与 [pickupCodeOf] 差一层：这里**没有**「记录自己的优先」—— 身份码是账号级的，
+     * 包裹身上没有它的位置（宿主不下发），只可能来自用户对该驿站的设置。
+     */
+    fun identitySourceOf(record: ExpressRecord, rules: ExpressStationRules): IdentitySource? =
+        rules.identitySourceFor(normalizedKey(record))
+
+    /**
+     * 身份码弹窗用：把记录里出现过的取件点压成「点位」列表，供挑「离我最近的那个」。
+     *
+     * 一条点位聚合了它名下**所有**记录能给出的信息，各字段独立取第一个有值的：
+     * 坐标只有宿主下发过的那几条才有，取件码只有待取件的那几条才有 —— 不该因为
+     * 组内第一条恰好两样都缺就把整个点位的信息吞掉。
+     *
+     * 未知地点（没有驿站名的）不收：弹窗要显示「去哪取」，一个说不出名字的点位帮不上忙。
+     *
+     * 顺序按该点最近一条记录的时间**倒序**，也就是「最近有动静的排前面」。它同时是
+     * 拿不到定位时的兜底顺序 —— 挑不出「最近」的时候，最近来件的那个驿站是最合理的猜测。
+     */
+    fun spots(
+        records: List<ExpressRecord>,
+        rules: ExpressStationRules,
+    ): List<ExpressStationSpot> {
+        val ids = stationIdentities(records)
+        val labels = labelsOf(ids, rules)
+        val grouped = LinkedHashMap<String, MutableList<ExpressRecord>>()
+        for (record in records) {
+            val display = labels[identityOf(record, ids)] ?: identityOf(record, ids)
+            if (display == UNKNOWN_STATION) continue
+            grouped.getOrPut(display) { mutableListOf() } += record
+        }
+        return grouped
+            .map { (display, items) ->
+                // 待取件的排在前面：取件码要念的是「现在能取的这件」，而同一站里往往还躺着
+                // 已签收的历史件（它们的 authCode 早就没用了）。用户手动标记过取件的也排开。
+                val pending = items.filter { it.status in PICKUP_STATUSES && it.pickedUpAt == null }
+                ExpressStationSpot(
+                    displayName = display,
+                    // 坐标两边都过一遍 [geoPointOf]：宿主写进来的已经是归一后的度，
+                    // 而这之前落库的历史记录里还存着 1e5 倍的放大值，读时一并修掉。
+                    position = items.firstNotNullOfOrNull { geoPointOf(it.stationLat, it.stationLng) },
+                    pickupCode = (pending.ifEmpty { items }).firstNotNullOfOrNull { pickupCodeOf(it, rules) },
+                    identitySource = items.firstNotNullOfOrNull { identitySourceOf(it, rules) },
+                    readyCount = pending.size,
+                ) to items.maxOf { it.timestamp }
+            }
+            .sortedByDescending { it.second }
+            .map { it.first }
+    }
+
     const val UNKNOWN_STATION = "未知取件地点"
+
+    /**
+     * 从 [spots] 里挑「用户此刻最可能要去的那一个」—— 身份码弹窗下半屏就靠它。
+     *
+     * ## 规则（两步，每一步都能被用户看懂、被日志解释）
+     *
+     * 1. **人在驿站附近（≤ [nearbyMeters]）→ 就是它**。这一档只在「有定位、且该站有坐标」
+     *    时才成立 —— 站在柜台前打开弹窗是这个界面最常见的一刻，「最近的」就是对的答案。
+     * 2. **否则按待取件件数**（[ExpressStationSpot.readyCount]）取最多的那个；并列时取
+     *    [spots] 里靠前的（= 最近有来件的那个）。
+     *
+     * ## 为什么第 2 步不是「按距离接着排」
+     *
+     * 因为宿主**经常不下发驿站坐标**（2026-09-26 真机实测：手里 4 个取件点只有 2 个有坐标），
+     * 而「没有坐标」不等于「很远」。只按距离排等于让有坐标的那两三个点垄断结果 ——
+     * 真机上看到的正是这一幕：手里攥着 10 件待取的站在几公里外，弹窗却推了一个只有 1 件、
+     * 12 天前到站的站，仅仅因为它是唯一有坐标的那个。用户报的「最近的取件点显示不对」就是它。
+     *
+     * 而「哪站件多」在拿不到位置时才是真正相关的信号：用户要的是「去哪个站跑一趟」。
+     * 位置敏感的场景（站在驿站门口）由第 1 步兜住。
+     *
+     * 返回的是 [SpotPick] 而不是裸的点位：界面要按**依据**改标题（「最近的」和「件最多的」
+     * 是两句话），而这个依据只有这里知道 —— 让界面去复述规则，规则就又多了一份。
+     *
+     * @param position 当前位置；拿不到定位（没权限 / 没有最后已知位置）时传 null。
+     */
+    fun pickSpot(
+        spots: List<ExpressStationSpot>,
+        position: GeoPoint?,
+        nearbyMeters: Double = NEARBY_STATION_M,
+    ): SpotPick? {
+        if (spots.isEmpty()) return null
+        // 没有取件码的点排在最后：弹窗下半屏要回答「念什么」，一个说不出码的点顶上来
+        // 只会把真正能用的那个挤下去（宿主对在途件本来就不给 authCode）。
+        val withCode = spots.filter { !it.pickupCode.isNullOrBlank() }
+        val candidates = withCode.ifEmpty { spots }
+
+        // 距离按需算。缺一半（没定位 / 该点没坐标）就是 null —— 「不知道多远」，不是 0。
+        fun distanceTo(spot: ExpressStationSpot): Double? = position?.let { from ->
+            spot.position?.let { to ->
+                GeoDistance.meters(from.lat, from.lng, to.lat, to.lng)
+            }
+        }
+
+        if (candidates.size == 1) {
+            val only = candidates.first()
+            return SpotPick(only, SpotPickReason.ONLY, distanceTo(only))
+        }
+
+        if (position != null) {
+            val nearest = candidates
+                .mapNotNull { spot -> distanceTo(spot)?.let { it to spot } }
+                .minByOrNull { it.first }
+            // 只有「就在附近」才采纳。最近的一个都在几公里外，说明用户不在任何一个取件点边上
+            // （在家点开弹窗就是这样），那时的距离只是「谁更远」的排序，对「该去哪一趟」没有指导意义。
+            if (nearest != null && nearest.first <= nearbyMeters) {
+                return SpotPick(nearest.second, SpotPickReason.NEARBY, nearest.first)
+            }
+        }
+
+        val pick = candidates.maxByOrNull { it.readyCount } ?: candidates.first()
+        return SpotPick(pick, SpotPickReason.READY_COUNT, distanceTo(pick))
+    }
+
+    /**
+     * 「算近」的半径。
+     *
+     * 取 1 公里：模块只申请了粗略定位（COARSE），基站定位的误差可达一两公里，
+     * 更小的值会把「明明站在门口」误判成不近；更大则两个点会同时命中而按错顺序。
+     */
+    const val NEARBY_STATION_M = 1_000.0
+}
+
+/**
+ * 身份码弹窗里的一处取件点。
+ *
+ * [position] 来自宿主 `packageStation.stationLat/stationLng`，**已经过 [geoPointOf] 归一化**
+ * （宿主下发的是 1e5 倍的整数，见那个函数）。菜鸟没给过坐标就是 null —— 真机上很常见，
+ * 那时的选择规则由 [ExpressHomeGrouper.pickSpot] 决定。
+ */
+data class ExpressStationSpot(
+    /** 该显示的驿站名（已过用户的改名 / 合并规则）。 */
+    val displayName: String,
+    /** 驿站坐标（WGS84 度）；null = 宿主没给，按「不知道多远」处理。 */
+    val position: GeoPoint?,
+    /** 这一处当前该念的取件码（待取件的记录优先，缺了用该站默认码）；整组都没有时 null。 */
+    val pickupCode: String?,
+    /**
+     * 用户在驿站管理里给这站选的**身份码来源**（菜鸟 / 拼多多）；没设过 null。
+     *
+     * 它决定弹窗去哪个平台取码，也决定「取不到」时该怎么解释 —— 选中一个还没实现的平台
+     * （[IdentitySource.supported] 为 false）时必须如实说明，不能悄悄换一个平台。
+     */
+    val identitySource: IdentitySource? = null,
+    /**
+     * 该站当前**待取件**的件数（到站 / 待取件，且用户没手动标记过）。
+     *
+     * 它是「哪一站值得跑一趟」的直接答案，也是拿不到定位时 [ExpressHomeGrouper.pickSpot]
+     * 的判据 —— 一个只有坐标、却一件待取都没有的站，不该抢在手里攥着十件待取的站前面。
+     */
+    val readyCount: Int = 0,
+)
+
+/**
+ * [ExpressHomeGrouper.pickSpot] 的结果：挑中的取件点 + **凭什么挑中它** + 距离。
+ *
+ * 为什么把「依据」也返回出来：弹窗那一段的标题得跟着依据走（「最近的取件点」与
+ * 「待取件最多的取件点」是两句话，写错等于对用户撒谎），而这个依据只有挑选函数知道。
+ * 把规则再在界面里复述一遍，就是让同一件事有两个说法 —— 改了一处忘了另一处，
+ * 界面就开始解释一个它并没有执行的规则。
+ */
+data class SpotPick(
+    val spot: ExpressStationSpot,
+    val reason: SpotPickReason,
+    /** 当前位置到该点的直线距离（米）；没定位或该点没坐标时 null。 */
+    val distanceMeters: Double?,
+)
+
+/** [ExpressHomeGrouper.pickSpot] 是怎么挑出这个点的。 */
+enum class SpotPickReason {
+    /** 只有这一个候选（或有码的只有一个），没什么可挑的。 */
+    ONLY,
+    /** 人就在它附近（≤ [ExpressHomeGrouper.NEARBY_STATION_M]）。 */
+    NEARBY,
+    /** 拿不到「近」的依据（没定位 / 最近的一个都在几公里外），改按待取件件数挑的。 */
+    READY_COUNT,
 }

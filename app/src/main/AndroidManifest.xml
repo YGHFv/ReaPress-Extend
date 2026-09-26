@@ -15,6 +15,26 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!--
+      定位有两个用处，精度要求差一个量级，所以两份都申请：
+      - **粗略**（COARSE）：身份码弹窗判「离我最近的那个驿站」—— 需要的精度是「哪个驿站」，
+        也就是几百米到几公里，粗略定位绰绰有余；
+      - **精确**（FINE）：「驿站管理」里点「获取」时把这一站门口的坐标记下来（StationFingerprint）。
+        粗定位在楼群里能差一两公里，相邻两个驿站就分不开了，那一项等于白记。
+      边界：粗略那份**用完即弃**（只在这一屏里参与一次比较，不入库、不上传）；精确那份只落在
+      本机驿站规则里（用户自己点「获取」才产生，且「恢复默认」能一键清掉）。
+    -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <!--
+      「附近 WiFi」：`ACCESS_WIFI_STATE` 是普通权限（读 WiFi 状态）；Android 13 起读扫描结果
+      还要 `NEARBY_WIFI_DEVICES`。
+      ⚠️ **不加 `usesPermissionFlags="neverForLocation"`**：那个 flag 声明「本应用不用 WiFi
+      结果推断位置」，系统会据此过滤掉一部分扫描结果 —— 而我们的用途恰恰就是拿 WiFi 判
+      「人在不在驿站门口」。声明要跟实际行为一致，不能为了少要一份授权就把它写上。
+    -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
+    <!--
       轨迹拉取请求的发送凭证：菜鸟进程里的 receiver 只收**持有这个权限**的广播方
       （signature 级 = 只有模块自己签得出），否则设备上任何 app 都能拿用户的菜鸟登录态
       替自己查任意单号。声明与使用在同一 APK，签名必然匹配，安装即授予。

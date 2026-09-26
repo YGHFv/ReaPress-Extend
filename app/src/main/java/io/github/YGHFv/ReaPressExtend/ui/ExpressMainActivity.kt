@@ -1,6 +1,7 @@
 package io.github.YGHFv.ReaPressExtend.ui
 
 import android.Manifest
+import android.app.ActivityManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -13,8 +14,10 @@ import android.os.Bundle
 import android.view.WindowInsetsController
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -60,6 +63,7 @@ import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
 import io.github.YGHFv.ReaPressExtend.hook.CainiaoTraceApi
 import io.github.YGHFv.ReaPressExtend.core.ExpressRule
 import io.github.YGHFv.ReaPressExtend.core.ExpressStationRules
+import io.github.YGHFv.ReaPressExtend.core.GeoPoint
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
 import io.github.YGHFv.ReaPressExtend.logging.ModuleLogBuffer
 import io.github.YGHFv.ReaPressExtend.notification.ExpressHomeGrouper
@@ -68,11 +72,15 @@ import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationPoster
 import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
 import io.github.YGHFv.ReaPressExtend.notification.ExpressStationRuleStore
 import io.github.YGHFv.ReaPressExtend.relay.ExpressRelay
+import io.github.YGHFv.ReaPressExtend.relay.HostCredentialRequester
+import io.github.YGHFv.ReaPressExtend.relay.HostRefreshRequester
+import io.github.YGHFv.ReaPressExtend.relay.HostWakePin
 import io.github.YGHFv.ReaPressExtend.relay.ModuleTraceFetcher
 import io.github.YGHFv.ReaPressExtend.relay.WatchdogReporter
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.basic.Icon
+import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.NavigationBar
 import top.yukonga.miuix.kmp.basic.NavigationBarItem
@@ -92,6 +100,7 @@ import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Home
 import top.yukonga.miuix.kmp.icon.extended.Info
 import top.yukonga.miuix.kmp.icon.extended.Recent
+import top.yukonga.miuix.kmp.icon.extended.Scan
 import top.yukonga.miuix.kmp.icon.extended.Settings
 import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.preference.OverlayDropdownPreference
@@ -128,6 +137,10 @@ import top.yukonga.miuix.kmp.utils.springAnimateToPage
  * `isRuntimeShaderSupported()`。所以这里的取值链是 `blurred = 模糊 && 支持`、
  * `liquid = 悬浮 && 液态 && 支持` —— 不支持的设备上开关仍可保存，只是不生效，
  * 界面上也会把开关置灰而不是静默失效。
+ *
+ * 「界面」那张卡片里还有第四行 **「隐藏后台卡片」**（见 [applyExcludeFromRecents]）：
+ * 它改的是**窗口行为**而不是外观（让本模块不出现在系统最近任务里），与上面三个互不影响，
+ * 所以不参与那套递进链。
  */
 class ExpressMainActivity : ComponentActivity() {
 
@@ -150,9 +163,130 @@ class ExpressMainActivity : ComponentActivity() {
      */
     private val resumeTick = mutableIntStateOf(0)
 
+    /**
+     * 上次发唤醒销的时刻（见 [refreshHostOnResume]）。
+     *
+     * 节流的理由：`onResume` 在**任何**回到前台的时刻都会触发（从通知栏回来、从别的应用切回来、
+     * 分屏里点一下），而每一次都会把菜鸟拉起来一次。用户主动打开模块的间隔通常远大于这个值，
+     * 所以节流对他没有感知，却挡住了「切来切去把宿主反复拉起」那类无意义的后台唤醒。
+     */
+    private var lastHostWakeAt = 0L
+
+    /**
+     * 上次请宿主重查本地包裹表的时刻（见 [refreshHostOnResume]）。
+     *
+     * 比唤醒销那条短得多，因为两者代价差着量级：这一条不动进程，只让已经在跑的宿主读一次
+     * 它自己的本地库；而它才是「打开模块就看到最新数据」真正经常生效的那一条 ——
+     * 宿主常年以推送进程活着时，唤醒销是一记空操作。
+     *
+     * 一分钟也足够挡住「从身份码弹窗回来」「从驿站页返回」这类同一个使用回合内的重入。
+     */
+    private var lastHostRefreshAt = 0L
+
+    /**
+     * 上一次实际下发的「隐藏后台卡片」取值。**只用来决定日志打不打** ——
+     * 那个 flag 每次 `onResume` 都必须重放（理由见 [applyExcludeFromRecents]），
+     * 但没有变化时再写一行日志就是纯噪音。
+     */
+    private var lastExcludeFromRecents: Boolean? = null
+
     override fun onResume() {
         super.onResume()
         resumeTick.intValue++
+        refreshHostOnResume()
+        // flag 记在**任务的根 Intent** 上，用户从后台划掉之后下次是全新任务 —— 每次都要重放。
+        applyExcludeFromRecents(uiPrefs.hideFromRecents)
+    }
+
+    /**
+     * **打开模块时静默刷新快递信息** —— 两条一起发，缺一条就有场景不工作。
+     *
+     * 模块拿包裹数据的两条路都不完全在自己手里：
+     * - 拦截通知是**被动**的（宿主发了推送才有）；
+     * - 菜鸟 hook 读的是宿主**本地那张包裹表**，而那张表要菜鸟自己活着才会被刷新。
+     *
+     * 于是「打开模块 → 数据是新的」中间缺的这一环在这里补上：
+     *
+     * 1. **唤醒销**（[HostWakePin.wake]）：把菜鸟进程拉起来，好让我们的 hook 装上。
+     *    只在进程**不在**时有意义 —— 进程已存活时它是一记空操作。
+     * 2. **刷新请求**（[HostRefreshRequester.request]）：请已在运行的宿主**现在**重查一次本地
+     *    包裹表。只在进程**已存活**时有意义 —— 那条接收器是动态注册的，不随进程创建而存在，
+     *    它叫不醒一个死进程（所以第 1 条不能删）。小米上菜鸟常年以推送进程（`:channel`）
+     *    的形式活着，这恰恰是**常态**，所以第 2 条才是经常起作用的那条。
+     *
+     * 先发销再发请求：万一宿主是死的，销把进程拉起来之后，紧接着这条请求有可能正好落到它
+     * 刚注册好的接收器上。反过来就没这个机会了。
+     *
+     * 宿主的 `Application` 一创建还会自己跑一遍冷启动自查（见 `CainiaoPackageHook`）——
+     * 那是第三条路，但它每进程只跑一次，覆盖不了「主进程一直活着」。
+     *
+     * ⚠️ **这不是「保证刷新」**：关联启动可能被 ROM 拦下、菜鸟可能起来后又立刻被回收，
+     * 而广播发出去之后这一层什么都看不到。有没有成功，看模块日志里随后有没有
+     * `host self query: rows=N`（宿主读到本地表了）与 `enrichment received`（数据落进模块了）。
+     *
+     * ⚠️ 也**不是「保证数据是新的」**：宿主自查读的是它**本地库**，那个库要靠宿主自己
+     * （首页查询 / 推送 / 小组件）才会收到新包裹。这里解决的是「库里有、没人读」，
+     * 不是「服务端有、本地没有」。
+     */
+    private fun refreshHostOnResume() {
+        val now = System.currentTimeMillis()
+        if (now - lastHostWakeAt >= HOST_WAKE_MIN_INTERVAL_MS) {
+            lastHostWakeAt = now
+            HostWakePin.wake(this, "打开模块")
+        }
+        if (now - lastHostRefreshAt >= HOST_REFRESH_MIN_INTERVAL_MS) {
+            lastHostRefreshAt = now
+            HostRefreshRequester.request(this)
+        }
+    }
+
+    /**
+     * 「隐藏后台卡片」：把本模块从系统**最近任务（后台）**列表里摘掉 / 放回去。
+     *
+     * ## 为什么只能运行时做
+     *
+     * `android:excludeFromRecents`（清单）与 `Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS`
+     * 都只在**任务根 Activity 启动那一刻**定下来，之后改不了 —— 做成设置里的开关，就只剩
+     * `ActivityManager.AppTask#setExcludeFromRecents` 一条路：它改的正是根 Intent 上那个 flag，
+     * 任务存活期间随时可改。
+     *
+     * `getAppTasks()` 返回的是**本应用自己的**任务，官方就是拿它来管自己任务的
+     * （老那套 `GET_TASKS` 自 Lollipop 起提权到 signature，第三方拿不到，但它从来只管别人的任务）——
+     * 所以这里**不需要任何权限**。
+     *
+     * ## 为什么每次 onResume 都要重放
+     *
+     * flag 存在**任务的根 Intent**上。用户在最近任务里划掉本模块 = 任务被销毁，下次从桌面图标
+     * 进来是**一个全新任务**，那次启动自然没有这个 flag —— 只在开关变化时设一次的话，
+     * 「打开开关 → 划掉 → 再进来」这条最常见的路径就失效了。代价是每次回到前台两次
+     * Binder 调用（`appTasks` + `setExcludeFromRecents`），可以忽略。
+     *
+     * ⚠️ 失败一律吞掉：`getAppTasks()` 在个别老 ROM 上可能给空列表，而这只是个**体验开关**，
+     * 不该因为它让界面起不来。真出问题会在「模块日志」里留一行。
+     */
+    private fun applyExcludeFromRecents(exclude: Boolean) {
+        val changed = lastExcludeFromRecents != exclude
+        lastExcludeFromRecents = exclude
+        runCatching {
+            val manager = getSystemService(ActivityManager::class.java) ?: return
+            val tasks = manager.appTasks
+            // 按 taskId 认自己那一个；`getTaskInfo()` 在 SDK 里标了 `@Nullable`（任务刚消失时
+            // 会给 null），所以用安全调用、认不到就退回「列表里只有一个任务」的情形 ——
+            // 本应用只有 ExpressMainActivity 一个 Activity，正常情况下面这个列表就只有一条。
+            val task = tasks.firstOrNull { it.taskInfo?.taskId == taskId } ?: tasks.firstOrNull()
+            if (task == null) {
+                if (changed) {
+                    ModuleAndroidLog.legacy(LOG_TAG, "exclude from recents: 拿不到本应用的任务，跳过")
+                }
+            } else {
+                task.setExcludeFromRecents(exclude)
+                if (changed) {
+                    ModuleAndroidLog.legacy(LOG_TAG, "exclude from recents: $exclude")
+                }
+            }
+        }.onFailure {
+            ModuleAndroidLog.error(LOG_TAG, "exclude from recents failed", it)
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -163,6 +297,7 @@ class ExpressMainActivity : ComponentActivity() {
         applyWindowBackground()
         ModuleAndroidLog.legacy(LOG_TAG, "module main ui opened")
         requestNotificationPermissionIfNeeded()
+        requestHostLoginState()
 
         setContent {
             // 手动模式优先，否则跟随系统。用 isSystemInDarkTheme() 而不是读 configuration，
@@ -184,6 +319,12 @@ class ExpressMainActivity : ComponentActivity() {
                         uiPrefs.themeMode = mode
                         // 窗口底色要一起改，否则切到夜间时状态栏底下还是浅色。
                         applyWindowBackground()
+                    },
+                    // 提升到 Activity 这一层：开关的后果（改任务根 Intent 上的 flag）只有
+                    // Activity 做得到，Compose 里拿不到 `taskId`。
+                    onHideFromRecentsChange = { exclude ->
+                        uiPrefs.hideFromRecents = exclude
+                        applyExcludeFromRecents(exclude)
                     },
                 )
             }
@@ -274,9 +415,47 @@ class ExpressMainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * 模块一打开就向宿主索要一次淘宝登录态（发完即忘，不等待、不阻塞界面）。
+     *
+     * 「最好不打开菜鸟也能获取快递信息」卡在一个时序上：登录态只存在菜鸟的私有目录里，
+     * 而宿主主动投递它的时机是「首页刷新」—— 用户「收到通知 → 点开模块」时，菜鸟很可能
+     * 早被系统清掉了，那一屏的轨迹就还是空的。补一次主动索要，宿主只要还活着就会回。
+     *
+     * **尽力而为**：宿主进程不在时系统会静默丢弃广播（小米上的实测行为），送不到也没关系 ——
+     * 下一次富化到达时宿主自己还会补一次，详情页那次也有兜底。模块到底有没有拿到登录态，
+     * 看日志里是 `cookie synced` 还是 `cookie sync 收到宿主回执`。
+     */
+    private fun requestHostLoginState() {
+        // 菜鸟和淘宝都要问一次：凭据在哪一边事先不知道（菜鸟没绑淘宝账号时，只有淘宝 App 里有）。
+        // 两个包、重复投递、超时降级这些取舍都在 [HostCredentialRequester.requestFromHosts] 里。
+        //
+        // ⚠️ 这条只服务于**轨迹**：身份码从 2026-09-26 起不再要登录态，改成请菜鸟用自己的会话
+        // 现取（见 [IdentityCodeFetcher]）—— 那个接口在 H5 通道上根本打不动。
+        HostCredentialRequester.requestFromHosts(this)
+    }
+
     private companion object {
         const val LOG_TAG = "ReaPress"
         const val REQUEST_CODE = 4201
+
+        /**
+         * 两次「打开模块叫醒菜鸟」之间的最小间隔。
+         *
+         * 5 分钟：短到「用户从驿站回来重新打开」必然触发，长到「反复切前后台」不会把宿主
+         * 一次次拉起来。这个值只影响「多久拉一次进程」，不影响正确性 —— 唤醒是幂等的，
+         * 没叫醒也只是一次没有后续的空操作（真正干活的是 [HOST_REFRESH_MIN_INTERVAL_MS] 那条）。
+         */
+        const val HOST_WAKE_MIN_INTERVAL_MS = 5 * 60_000L
+
+        /**
+         * 两次「请宿主重查本地包裹表」之间的最小间隔。
+         *
+         * 1 分钟，比唤醒销那条短得多：这条不动进程，只让已经在跑的宿主读一次它自己的本地库，
+         * 代价差着量级；而宿主常年以推送进程活着时，它才是真正让「打开模块就有新数据」成立的
+         * 那一条。一分钟足够挡住同一回合内的重入（从身份码弹窗回来、从驿站页返回）。
+         */
+        const val HOST_REFRESH_MIN_INTERVAL_MS = 60_000L
     }
 }
 
@@ -304,6 +483,11 @@ private fun ExpressApp(
     themeMode: Int,
     resumeTick: Int,
     onThemeModeChange: (Int) -> Unit,
+    /**
+     * 「隐藏后台卡片」被切换。**必须由 Activity 实现**（它才有 `taskId` 去改任务的根 Intent），
+     * 所以和 [onThemeModeChange] 一样是提升上来的回调，而不是就地写 prefs。
+     */
+    onHideFromRecentsChange: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -314,6 +498,9 @@ private fun ExpressApp(
     var liquidGlass by remember { mutableStateOf(uiPrefs.liquidGlass) }
     // 双击确认取件。和上面三个一样只影响本机界面，所以也走 uiPrefs 而不是功能设置。
     var doubleTapPickup by remember { mutableStateOf(uiPrefs.doubleTapPickup) }
+    // 「隐藏后台卡片」。初值取自 prefs —— Activity 的 onResume 已经按它设过一次 flag
+    // （那条路覆盖「划掉后台再进来」的情景），这里只是让开关的显示跟生效的那份取值对上。
+    var hideFromRecents by remember { mutableStateOf(uiPrefs.hideFromRecents) }
 
     // 功能设置（拦截开关等）。与外观分开：那份要投影给 system_server，这份不用。
     var settings by remember { mutableStateOf(ExpressSettings.read(context)) }
@@ -391,12 +578,96 @@ private fun ExpressApp(
     var stationRules by remember { mutableStateOf(ExpressStationRuleStore.load(context)) }
     var stationAdminOpen by remember { mutableStateOf(false) }
 
+    // 「归档快递」二级页（首页最下面那一行进来的）。只看不写，所以这里没有配套的写入侧状态。
+    var archiveOpen by remember { mutableStateOf(false) }
+
+    // 「获取当前位置」这一次动作的状态，以及**正在等授权的那一行**。
+    // 授权是异步的（用户可能过几秒才点「允许」），回调里没有别的办法知道「谁在等」——
+    // 所以必须在发起申请的时候就把 keys 存下来。
+    var stationCapture by remember { mutableStateOf<StationCaptureState?>(null) }
+    var pendingCaptureKeys by remember { mutableStateOf<List<String>?>(null) }
+
+    /**
+     * 采一次现场（定位 + 附近 WiFi），落到这一行的规则上。
+     *
+     * 三样东西分开处置，因为它们**各自都可能缺**，而缺了要如实说：
+     * - 位置 → 写进指纹；这是这项功能的主产物；
+     * - WiFi → 写进指纹（同一个对象），空列表照样写（「这站没记到 AP」本身是信息）；
+     * - 地址文本 → 反查得到就用系统的，拿不到退回坐标串。写的是一个**普通字符串**，
+     *   所以包裹详情页读地址那一路（`stationAddressOf`）一行都不用改。
+     *
+     * 采集期间再点按钮由界面挡掉（见 `StationCaptureState.busy`）：并发两次采集的话，
+     * 后一次会把前一次的指纹覆盖掉，而用户看到的是「点了没反应却记了个别的地方的坐标」。
+     */
+    fun captureStation(keys: List<String>) {
+        val key = keys.firstOrNull() ?: return
+        scope.launch {
+            stationCapture = StationCaptureState(key, busy = true)
+            val capture = StationLocator.capture(context)
+            if (capture.permissionMissing) {
+                // 交给 launcher 去弹框，授权回来后再走一遍这条路（[pendingCaptureKeys]）。
+                pendingCaptureKeys = keys
+                stationCapture = StationCaptureState(key, busy = false, note = PERMISSION_HINT)
+                return@launch
+            }
+            val fingerprint = capture.fingerprint
+            if (fingerprint.isEmpty) {
+                // 一样都没采到就**不写**（写入侧也会拒绝空指纹）：写进去只会在界面上显示成
+                // 「已记录」，而实际上什么都判不了 —— 那比留着「未记录」更误导。
+                stationCapture = StationCaptureState(key, busy = false, note = EMPTY_CAPTURE_HINT)
+                return@launch
+            }
+            ExpressStationRuleStore.setFingerprint(context, keys, fingerprint)
+            ExpressStationRuleStore.setAddress(
+                context,
+                keys,
+                capture.addressText ?: coordinatesOf(fingerprint.position),
+            )
+            stationRules = ExpressStationRuleStore.load(context)
+            stationCapture = StationCaptureState(key, busy = false, note = captureNote(capture))
+        }
+    }
+
+    /**
+     * 定位 / WiFi 权限的申请。
+     *
+     * 申请**两份**：精确定位是采坐标必需（粗定位分不开相邻两个驿站），
+     * Android 13 起读 WiFi 扫描结果还要 NEARBY_WIFI_DEVICES。
+     *
+     * 只要**任意一项**被允许就继续采：WiFi 没批下来时定位照样能记，反过来也一样 ——
+     * 半份数据比一份都没有强，缺的那一半由 [captureNote] 照实说出来。
+     */
+    val stationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { granted ->
+        val keys = pendingCaptureKeys ?: return@rememberLauncherForActivityResult
+        pendingCaptureKeys = null
+        if (granted.values.any { it }) {
+            captureStation(keys)
+        } else {
+            stationCapture = StationCaptureState(
+                key = keys.firstOrNull().orEmpty(),
+                busy = false,
+                note = PERMISSION_DENIED_HINT,
+            )
+        }
+    }
+
     // 包裹详情页（全轨迹 / 驿站完整地址 / 商品图）。存的是**记录快照**而不是它的 dedupeKey：
     // 富化把通知里截断的尾号补成全号时 dedupeKey 会跟着变（它是 `tn:`/`pc:`/`raw:` 拼出来的），
     // 只存 key 的话那一刻详情页会凭空关掉。渲染时再拿快照去最新列表里配一份更全的。
     var detailRecord by remember { mutableStateOf<ExpressRecord?>(null) }
     // 详情页自己的刷新指示器状态（与 homeRefreshing / recordRefreshing 同一套约定）。
     var detailRefreshing by remember { mutableStateOf(false) }
+
+    // 身份码弹窗（首页右上角那个按钮）。
+    var identityOpen by remember { mutableStateOf(false) }
+    // 定位权限申请的结果计数器：授权回来后自增，弹窗随之重算一次「最近驿站」。
+    // 没有它的话，用户在系统弹框里点「允许」之后，当前这一屏还会停在「最近有来件的那个」。
+    var locationTick by remember { mutableIntStateOf(0) }
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { locationTick++ }
 
     /**
      * 按需拉取当前包裹的全轨迹（「点击时获取」模式）。
@@ -443,6 +714,14 @@ private fun ExpressApp(
 
     val pagerState = rememberPagerState(initialPage = TAB_HOME, pageCount = { TAB_TITLES.size })
     val scrollBehaviors = List(TAB_TITLES.size) { MiuixScrollBehavior() }
+    // 每个页签各自的滚动位置。**必须建在这一层** —— 也就是所有二级页的提前 return **之前**：
+    // 详情 / 归档 / 驿站管理 / 日志都是整页替换主界面的（见下面几处 `return`），主界面从组合树里
+    // 摘掉之后，原先写在 `scrollContent` 里的 `rememberScrollState()` 就跟着没了 ——
+    // 用户从详情返回时列表会跳回顶部，包裹一多就等于每次都要重新滚一遍（2026-09-26 用户报的）。
+    // 提升到这一层之后，二级页期间这些 ScrollState 一直活着，返回时按原偏移重新挂上。
+    //
+    // 放在 `List(...)` 的 init 里调 remember 是安全的：次数恒等于页签数，重组之间一一对应。
+    val pageScrollStates = List(TAB_TITLES.size) { rememberScrollState() }
     val currentPage = pagerState.currentPage.coerceIn(0, TAB_TITLES.lastIndex)
     val scrollBehavior = scrollBehaviors[currentPage]
 
@@ -485,10 +764,25 @@ private fun ExpressApp(
         StationAdminPage(
             records = homeRecords,
             rules = stationRules,
-            onRename = { key, display ->
-                ExpressStationRuleStore.setRename(context, key, display)
+            // 几个写入口都收**一组**键（整行的 ruleKeys）：合并过来的那一行只有一个主键，
+            // 但链上还挂着别的键，只动主键会让同一行当场裂回两行。每次改完重读一遍，
+            // 首页分组是拿规则现算的，不重读的话名字改了但卡片没动。
+            onRename = { keys, display ->
+                ExpressStationRuleStore.setRename(context, keys, display)
                 stationRules = ExpressStationRuleStore.load(context)
             },
+            onIdentitySource = { keys, source ->
+                ExpressStationRuleStore.setIdentitySource(context, keys, source)
+                stationRules = ExpressStationRuleStore.load(context)
+            },
+            // 「精确地址」不再手填，改成**站在驿站门口点一次「获取当前位置」**：
+            // 地址和位置指纹都由这一次采集产生（见 captureStation）。
+            onCaptureLocation = ::captureStation,
+            onRestore = { keys ->
+                ExpressStationRuleStore.clearRules(context, keys)
+                stationRules = ExpressStationRuleStore.load(context)
+            },
+            capture = stationCapture,
             onBack = { stationAdminOpen = false },
         )
         return
@@ -527,6 +821,27 @@ private fun ExpressApp(
             onDispose { context.unregisterReceiver(receiver) }
         }
 
+        // 宿主自查那一批灌完之后的重读（见 ACTION_RECORDS_CHANGED 的注释）。
+        //
+        // 与上面那条**必须分开注册**：那个的接收体里还有 `detailRefreshing = false`，
+        // 而这条消息到达时详情页可能正等着一单的轨迹 —— 被提前收掉指示器，
+        // 用户看到的是「暂无物流轨迹」，但其实还在拉。
+        DisposableEffect(Unit) {
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(ctx: Context?, intent: Intent?) {
+                    homeRecords = ExpressRecordStore.load(context)
+                }
+            }
+            val filter = IntentFilter(ExpressRelay.ACTION_RECORDS_CHANGED)
+            if (Build.VERSION.SDK_INT >= 33) {
+                context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                context.registerReceiver(receiver, filter)
+            }
+            onDispose { context.unregisterReceiver(receiver) }
+        }
+
         // 在有同样内容的那条记录里挑**最新**的一份：详情页开着的时候，轨迹富化可能刚落到
         // 存储里、主列表刚被重读过。用 isSamePackageAs 而不是 dedupeKey 相等，正是为了兜住
         // 「运单号从尾号补成全号」这种主键发生变化的合并 —— 否则那一刻会退回旧快照，
@@ -535,23 +850,49 @@ private fun ExpressApp(
         val labels = remember(homeRecords, stationRules) {
             ExpressHomeGrouper.stationLabels(homeRecords, stationRules)
         }
-        // 轨迹拉取被风控挡下时，把真实原因透给用户（而不是干等超时后显示误导性的
-        // 「确认菜鸟在后台」）。计算很便宜（两个 volatile 读），不做 remember。
-        val traceHint = if (!CainiaoTraceApi.riskBlocked()) {
-            null
-        } else {
+        // 轨迹空着时，把**真实原因**透给用户 —— 干等到超时再显示「请确认菜鸟在后台」
+        // 是误导：用户报的「怎么都获取不了」，八成根本不是菜鸟没在跑。
+        // 计算很便宜（几个 volatile 读），不做 remember。
+        val traceHint = if (CainiaoTraceApi.riskBlocked()) {
             val minutes =
                 ((CainiaoTraceApi.riskBlockedUntil - System.currentTimeMillis()) / 60_000L)
                     .coerceAtLeast(1)
             "拉取被淘宝风控暂时拦住（按请求频率保护），约 $minutes 分钟后下拉重试。"
+        } else {
+            // 没取到就用最近一次失败的原因（`CainiaoTraceApi.lastError`：没有登录态 /
+            // 解析不出结果 / 接口形状变了…）。
+            //
+            // ⚠️ 它是**进程级**的「最近一次」，不按运单号分。放在这里仍然是对的：本页只在
+            // `record.trace` **完全为空**时才用这句，而拉取是串行单线程、刚被本页触发过 ——
+            // 「最近一次失败」就是关于这条件的、或者是最接近真相的那句话。
+            // 要按件区分就得再引一层按单号的错误表，收益远小于复杂度。
+            CainiaoTraceApi.lastError
         }
         ExpressDetailPage(
             record = latest,
             stationLabel = ExpressHomeGrouper.stationLabelOf(latest, labels),
+            rules = stationRules,
             isRefreshing = detailRefreshing,
             onRefresh = onDetailRefresh,
             onBack = { detailRecord = null },
             traceHint = traceHint,
+        )
+        return
+    }
+
+    // 「归档快递」二级页（首页最下面那一行进来的）。
+    //
+    // 它**排在详情判定之后**，这是有意的：从归档页点进某个包裹时 `detailRecord` 被设上、
+    // `archiveOpen` 仍是 true，两个条件同时成立 —— 详情先判定就赢了，用户看到的是详情页；
+    // 详情返回（`detailRecord = null`）之后又自然落回**归档页**，而不是被一脚踢回首页。
+    // 反过来放（归档在详情之前）就必须在打开详情时手动把 archiveOpen 清掉，那等于丢掉返回位置。
+    if (archiveOpen) {
+        ExpressArchivePage(
+            // 传**全量**记录：归档页自己筛（聚类要拿完整集合做，理由见那边的 @param）。
+            records = homeRecords,
+            rules = stationRules,
+            onBack = { archiveOpen = false },
+            onOpenDetail = { record -> detailRecord = record },
         )
         return
     }
@@ -572,6 +913,22 @@ private fun ExpressApp(
                     )
                 } else {
                     Modifier
+                },
+                // 身份码入口只挂在首页：它回答的是「站在驿站门口要念什么」，
+                // 与设置 / 记录 / 关于三页无关，摆在别的页上只会让人以为它跟那一页有关系。
+                actions = {
+                    if (currentPage == TAB_HOME) {
+                        IconButton(
+                            onClick = { identityOpen = true },
+                            // 与返回箭头同一条规矩：顶栏上的图标按钮不铺胶囊底色。
+                            backgroundColor = Color.Transparent,
+                        ) {
+                            Icon(
+                                imageVector = MiuixIcons.Scan,
+                                contentDescription = "身份码",
+                            )
+                        }
+                    }
                 },
             )
         },
@@ -680,7 +1037,8 @@ private fun ExpressApp(
                         .fillMaxSize()
                         .overScrollVertical()
                         .nestedScroll(pageScroll.nestedScrollConnection)
-                        .verticalScroll(rememberScrollState(), overscrollEffect = null)
+                        // 滚动位置按页取（状态建在上面那一层，二级页返回时才能保住偏移）。
+                        .verticalScroll(pageScrollStates[page], overscrollEffect = null)
                         .padding(top = padding.calculateTopPadding())
                         .padding(vertical = 4.dp),
                 ) {
@@ -698,6 +1056,9 @@ private fun ExpressApp(
                                 // 不重读这一下，详情页首次打开经常是空的，得退出去再进来。
                                 scope.launch { homeRecords = ExpressRecordStore.load(context) }
                             },
+                            // 底部「归档快递」那一行。归档页是**只读视图**，不需要提前准备数据 ——
+                            // 它拿的还是同一份 homeRecords，存储重读后它自己会重组。
+                            onOpenArchive = { archiveOpen = true },
                         )
                         TAB_RECORDS -> RecordPage(recordEntries)
                         TAB_ABOUT -> AboutPage(
@@ -729,6 +1090,13 @@ private fun ExpressApp(
                             onDoubleTapPickupChange = {
                                 doubleTapPickup = it
                                 uiPrefs.doubleTapPickup = it
+                            },
+                            hideFromRecents = hideFromRecents,
+                            onHideFromRecentsChange = {
+                                hideFromRecents = it
+                                // prefs 与任务 flag 都由 Activity 那一层写：前者是它的初始化职责，
+                                // 后者只有它做得到（见 ExpressApp 的参数说明）。
+                                onHideFromRecentsChange(it)
                             },
                             blurSupported = blurSupported,
                             stationRules = stationRules,
@@ -762,6 +1130,22 @@ private fun ExpressApp(
                 else -> scrollContent()
             }
         }
+
+        // 身份码弹窗。必须挂在 Scaffold 里面 —— miuix 的 `OverlayDialog` 靠 Scaffold 提供的
+        // `MiuixPopupHost` 渲染，放在外面会静默不显示（库文档明写了这条前提）。
+        //
+        // 传的是**全量** homeRecords：弹窗要自己算「最近的那个驿站」，
+        // 那是驿站级的聚合，首页那几个分组（只装待取件）不够用。
+        IdentityCodeDialog(
+            show = identityOpen,
+            records = homeRecords,
+            rules = stationRules,
+            resumeTick = resumeTick,
+            onNeedLocation = {
+                locationPermissionLauncher.launch(Manifest.permission.ACCESS_COARSE_LOCATION)
+            },
+            onDismiss = { identityOpen = false },
+        )
     }
 }
 
@@ -825,6 +1209,54 @@ private fun stationAdminSummary(rules: ExpressStationRules): String =
         "已设置 ${rules.renames.size} 条规则"
     }
 
+// ---------------------------------------------------------------- 现场采集（驿站地址 / 指纹）
+
+/** 坐标文本（地址反查失败时的兜底）。5 位小数 ≈ 1 米，正好是驿站门口的尺度。 */
+private fun coordinatesOf(position: GeoPoint?): String =
+    position?.let { "%.5f, %.5f".format(java.util.Locale.US, it.lat, it.lng) } ?: ""
+
+/**
+ * 一次采集的结果说明。
+ *
+ * **如实说采到了什么、缺了什么**，不写成「获取成功」：缺 WiFi 和缺定位的处置完全不同
+ * （前者多半是系统限流、再点一次就好；后者是系统定位没开，得去设置里开），
+ * 而这两种在界面上如果都是一句「成功」，用户就只能靠反复试点 —— 那是猜，不是排查。
+ */
+private fun captureNote(capture: Capture): String {
+    val fingerprint = capture.fingerprint
+    val parts = buildList {
+        add(
+            if (fingerprint.position != null) {
+                "已记下当前位置"
+            } else {
+                "没取到定位（确认系统的定位服务已打开）"
+            },
+        )
+        add(
+            if (fingerprint.wifi.isEmpty()) {
+                "没扫到附近 WiFi（可能没开 WiFi，或被系统限流）"
+            } else {
+                "同时记下 ${fingerprint.wifi.size} 个 WiFi"
+            },
+        )
+        // 只在「有坐标、但地址是坐标本身」时说这一句 —— 没有坐标时上面已经说了缺定位，
+        // 再说一次地址兜底只会让两句话互相解释。
+        if (capture.addressText == null && fingerprint.position != null) {
+            add("地址一栏用坐标代替（本机没有可用的地址反查服务）")
+        }
+    }
+    return parts.joinToString("；") + "。"
+}
+
+/** 缺权限时先提示去授权；授权回来会自动继续这次采集。 */
+private const val PERMISSION_HINT = "需要先允许定位权限，允许后会自动接着获取。"
+
+private const val PERMISSION_DENIED_HINT =
+    "没有定位权限，取不到位置。可以到系统设置里给本模块开启定位，再点一次。"
+
+private const val EMPTY_CAPTURE_HINT =
+    "没取到位置和附近 WiFi。请确认系统定位与 WiFi 已打开，站在驿站门口再点一次。"
+
 // ---------------------------------------------------------------- 设置页
 
 @Composable
@@ -842,6 +1274,8 @@ private fun SettingsPage(
     onLiquidGlassChange: (Boolean) -> Unit,
     doubleTapPickup: Boolean,
     onDoubleTapPickupChange: (Boolean) -> Unit,
+    hideFromRecents: Boolean,
+    onHideFromRecentsChange: (Boolean) -> Unit,
     blurSupported: Boolean,
     stationRules: ExpressStationRules,
     onOpenStations: () -> Unit,
@@ -880,6 +1314,18 @@ private fun SettingsPage(
                 onCheckedChange = onLiquidGlassChange,
             )
         }
+        // 第四行「隐藏后台卡片」：前三行是**外观**，这一行改的是**窗口行为**（本模块要不要
+        // 出现在系统最近任务里）。同放一张卡片是因为它同样只影响本机界面（见 ExpressUiPrefs 类注释）。
+        //
+        // 副标题必须留：单看「隐藏后台卡片」根本看不出「后台」指系统最近任务 —— 用户很可能
+        // 理解成「首页那些卡片」（2026-09-26 定这个开关时就是这么来回确认的）。
+        // 它不受 floatingNavBar 影响，所以留在那个 if 外面。
+        SwitchPreference(
+            title = "隐藏后台卡片",
+            summary = "从系统「最近任务」里隐藏本模块",
+            checked = hideFromRecents,
+            onCheckedChange = onHideFromRecentsChange,
+        )
     }
 
     GroupTitle("取件")
@@ -892,7 +1338,10 @@ private fun SettingsPage(
             checked = doubleTapPickup,
             onCheckedChange = onDoubleTapPickupChange,
         )
-        CardDivider()
+        // 这里**故意不画分割线**（2026-09-26 用户要求移除）：两个开关各占一整行、行高一致，
+        // 中间那道 0.5dp 的线除了把一张小卡片切碎没有别的信息量；miuix 自己的偏好列表也是
+        // 靠行间距分行的。开关行 ↔ 带箭头入口行之间才需要线（见驿站详情页的「保存 / 恢复默认」）。
+        //
         // 驿站管理放在「取件」组里而不是单开一组：它服务的就是取件（去哪个驿站、认哪几张卡片），
         // 单开一组会给它一个与其分量不符的位置。
         ArrowPreference(
@@ -1170,9 +1619,14 @@ private fun AboutPage(settings: ExpressSettingsSnapshot, onOpenLog: () -> Unit) 
 
     SettingsCard {
         HintText("1. 在 LSPosed 里勾选本模块，作用域必须包含 system（全局拦截的前提）。")
-        HintText("2. 改动作用域或模块代码后需重启设备，system_server 里的 hook 才会更新。")
-        HintText("3. 模块界面至少打开过一次才算脱离 stopped，广播才收得到。")
-        HintText("4. 若「记录」页显示未发出，先看上面的通知权限。")
+        HintText(
+            "2. 作用域还要包含菜鸟与淘宝：菜鸟给包裹数据，淘宝给淘宝登录态。" +
+                "菜鸟没绑淘宝账号时，它自己的 cookie 里就没有淘宝那份登录态，" +
+                "轨迹只能靠淘宝那头 —— 没勾淘宝，详情页的轨迹会一直取不到。",
+        )
+        HintText("3. 改动作用域或模块代码后需重启设备，system_server 里的 hook 才会更新。")
+        HintText("4. 模块界面至少打开过一次才算脱离 stopped，广播才收得到。")
+        HintText("5. 若「记录」页显示未发出，先看上面的通知权限。")
     }
 
     GroupTitle("诊断")
