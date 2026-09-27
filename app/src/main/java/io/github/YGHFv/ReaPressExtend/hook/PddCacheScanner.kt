@@ -18,9 +18,9 @@
 package io.github.YGHFv.ReaPressExtend.hook
 
 import android.content.Context
+import io.github.YGHFv.ReaPressExtend.core.Courier
 import io.github.YGHFv.ReaPressExtend.core.ExpressOrigin
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
-import io.github.YGHFv.ReaPressExtend.core.ExpressStatus
 import io.github.YGHFv.ReaPressExtend.core.PddCacheDiscovery
 import io.github.YGHFv.ReaPressExtend.relay.ExpressRelay
 import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
@@ -145,7 +145,18 @@ internal object PddCacheScanner {
 
         var sent = 0
         for (pkg in packages) {
-            val fp = "${pkg.orderSn.orEmpty()}|${pkg.pickupCode.orEmpty()}|${pkg.phoneTail.orEmpty()}"
+            // 指纹必须覆盖所有会变的字段：状态/驿站/公司/提示升级了也要重投，
+            // 否则模块侧已落库的那条永远停在旧值。（上一版只指纹三样，升级解析器后
+            // 全量指纹必然失配 —— 正好借这次把库里那批「未知」旧记录刷一遍。）
+            val fp = listOf(
+                pkg.orderSn.orEmpty(),
+                pkg.pickupCode.orEmpty(),
+                pkg.phoneTail.orEmpty(),
+                pkg.status.name,
+                pkg.courier.name,
+                pkg.station.orEmpty(),
+                pkg.logisticsDetail.orEmpty(),
+            ).joinToString("|")
             val unchanged = synchronized(fingerprints) {
                 if (fingerprints[pkg.trackingNumber] == fp) {
                     true
@@ -174,9 +185,10 @@ internal object PddCacheScanner {
      *
      * 字段取舍（**只送能证明的**）：
      * - 运单号 = 强标识，`hasIdentity` 必然通过；
-     * - 取件码 / 手机尾号 / 订单号按解析器的结论原样带上；
-     * - 快递公司、状态、驿站缓存里**没有**，一律留空 —— 让将来的富化（parse 出口那条腿）
-     *   或用户侧自愈去补，不猜。
+     * - 取件码 / 手机尾号 / 订单号 / 驿站名+地址 / 取件提示按解析器的结论原样带上；
+     * - 快递公司优先用 `tracking_num` 值里的中文前缀（宿主自己写好的），认不出再按
+     *   运单号前缀兜底一次（`JT…` = 极兔这类字母前缀；纯数字号段认不出就 UNKNOWN）；
+     * - 状态来自分栏/提示词（见 [PddCacheDiscovery] 类注释的刻意留白），推不出 UNKNOWN。
      */
     private fun sendEnrichment(context: Context, pkg: PddCacheDiscovery.Package) {
         val record = ExpressRecord(
@@ -186,10 +198,18 @@ internal object PddCacheScanner {
                 pkg.orderSn?.let { append("（订单 $it）") }
             },
             trackingNumber = pkg.trackingNumber,
+            courier = if (pkg.courier != Courier.UNKNOWN) {
+                pkg.courier
+            } else {
+                Courier.fromTrackingNumber(pkg.trackingNumber)
+            },
             pickupCode = pkg.pickupCode,
             phoneTail = pkg.phoneTail,
+            station = pkg.station,
+            stationAddress = pkg.stationAddress,
+            logisticsDetail = pkg.logisticsDetail,
             platform = "拼多多",
-            status = ExpressStatus.UNKNOWN,
+            status = pkg.status,
             origin = ExpressOrigin.ENRICHMENT,
             confidence = 100,
             timestamp = System.currentTimeMillis(),

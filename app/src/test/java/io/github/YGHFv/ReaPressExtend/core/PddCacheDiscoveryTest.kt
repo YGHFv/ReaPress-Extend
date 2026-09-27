@@ -143,4 +143,76 @@ class PddCacheDiscoveryTest {
         assertNull(pkg.pickupCode)
         assertEquals("0000", pkg.phoneTail)
     }
+
+    // --------------------------------------------------- 分栏 / 驿站 / 状态（v2）
+
+    /** 待取件分栏片段（形状按真机样本，内容化名）。 */
+    private fun gotTabFile(): String {
+        val mojibake = { s: String -> String(s.toByteArray(Charsets.UTF_8), Charsets.ISO_8859_1) }
+        return """
+            {"express_tab":{"tab_list":[
+              {"tab_id":"sign","tab_name":"${mojibake("已签收")}","tab_num":0,"orders":[]},
+              {"tab_id":"got","tab_name":"${mojibake("待取件")}","tab_num":1,
+               "items":[{"pick_up_info":{"company_name":"${mojibake("某花园驿站")}","address":"${mojibake("某楼23号楼109")}","contact_phone":"18000000000"},
+                "orders":[{"pick_up_desc":[{"type":1,"text":"${mojibake("取件码 1-3-4024")}"}],
+                  "tracking_num":"${mojibake("中通快递")}: 770012340000005",
+                  "order_sn":"260921-999000000000002",
+                  "express_link_url":"goods_express.html?tracking_number\u003d770012340000005",
+                  "additional_desc":[{"type":1,"text":"${mojibake("9月24日18:22送达，已超3天未取")}"}]}]}]}]}}
+        """.trimIndent()
+    }
+
+    @Test
+    fun `分栏 - 待取件栏的单 - 状态驿站公司提示语齐活`() {
+        val pkg = PddCacheDiscovery.parse(mapOf("cache/pdd_cache/a.0" to gotTabFile())).single()
+        assertEquals("770012340000005", pkg.trackingNumber)
+        assertEquals(ExpressStatus.READY_FOR_PICKUP, pkg.status)
+        assertEquals("某花园驿站", pkg.station)
+        assertEquals("某楼23号楼109", pkg.stationAddress)
+        assertEquals(Courier.ZHONGTONG, pkg.courier)
+        assertEquals("1-3-4024", pkg.pickupCode)
+        assertEquals("9月24日18:22送达，已超3天未取", pkg.logisticsDetail)
+    }
+
+    @Test
+    fun `分栏 - onroad 运输中 - 刻意不设状态`() {
+        // IN_TRANSIT 会把富化合并里「CREATED 纠正 IN_TRANSIT」的修正盖回去（项目老坑）。
+        val text = """
+            {"tab_id":"onroad","orders":[{"tracking_num":"${String("运单号".toByteArray(Charsets.UTF_8), Charsets.ISO_8859_1)}: 880000000000001"}]}
+        """.trimIndent()
+        val pkg = PddCacheDiscovery.parse(mapOf("cache/pdd_cache/a.0" to text)).single()
+        assertEquals(ExpressStatus.UNKNOWN, pkg.status)
+    }
+
+    @Test
+    fun `订单列表 - 交易成功提示词 - 历史件标已签收`() {
+        // orderList 缓存形状：chat_status_prompt 贴在 express URL 前 ~100-400 字符。
+        val prompt = String("交易成功".toByteArray(Charsets.UTF_8), Charsets.ISO_8859_1)
+        val text = """{"param":"{\"chat_status_prompt\":\"$prompt\"}","bt":{"url":""" +
+            """"goods_express.html?tracking_number\u003dJT00000000000001\u0026order_sn\u003d260811-999000000000003"}"""
+        val pkg = PddCacheDiscovery.parse(mapOf("cache/pdd_cache/a.0" to text)).single()
+        assertEquals(ExpressStatus.SIGNED, pkg.status)
+        assertEquals("260811-999000000000003", pkg.orderSn)
+    }
+
+    @Test
+    fun `提示词离锚点太远 - 不挂`() {
+        val prompt = String("交易成功".toByteArray(Charsets.UTF_8), Charsets.ISO_8859_1)
+        // 3KB 的无关填充把提示词推到窗口外。
+        val filler = "x".repeat(3000)
+        val text = """{"param":"$prompt$filler","bt":{"url":""" +
+            """"goods_express.html?tracking_number\u003d880000000000002"}"""
+        val pkg = PddCacheDiscovery.parse(mapOf("cache/pdd_cache/a.0" to text)).single()
+        assertEquals(ExpressStatus.UNKNOWN, pkg.status)
+    }
+
+    @Test
+    fun `取件提示过期 - 不挂给下一个单`() {
+        // pick_up_desc 与运单锚点之间隔着 2KB —— 提示是上一单的尾巴，宁可丢也不张冠李戴。
+        val filler = "y".repeat(2000)
+        val text = """"pick_up_desc":[{"text":"${String("取件码 1-1-2001".toByteArray(Charsets.UTF_8), Charsets.ISO_8859_1)}"}],$filler""" +
+            """"tracking_num":"${String("运单号".toByteArray(Charsets.UTF_8), Charsets.ISO_8859_1)}: 880000000000003""" + "\""
+        val pkg = PddCacheDiscovery.parse(mapOf("cache/pdd_cache/a.0" to text)).single()
+        assertNull(pkg.pickupCode)
+    }
 }
