@@ -70,11 +70,26 @@ package io.github.YGHFv.ReaPressExtend.core
  */
 object ExpressRecordRepair {
 
+    /** 旧版 PDD 扫描器在 `orderSn` 缺失时发出的裸诊断串。 */
+    private const val PDD_V23_DIAGNOSTIC_RAW = "拼多多取快递缓存"
+
+    /** 旧版 PDD 扫描器带订单号的诊断串（订单号形状 `260410-367735652661006`）。 */
+    private val PDD_V23_DIAGNOSTIC_RAW_RE = Regex("""拼多多取快递缓存（订单 [0-9-]{8,45}）""")
+
     /** 修复一条记录；没有可修的返回原对象（调用方可以直接用 `===` 判断有没有变）。 */
     fun repair(record: ExpressRecord): ExpressRecord {
         val raw = record.rawText
         if (raw.isBlank()) return record
         var result = record
+
+        // ⓪ 拼多多「发现」腿第一版（缓存解析器只有三样字段时）给每条记录发的诊断副标题。
+        //    它不是任何通知的原文 —— 这个字符串只可能出自我们自己的旧扫描器
+        //    （`PddCacheScanner` v23），卡片副行退回原文时显示的就是这句废话。
+        //    精确匹配整串才清：普通通知/短信不可能长这样，误伤面为零。
+        //    清空后卡片副行自动省略（UI 对 blank raw 的回退就是不显示）。
+        if (raw == PDD_V23_DIAGNOSTIC_RAW || raw.matches(PDD_V23_DIAGNOSTIC_RAW_RE)) {
+            return record.copy(rawText = "")
+        }
 
         // ① 运单号其实是个手机号。判据是「原文里那串号带国家码」——不是「重解析结果为空」，
         //    见类注释第 1 条。

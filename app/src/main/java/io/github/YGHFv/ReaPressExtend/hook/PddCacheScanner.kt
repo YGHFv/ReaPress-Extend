@@ -193,10 +193,10 @@ internal object PddCacheScanner {
     private fun sendEnrichment(context: Context, pkg: PddCacheDiscovery.Package) {
         val record = ExpressRecord(
             sourcePackage = ExpressRelay.PDD_PACKAGE,
-            rawText = buildString {
-                append("拼多多取快递缓存")
-                pkg.orderSn?.let { append("（订单 $it）") }
-            },
+            // rawText 留空：缓存里没有「通知原文」这回事，之前那串「拼多多取快递缓存（订单 …）」
+            // 是探索期的诊断副标题，卡片退回原文首行时显示的就是它。有价值的字段
+            // （驿站/取件码/动态）各有自己的格子，不需要靠 raw 携带。
+            rawText = "",
             trackingNumber = pkg.trackingNumber,
             courier = if (pkg.courier != Courier.UNKNOWN) {
                 pkg.courier

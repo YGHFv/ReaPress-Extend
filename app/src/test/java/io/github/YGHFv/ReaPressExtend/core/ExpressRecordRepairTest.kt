@@ -220,4 +220,43 @@ class ExpressRecordRepairTest {
         val once = ExpressRecordRepair.repair(staleSmsRecord())
         assertEquals(once, ExpressRecordRepair.repair(once))
     }
+
+    // ------------------------------------------------------------ PDD 诊断副标题（v23 扫描器的遗留）
+
+    /** v23 PDD 扫描器给每条发现记录发的诊断串，库里真实形状照抄。 */
+    private fun pddDiagnosticRecord(orderSn: String?) = ExpressRecord(
+        sourcePackage = "com.xunmeng.pinduoduo",
+        rawText = if (orderSn != null) "拼多多取快递缓存（订单 $orderSn）" else "拼多多取快递缓存",
+        trackingNumber = "777398850599489",
+        platform = "拼多多",
+        status = ExpressStatus.UNKNOWN,
+        origin = ExpressOrigin.ENRICHMENT,
+    )
+
+    @Test
+    fun `PDD 旧诊断副标题带订单号的被清掉`() {
+        val fixed = ExpressRecordRepair.repair(pddDiagnosticRecord("260410-367735652661006"))
+        assertEquals("", fixed.rawText)
+        // 清的只是显示层遗留，字段一个不动。
+        assertEquals("777398850599489", fixed.trackingNumber)
+        assertEquals(ExpressStatus.UNKNOWN, fixed.status)
+    }
+
+    @Test
+    fun `PDD 旧诊断副标题无订单号的也被清掉`() {
+        assertEquals("", ExpressRecordRepair.repair(pddDiagnosticRecord(null)).rawText)
+    }
+
+    @Test
+    fun `PDD 诊断串形状不对的不清`() {
+        // 整串精确匹配才清 —— 通知原文里万一真出现「拼多多」三个字，不能误伤。
+        // （后半句是正经通知文案，走正常修复路径、可能推进状态，这里只验 raw 没被清。）
+        val notOurs = ExpressRecord(
+            sourcePackage = "com.android.mms",
+            rawText = "拼多多取快递缓存（订单 260410-367735652661006）请凭取件码到驿站取件",
+            trackingNumber = "777398850599489",
+            origin = ExpressOrigin.NOTIFICATION,
+        )
+        assertEquals(notOurs.rawText, ExpressRecordRepair.repair(notOurs).rawText)
+    }
 }
