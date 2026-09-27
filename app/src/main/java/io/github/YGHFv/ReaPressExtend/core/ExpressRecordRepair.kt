@@ -76,8 +76,11 @@ object ExpressRecordRepair {
     /** 旧版 PDD 扫描器带订单号的诊断串（订单号形状 `260410-367735652661006`）。 */
     private val PDD_V23_DIAGNOSTIC_RAW_RE = Regex("""拼多多取快递缓存（订单 [0-9-]{8,45}）""")
 
+    /** 从诊断串里抠订单号 —— 订单号前 6 位是下单日期（见 [PddCacheDiscovery.orderDateMillis]）。 */
+    private val PDD_V23_ORDER_SN_RE = Regex("""订单 (\d{6,10}-\d{8,32})""")
+
     /** 修复一条记录；没有可修的返回原对象（调用方可以直接用 `===` 判断有没有变）。 */
-    fun repair(record: ExpressRecord): ExpressRecord {
+    fun repair(record: ExpressRecord, now: Long = System.currentTimeMillis()): ExpressRecord {
         val raw = record.rawText
         if (raw.isBlank()) return record
         var result = record
@@ -86,9 +89,20 @@ object ExpressRecordRepair {
         //    它不是任何通知的原文 —— 这个字符串只可能出自我们自己的旧扫描器
         //    （`PddCacheScanner` v23），卡片副行退回原文时显示的就是这句废话。
         //    精确匹配整串才清：普通通知/短信不可能长这样，误伤面为零。
-        //    清空后卡片副行自动省略（UI 对 blank raw 的回退就是不显示）。
+        //    清空前先把**订单日期**抢救出来（订单号前 6 位 = 下单日期）：这批件的物流痕迹
+        //    已被宿主淘汰，订单时刻是「这是什么时候的件」的唯一证据，也是归档链
+        //    （updatedAtOf → 未知件过期）唯一的凭据 —— 只清不留的话它们会在首页
+        //    「其他」档再挂 7 天（2026-09-27 用户：「挂了一堆未知是干嘛」）。
+        //    只填空：万一将来诊断串和真富化并存，不覆盖物流侧给的 arrivalAt。
         if (raw == PDD_V23_DIAGNOSTIC_RAW || raw.matches(PDD_V23_DIAGNOSTIC_RAW_RE)) {
-            return record.copy(rawText = "")
+            // 订单号从诊断串里抢救（详情页展示 + 订单日期的证据载体）。
+            val orderSn = PDD_V23_ORDER_SN_RE.find(raw)?.groupValues?.get(1)
+            val orderDate = orderSn?.let { PddCacheDiscovery.orderDateMillis(it, now) }
+            return record.copy(
+                rawText = "",
+                orderSn = record.orderSn ?: orderSn,
+                arrivalAt = record.arrivalAt ?: orderDate,
+            )
         }
 
         // ① 运单号其实是个手机号。判据是「原文里那串号带国家码」——不是「重解析结果为空」，

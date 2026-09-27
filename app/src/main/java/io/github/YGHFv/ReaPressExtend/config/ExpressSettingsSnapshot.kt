@@ -46,6 +46,8 @@ data class ExpressSettingsSnapshot(
     val hookForceEnabled: Boolean = false,
     /** 包裹详情（轨迹）的获取模式：自动更新 / 点击时获取。见 [ExpressSettingsKeys]。 */
     val traceFetchMode: String = ExpressSettingsKeys.DEFAULT_TRACE_FETCH_MODE,
+    /** 归档时机：签收后归档 / 签收7天后归档。见 [ExpressSettingsKeys.KEY_ARCHIVE_MODE]。 */
+    val archiveMode: String = ExpressSettingsKeys.DEFAULT_ARCHIVE_MODE,
     /**
      * 用户选择**直接吞掉**的通知分类（设置 → 通知拦截）。
      *
@@ -81,6 +83,10 @@ data class ExpressSettingsSnapshot(
     /** 是否「自动更新」轨迹（false = 只在点开详情 / 下拉时按需拉）。 */
     val isTraceAutoFetch: Boolean
         get() = traceFetchMode == ExpressSettingsKeys.MODE_TRACE_AUTO
+
+    /** 是否「签收后立即归档」（false = 签收 7 天后归档，见 [ExpressSettingsKeys.ARCHIVE_MODE_OPTIONS]）。 */
+    val isArchiveOnSign: Boolean
+        get() = archiveMode == ExpressSettingsKeys.MODE_ARCHIVE_ON_SIGN
     /** 模块是否在工作。关掉时 hook 直接放行，不做判定也不投递。 */
     val isEnabled: Boolean get() = mode != ExpressSettingsKeys.MODE_OFF
 

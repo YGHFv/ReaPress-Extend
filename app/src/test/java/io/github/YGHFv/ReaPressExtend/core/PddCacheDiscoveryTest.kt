@@ -215,4 +215,39 @@ class PddCacheDiscoveryTest {
         val pkg = PddCacheDiscovery.parse(mapOf("cache/pdd_cache/a.0" to text)).single()
         assertNull(pkg.pickupCode)
     }
+
+    // ---- 订单日期（订单号前 6 位 = 下单日期，归档链的时间证据）----
+
+    /** 固定「现在」：2026-09-27。core 不碰时钟，orderDateMillis 必须注入。 */
+    private val now: Long = java.time.LocalDate.of(2026, 9, 27)
+        .atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+
+    private fun dateOf(y: Int, m: Int, d: Int): Long = java.time.LocalDate.of(y, m, d)
+        .atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+
+    @Test
+    fun `订单日期从订单号前六位解出`() {
+        assertEquals(dateOf(2025, 12, 9), PddCacheDiscovery.orderDateMillis("251209-346685489461006", now))
+        assertEquals(dateOf(2026, 4, 10), PddCacheDiscovery.orderDateMillis("260410-367735652661006", now))
+    }
+
+    @Test
+    fun `订单日期形状不对的返回null`() {
+        assertNull(PddCacheDiscovery.orderDateMillis("", now))
+        // 纯运单号不是订单号。
+        assertNull(PddCacheDiscovery.orderDateMillis("98120655161875", now))
+        // 前段不是 6 位（order_sn 正则允许 6-10 位，但日期段只有 6 位才算数）。
+        assertNull(PddCacheDiscovery.orderDateMillis("1234567-12345678", now))
+        // 13 月不是合法日期。
+        assertNull(PddCacheDiscovery.orderDateMillis("260932-12345678", now))
+    }
+
+    @Test
+    fun `订单日期落未来的不收`() {
+        // 下个月的「订单」只可能是解析错了或设备时钟被拨过 —— null，绝不编时刻。
+        assertNull(PddCacheDiscovery.orderDateMillis("261201-12345678", now))
+        // 今天的订单收（`<= now` 的边界），明天的不收。
+        assertEquals(dateOf(2026, 9, 27), PddCacheDiscovery.orderDateMillis("260927-12345678", now))
+        assertNull(PddCacheDiscovery.orderDateMillis("260928-12345678", now))
+    }
 }

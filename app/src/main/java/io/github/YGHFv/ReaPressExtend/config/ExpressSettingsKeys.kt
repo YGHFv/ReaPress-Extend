@@ -148,6 +148,36 @@ object ExpressSettingsKeys {
 
     const val DEFAULT_TRACE_FETCH_MODE = MODE_TRACE_ON_DEMAND
 
+    // ---- 归档 ----
+
+    /**
+     * 归档时机。**只影响模块 UI 的列表切分**（system_server / 宿主进程不读它，
+     * 但走同一份 readFrom/writeTo 存取，加键不破坏契约）。
+     *
+     * 两态：
+     * - [MODE_ARCHIVE_ON_SIGN]：物流一签收就进「归档快递」；
+     * - [MODE_ARCHIVE_AFTER_SIGN_7D]（默认）：物流签收 7 天后再归档（历史行为）。
+     *
+     * 两条铁律与模式无关（见 `ExpressHomeGrouper` 的注释）：
+     * 签收时刻以**物流**为准（轨迹末节点 / arrivalAt）；**手动标记取件不算签收**，
+     * 必须等物流推来已签收才有归档资格。
+     */
+    const val KEY_ARCHIVE_MODE = "archive_mode"
+
+    /** 物流签收后立即归档。 */
+    const val MODE_ARCHIVE_ON_SIGN = "archive_on_sign"
+
+    /** 物流签收 7 天后归档（默认，2026-09-26 用户定的原行为）。 */
+    const val MODE_ARCHIVE_AFTER_SIGN_7D = "archive_sign_7d"
+
+    const val DEFAULT_ARCHIVE_MODE = MODE_ARCHIVE_AFTER_SIGN_7D
+
+    /** 归档模式的两个选项，UI 与解析共用一份（同 [MODE_OPTIONS] 的做法）。 */
+    val ARCHIVE_MODE_OPTIONS: List<Pair<String, String>> = listOf(
+        MODE_ARCHIVE_ON_SIGN to "签收后归档",
+        MODE_ARCHIVE_AFTER_SIGN_7D to "签收7天后归档",
+    )
+
     // ---- 自动轮查 ----
     //
     // 与上面「获取模式」的分工：那个决定**被触发时**怎么拉（点开详情 / 富化到达），
@@ -262,6 +292,10 @@ object ExpressSettingsKeys {
             traceFetchMode = prefs.getString(KEY_TRACE_FETCH_MODE, DEFAULT_TRACE_FETCH_MODE)
                 ?.takeIf { it == MODE_TRACE_AUTO || it == MODE_TRACE_ON_DEMAND }
                 ?: DEFAULT_TRACE_FETCH_MODE,
+            // 归档模式同样夹取：认不出的值回落默认（手改 XML / 旧版本残留都不至于炸）。
+            archiveMode = prefs.getString(KEY_ARCHIVE_MODE, DEFAULT_ARCHIVE_MODE)
+                ?.takeIf { it == MODE_ARCHIVE_ON_SIGN || it == MODE_ARCHIVE_AFTER_SIGN_7D }
+                ?: DEFAULT_ARCHIVE_MODE,
             autoWatch = prefs.getBoolean(KEY_AUTO_WATCH, false),
             watchScope = prefs.getString(KEY_WATCH_SCOPE, DEFAULT_WATCH_SCOPE)
                 ?.takeIf { it == MODE_WATCH_TRANSIT || it == MODE_WATCH_UNFINISHED }
@@ -330,6 +364,7 @@ object ExpressSettingsKeys {
             .putString(KEY_EXCLUDE_KEYWORDS, joinKeywords(snapshot.excludeKeywords))
             .putInt(KEY_CONFIDENCE_THRESHOLD, snapshot.confidenceThreshold)
             .putString(KEY_TRACE_FETCH_MODE, snapshot.traceFetchMode)
+            .putString(KEY_ARCHIVE_MODE, snapshot.archiveMode)
             .putBoolean(KEY_AUTO_WATCH, snapshot.autoWatch)
             .putString(KEY_WATCH_SCOPE, snapshot.watchScope)
             .putBoolean(KEY_WATCH_QUIET, snapshot.watchQuiet)

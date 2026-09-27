@@ -185,6 +185,9 @@ private fun PackageSection(record: ExpressRecord, rules: ExpressStationRules) {
         // **收件类型词**，不是平台名（见 [ExpressPlatform]）。这一行显示「来源：普通收件」
         // 等于用一整行说了一件零信息量的事。
         ExpressPlatform.normalize(record.platform)?.let { InfoRow("来源", it) }
+        // 拼多多订单号（发现腿才有）。摆在来源后面：先答「哪买的」，再给那边的单号
+        // —— 用户在拼多多 App 里搜订单 / 找客服时用的就是它。
+        record.orderSn?.takeIf { it.isNotBlank() }?.let { InfoRow("订单号", it) }
     }
 }
 

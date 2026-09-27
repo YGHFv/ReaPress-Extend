@@ -243,6 +243,29 @@ class ExpressRecordRepairTest {
     }
 
     @Test
+    fun `PDD 诊断串里的订单号和订单日期被抢救`() {
+        // 2026-09-27 用户定的方向：这批件的物流痕迹已被宿主淘汰，订单号（详情页展示）
+        // 和订单日期（前 6 位 = 下单日期，归档链的时间证据）是诊断串里仅有的遗产，
+        // 清空前必须捞出来 —— 否则未知老件会在首页「其他」档再挂 7 天。
+        // 260410 = 2026-04-10；now 取 2026-09-27（毫秒由 LocalDate 现算，避免写死时区偏移）。
+        val now = java.time.LocalDate.of(2026, 9, 27)
+            .atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+        val fixed = ExpressRecordRepair.repair(pddDiagnosticRecord("260410-367735652661006"), now)
+        assertEquals("260410-367735652661006", fixed.orderSn)
+        val expected = java.time.LocalDate.of(2026, 4, 10)
+            .atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+        assertEquals(expected, fixed.arrivalAt)
+    }
+
+    @Test
+    fun `PDD 诊断串无订单号的只清原文`() {
+        val fixed = ExpressRecordRepair.repair(pddDiagnosticRecord(null))
+        assertEquals("", fixed.rawText)
+        assertNull(fixed.orderSn)
+        assertNull(fixed.arrivalAt)
+    }
+
+    @Test
     fun `PDD 旧诊断副标题无订单号的也被清掉`() {
         assertEquals("", ExpressRecordRepair.repair(pddDiagnosticRecord(null)).rawText)
     }

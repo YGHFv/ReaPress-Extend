@@ -198,6 +198,17 @@ internal object PddCacheScanner {
             // （驿站/取件码/动态）各有自己的格子，不需要靠 raw 携带。
             rawText = "",
             trackingNumber = pkg.trackingNumber,
+            // 订单号原样带上：详情页展示「这是哪一单」，也是订单日期的载体（见下）。
+            orderSn = pkg.orderSn,
+            // 订单日期 → arrivalAt：这是「这件是什么时候的」唯一可证明的时刻。
+            // 语义上它是订单时刻不是物流变更时刻 —— 对只有订单号、物流痕迹已被缓存
+            // 淘汰的老件，别无选择；而归档链（updatedAtOf → isStaleUnknown）正需要它：
+            // 老订单的未知件当场具备归档资格，不再无限期占着首页「其他」档
+            // （2026-09-27 用户：「挂了一堆未知是干嘛」）。date 里的归属判断见
+            // [PddCacheDiscovery.orderDateMillis]。
+            arrivalAt = pkg.orderSn?.let {
+                PddCacheDiscovery.orderDateMillis(it, System.currentTimeMillis())
+            },
             courier = if (pkg.courier != Courier.UNKNOWN) {
                 pkg.courier
             } else {

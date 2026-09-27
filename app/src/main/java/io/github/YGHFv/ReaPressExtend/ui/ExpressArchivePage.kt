@@ -46,9 +46,9 @@ import top.yukonga.miuix.kmp.icon.extended.Back
  *
  * ## 它装的是什么
  *
- * [ExpressHomeGrouper.archive] 挑出来的那些：**已完成、且超过
- * [ExpressHomeGrouper.ARCHIVE_RETENTION_MS]（7 天）没再动过**的包裹。首页
- * 「已签收 / 异常」那一档于是恒等于「最近一周结束的件」，这一页则是它后面那段历史。
+ * [ExpressHomeGrouper.archive] 挑出来的那些：**物流签收后按归档设置过期**的包裹，加上
+ * 长期无动静的未知件（见那边的说明）。首页「已签收 / 异常」那一档于是等于「归档窗口内
+ * 结束的件 + 还没等到物流签收的手动取件」，这一页则是它后面那段历史。
  *
  * 不删除任何东西 —— 归档只是**换一页显示**。这点是有意为之：那些记录仍然能被搜到、
  * 仍然能在详情页里看到全轨迹，将来要「永久清理」也该是用户显式点的动作，而不是时间到了自动抹掉。
@@ -78,6 +78,8 @@ internal fun ExpressArchivePage(
     rules: ExpressStationRules,
     onBack: () -> Unit,
     onOpenDetail: ((ExpressRecord) -> Unit)? = null,
+    /** 归档窗口（毫秒）：设置选「签收后归档」传 0，「签收7天后归档」传 [ExpressHomeGrouper.ARCHIVE_RETENTION_MS]。 */
+    archiveRetentionMs: Long = ExpressHomeGrouper.ARCHIVE_RETENTION_MS,
 ) {
     val scrollBehavior = MiuixScrollBehavior()
 
@@ -87,7 +89,7 @@ internal fun ExpressArchivePage(
     // 「现在」只用来做归档切分，取一次就够 —— 与首页那边同一个口径
     // （`ExpressHomeGrouper.archive` 的 now 参数）。
     val now = System.currentTimeMillis()
-    val archived = ExpressHomeGrouper.archive(records, now)
+    val archived = ExpressHomeGrouper.archive(records, now, archiveRetentionMs)
     // 显示名表拿**全量**记录算，理由见上面 @param。
     val stationLabels = ExpressHomeGrouper.stationLabels(records, rules)
 
@@ -121,7 +123,13 @@ internal fun ExpressArchivePage(
                 // 只会以为入口点坏了，而不知道归档是被时间条件触发的。
                 GroupTitle("归档快递")
                 SettingsCard {
-                    HintText("暂无归档。已签收或已取件超过 7 天的包裹会自动移到这里，首页就不再显示它们。")
+                    HintText(
+                        if (archiveRetentionMs == 0L) {
+                            "暂无归档。物流签收后的包裹会自动移到这里，首页就不再显示它们。"
+                        } else {
+                            "暂无归档。物流签收超过 7 天的包裹会自动移到这里，首页就不再显示它们。"
+                        },
+                    )
                 }
             } else {
                 GroupTitle("归档快递 · ${archived.size}件")

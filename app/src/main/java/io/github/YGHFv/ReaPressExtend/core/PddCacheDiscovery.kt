@@ -410,6 +410,32 @@ object PddCacheDiscovery {
 
     // ---------------------------------------------------------------- 窗口常量
 
+    /** 订单号前段（`260922-…` 的 `260922`）—— 前 6 位是下单日期（YYMMDD，真机样本核实）。 */
+    private val ORDER_DATE_RE = Regex("""^(\d{2})(\d{2})(\d{2})-\d{8,}$""")
+
+    /**
+     * 订单号里的下单日期 → epoch 毫秒（当天零点，系统时区）。
+     *
+     * 这是「这是什么时候的件」唯一**可证明**的证据：缓存淘汰后物流痕迹一件不剩，
+     * 但订单号是拼多多自己编的号，日期段不会撒谎。用户 2026-09-27 的原话就是
+     * 「我都不知道是什么时候的件」—— 拿它当完成时刻的证据（订单在 7 天前，这件
+     * 就不可能是还在路上的活件），未知老件才能进归档。
+     *
+     * 形状不对 / 日期非法 / 落在未来（容忍 1 天时钟偏差）→ null：判不了就不判，
+     * 绝不编一个时刻出来。core 不碰系统时钟，[nowMillis] 必须注入。
+     */
+    fun orderDateMillis(orderSn: String, nowMillis: Long): Long? {
+        val m = ORDER_DATE_RE.find(orderSn) ?: return null
+        val (yy, mm, dd) = m.destructured
+        return runCatching {
+            val date = java.time.LocalDate.of(2000 + yy.toInt(), mm.toInt(), dd.toInt())
+            val millis = date.atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+            // 落在未来的「订单日期」只可能是解析错了（或设备时钟被拨过）——不收。
+            // 日期粒度是整天，几个小时的时钟漂移产生不了「明天的日期」，不需要容差。
+            millis.takeIf { it <= nowMillis }
+        }.getOrNull()
+    }
+
     /** 取件提示 → 运单锚点的最大距离（真机形状 ~100 字符，放宽留余量）。 */
     private const val PICK_WINDOW = 1500
 

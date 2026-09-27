@@ -955,6 +955,87 @@ class ExpressRecordStoreTest {
         )
     }
 
+    // ---- 归档设置（2026-09-27）：签收后归档 / 签收7天后归档；手动取件不算签收 ----
+
+    @Test
+    fun `签收后归档模式_物流签收件立刻进归档`() {
+        val day = 24L * 60L * 60L * 1000L
+        val now = 100L * day
+        val signed = record(tracking = "SF001", status = ExpressStatus.SIGNED, at = now - 1 * day)
+        val all = listOf(signed)
+
+        // retentionMs = 0：刚签收的件也归档（完成即归档），首页已签收档为空。
+        assertTrue(ExpressHomeGrouper.group(all, now = now, retentionMs = 0L).none { it.title == "已签收 / 异常" })
+        assertEquals(
+            listOf("SF001"),
+            ExpressHomeGrouper.archive(all, now, retentionMs = 0L).map { it.trackingNumber },
+        )
+        // 同一份数据在默认档（7 天）下仍留在首页 —— 窗口是调用方决定的。
+        assertEquals(
+            listOf("SF001"),
+            ExpressHomeGrouper.group(all, now = now)
+                .first { it.title == "已签收 / 异常" }.records.map { it.trackingNumber },
+        )
+    }
+
+    @Test
+    fun `手动取件的件等不到物流签收就不归档`() {
+        // 2026-09-27 用户定的规矩：手动签收要等待物流签收才能进归档。双击标记的
+        // pickedUpAt 是用户的手上动作，物流可能永远不推（拼多多那批只有缓存证据的
+        // 历史件就是）—— 拿它归档会让「取了但宿主一直没推签收」的件凭空从首页消失。
+        val day = 24L * 60L * 60L * 1000L
+        val now = 100L * day
+        // 单件驿站 + 8 天前标记取件：任何模式下都不归档，一直留在首页已签收档。
+        // （本类里的 record() 只有 tracking/status/at 三个参数，其余字段用 copy 补。）
+        val manual = record(tracking = "SF001", status = ExpressStatus.READY_FOR_PICKUP, at = now - 9 * day)
+            .copy(pickupCode = "1-1-1111", station = "菜鸟驿站(A店)", pickedUpAt = now - 8 * day)
+
+        assertTrue(ExpressHomeGrouper.archive(listOf(manual), now).isEmpty())
+        assertTrue(ExpressHomeGrouper.archive(listOf(manual), now, retentionMs = 0L).isEmpty())
+        assertEquals(
+            listOf("SF001"),
+            ExpressHomeGrouper.group(listOf(manual), now = now)
+                .first { it.title == "已签收 / 异常" }.records.map { it.trackingNumber },
+        )
+    }
+
+    @Test
+    fun `未知件超过7天没动静进归档_新鲜的留在其他档`() {
+        // 2026-09-27 用户：「这些未知留这里干嘛」—— 未知件没有签收时刻可等，
+        // 长期无动静的按**硬证据时刻**（arrivalAt / 轨迹末节点）归档；新鲜的
+        // （比如刚扫出来的拼多多件）必须留下。
+        val day = 24L * 60L * 60L * 1000L
+        val now = 100L * day
+        // 硬证据 = arrivalAt（拼多多老件的订单日期就写在这）。timestamp 刻意**给成
+        // 今天**：reconcile 回写 / 富化合并都会刷新它，它不是「这件多老」的证据
+        // （2026-09-27 真机实证：订单日期写进了 arrivalAt，但 timestamp 停在首扫
+        // 时刻，updatedAtOf 取到 timestamp，判据永不成立 —— 所以这里不能信它）。
+        val stale = record(tracking = "SF001", status = ExpressStatus.UNKNOWN, at = now)
+            .copy(arrivalAt = now - 8 * day)
+        val fresh = record(tracking = "SF002", status = ExpressStatus.UNKNOWN, at = now)
+            .copy(arrivalAt = now - 1 * day)
+        val all = listOf(stale, fresh)
+
+        // 首页其他档只剩新鲜那件；旧的那件进归档页 —— **任何归档模式下都一样**
+        // （「签收后归档」retentionMs=0 也不能吞掉新未知件，否则新包裹直接看不见）。
+        for (retention in listOf(ExpressHomeGrouper.ARCHIVE_RETENTION_MS, 0L)) {
+            assertEquals(
+                "retention=$retention 时其他档应只剩新鲜件",
+                listOf("SF002"),
+                ExpressHomeGrouper.group(all, now = now, retentionMs = retention)
+                    .first { it.title == "其他" }.records.map { it.trackingNumber },
+            )
+            assertEquals(
+                "retention=$retention 时归档页应只有 8 天前那件",
+                listOf("SF001"),
+                ExpressHomeGrouper.archive(all, now, retentionMs = retention).map { it.trackingNumber },
+            )
+        }
+        // 没有任何时刻证据（无轨迹无 arrivalAt）的未知件不判过期 —— 宁可多留。
+        val bare = record(tracking = "SF003", status = ExpressStatus.UNKNOWN, at = now)
+        assertTrue(ExpressHomeGrouper.archive(listOf(bare), now, retentionMs = 0L).isEmpty())
+    }
+
     @Test
     fun `物流动态跟随较新的一方而不是只填空`() {
         // 状态都「派送中」了，正文还停在第一次落下的转运中心文案 —— 时序字段必须跟随最新

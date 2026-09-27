@@ -697,6 +697,8 @@ object ExpressRecordStore {
                     put("pkg", record.sourcePackage)
                     put("raw", record.rawText)
                     put("tn", record.trackingNumber ?: JSONObject.NULL)
+                    // 拼多多订单号（发现腿专用；前 6 位是下单日期）。后加的短键，旧 JSON 缺键 → null。
+                    put("osn", record.orderSn ?: JSONObject.NULL)
                     put("courier", record.courier.name)
                     put("pickup", record.pickupCode ?: JSONObject.NULL)
                     put("station", record.station ?: JSONObject.NULL)
@@ -747,6 +749,7 @@ object ExpressRecordStore {
                     sourcePackage = obj.optString("pkg"),
                     rawText = obj.optString("raw"),
                     trackingNumber = obj.optStringOrNull("tn"),
+                    orderSn = obj.optStringOrNull("osn"),
                     courier = enumOr(obj.optString("courier"), Courier.UNKNOWN),
                     pickupCode = obj.optStringOrNull("pickup"),
                     station = obj.optStringOrNull("station"),
@@ -927,11 +930,15 @@ object ExpressHomeGrouper {
      *   默认 `0L` = **不做归档切分**（now 为 0 时任何记录都不可能超期），所有已完成记录都留在
      *   这一档。只关心分组结构的调用方（多数单测）用这个默认值即可；真正的首页那一处调用传的是
      *   真实时钟 —— core 层刻意不碰系统时钟，所以时间必须从这里注入。
+     * @param retentionMs 归档窗口（毫秒）。设置选「签收后归档」时传 `0L`（签收即归档），
+     *   「签收7天后归档」传 [ARCHIVE_RETENTION_MS]。未知件的「长期无动静」窗口与此无关，
+     *   恒为 [ARCHIVE_RETENTION_MS]（见 [archive] 的说明）。
      */
     fun group(
         records: List<ExpressRecord>,
         rules: ExpressStationRules = ExpressStationRules.EMPTY,
         now: Long = 0L,
+        retentionMs: Long = ARCHIVE_RETENTION_MS,
     ): List<ExpressHomeSection> {
         val sections = mutableListOf<ExpressHomeSection>()
 
@@ -992,7 +999,10 @@ object ExpressHomeGrouper {
 
         // 未知状态的单独一档：可能是解析没抽到状态词，但确实是快递通知。
         // 不给它一个位置的话这些记录就凭空消失了，用户会觉得「明明收到了却没显示」。
+        // 长期没动静的未知件进归档（见 [staleUnknownCutoff]）—— 它们没有签收时刻可等，
+        // 留在首页只会永远占着「其他」档（2026-09-27 用户：「这些未知留这里干嘛」）。
         val unknown = records.filter { it.status == ExpressStatus.UNKNOWN }
+            .filterNot { isStaleUnknown(it, now) }
         if (unknown.isNotEmpty()) {
             sections += ExpressHomeSection(title = "其他", records = unknown)
         }
@@ -1001,10 +1011,11 @@ object ExpressHomeGrouper {
         // 但它仍然是一条真实存在的包裹，直接删掉会让用户以为模块把数据弄丢了。
         // 等宿主推来「已签收」，它会自然留在这里；拿它当一条「已取」的凭据也不错。
         //
-        // 超过 [ARCHIVE_RETENTION_MS] 的那些**不在这里**：它们进了「归档快递」二级页。
-        // 首页这一档于是恒等于「最近一周内结束的件」—— 用户回头核对的就是这些，
-        // 再往前的只会让列表一直长下去（2026-09-26 用户要求）。
-        val done = finishedRecords(records, ids).filterNot { isArchived(it, now) }
+        // 超过归档窗口的**物流签收件**不在这里：它们进了「归档快递」二级页。手动标记
+        // 取件的件**不归档**（2026-09-27 用户定的规矩：手动签收要等物流签收），所以
+        // 它们会一直留在这档 —— filterNot 只摘物流完成的件。
+        val done = finishedRecords(records, ids)
+            .filterNot { it.status in DONE_STATUSES && isArchived(it, now, retentionMs) }
         if (done.isNotEmpty()) {
             sections += ExpressHomeSection(
                 title = "已签收 / 异常",
@@ -1136,13 +1147,24 @@ object ExpressHomeGrouper {
      * 已完成的记录在首页停留多久，超过就进「归档快递」（毫秒）。
      *
      * 7 天是用户定的（2026-09-26 原话：「已签收超过 7 天的快递自动进入归档快递的二级页面」）。
+     * 2026-09-27 起它身兼三职：归档设置的**默认档**窗口（另一个档是「签收后归档」，传 0），
+     * 以及未知件「长期无动静」的固定窗口（见 [archive] 第 2 类）。
      * 依据是这一档的用途 —— 用户回头翻「已签收 / 异常」只可能是核对最近几天的事；
      * 一周以前的签收记录既不需要动作、也早已不在驿站了，留在首页只是把列表越拖越长。
      */
     const val ARCHIVE_RETENTION_MS = 7L * 24L * 60L * 60L * 1000L
 
     /**
-     * 「归档快递」二级页要显示的那些记录：**已完成、且超过 [ARCHIVE_RETENTION_MS] 没再动过**的。
+     * 「归档快递」二级页要显示的那些记录。两类（2026-09-27 用户定的规矩）：
+     *
+     * 1. **物流签收 / 投递失败的件**（[DONE_STATUSES]），按 [retentionMs] 窗口过期。
+     *    手动标记取件的件**不在其中** —— 「手动签收要等待物流签收才能进归档」：
+     *    `pickedUpAt` 是用户的手上动作，物流可能永远不推（拼多多那些只有缓存证据的
+     *    历史件就是），拿它当归档凭据会让「取了但宿主一直没推签收」的件凭空从首页消失。
+     * 2. **长期无动静的未知件**：状态停在 UNKNOWN 且 [updatedAtOf] 超过 [ARCHIVE_RETENTION_MS]。
+     *    它们没有签收时刻可等（缓存淘汰 / 解析不出状态），留着只会永远占着首页「其他」档；
+     *    窗口**恒为 7 天**、不随 [retentionMs] 走 —— 「签收后归档」模式下新发现的未知件
+     *    （比如拼多多缓存刚扫出来的）要是立即归档，新包裹就直接看不到了。
      *
      * 按 [completedAtOf] 倒序 —— 最近归档的排最上面。归档件是「历史」，用户翻它的动机通常是
      * 「上周那件到底签收没有」，所以新的一般比旧的更常被找。
@@ -1155,14 +1177,18 @@ object ExpressHomeGrouper {
      *
      * @param now 当前时刻（毫秒）。与 [group] 的 `now` 是同一个值 —— 两处若不一致，
      *   会出现「一件既不在首页、也不在归档页」的空窗（恰好卡在两次调用之间的那件）。
+     * @param retentionMs 物流签收件的归档窗口：设置选「签收后归档」传 `0L`（立即），
+     *   「签收7天后归档」传默认值。
      */
     fun archive(
         records: List<ExpressRecord>,
         now: Long,
         retentionMs: Long = ARCHIVE_RETENTION_MS,
     ): List<ExpressRecord> =
-        finishedRecords(records, stationIdentities(records))
-            .filter { isArchived(it, now, retentionMs) }
+        (
+            records.filter { it.status in DONE_STATUSES && isArchived(it, now, retentionMs) } +
+                records.filter { it.status == ExpressStatus.UNKNOWN && isStaleUnknown(it, now) }
+            )
             .sortedWith(compareByDescending { completedAtOf(it) })
 
     /**
@@ -1186,7 +1212,11 @@ object ExpressHomeGrouper {
     /**
      * 这件是不是该归档了。判据只有一条：**完成之后过了 [retentionMs]**。
      *
+     * 只对**物流完成**的件调用（[DONE_STATUSES]）—— 手动取件的件没有归档资格，
+     * 传进来没有意义（见 [archive] 的说明）。
+     *
      * `>=` 而不是 `>`：「超过 7 天」按整天算，正好第 7 天那一刻归档是符合直觉的。
+     * `retentionMs = 0`（「签收后归档」）时恒为真 —— 完成即归档，正是想要的。
      *
      * ⚠️ 传 `now = 0` 时（见 [group] 的默认值）任何记录都不算归档 —— 差值恒为负。
      * 这正是「不做归档切分」想要的效果，不是巧合。
@@ -1196,6 +1226,27 @@ object ExpressHomeGrouper {
         now: Long,
         retentionMs: Long = ARCHIVE_RETENTION_MS,
     ): Boolean = now - completedAtOf(record) >= retentionMs
+
+    /**
+     * 未知件是不是「长期无动静」了。窗口**恒为 [ARCHIVE_RETENTION_MS]**，不随归档模式走
+     * （理由见 [archive] 第 2 类的说明：新发现的未知件不能被「签收后归档」立刻吞掉）。
+     *
+     * 时间只认**硬证据**：轨迹末节点 / [ExpressRecord.arrivalAt]（拼多多的订单日期就在这）。
+     * ⚠️ **不信 [ExpressRecord.timestamp] 兜底** —— 与 [completedAtOf] 当初踩的是同一个坑的
+     * 另一面：timestamp 是「这条记录最后一次被写」，而写它的人包括**模块自己**（reconcile
+     * 回写、富化合并都会碰），2026-09-27 真机实证：订单日期已写进 arrivalAt 的 5 件拼多多
+     * 未知件，因为 timestamp 停在当天首扫时刻，max() 取到 timestamp，归档判据永不成立。
+     * 两处来源全空（没有任何时刻证据）→ 不判过期：判不了就别乱归档，宁可多留一会儿。
+     *
+     * ⚠️ `now = 0`（不做归档切分）时恒为假 —— 与 [isArchived] 同一个口径。
+     */
+    private fun isStaleUnknown(record: ExpressRecord, now: Long): Boolean {
+        val evidence = maxOf(
+            record.trace.lastOrNull()?.let { ExpressFormatter.tracePointTime(it.time) } ?: 0L,
+            record.arrivalAt ?: 0L,
+        )
+        return evidence > 0L && now - evidence >= ARCHIVE_RETENTION_MS
+    }
 
     /**
      * 这件「最后有动静」是什么时候（毫秒）：轨迹最新节点、到站时间、宿主 `gmt_modified` 取最新。
@@ -1225,8 +1276,10 @@ object ExpressHomeGrouper {
      * 「完成时刻」要的是**能证明它完成了**的时刻，取三处较新者：
      * - 轨迹最后一个节点的时间（真实签收/失败时刻，`ExpressFormatter.tracePointTime` 解析）；
      * - [ExpressRecord.arrivalAt]（宿主物流记录的最后变更时间，签收后不再变）；
-     * - [ExpressRecord.pickedUpAt]（用户确认取件的时刻 —— 整站确认的到站件可能没有
-     *   签收轨迹，这一笔就是它唯一的完成凭据；只看前两处会把刚取走的件当场归档）。
+     * - [ExpressRecord.pickedUpAt]（手动取件的时刻）—— **它不再是归档资格**（2026-09-27
+     *   用户定的规矩：手动签收要等物流签收，见 [archive]），但物流已签收的件也可能留有
+     *   这一笔（用户先手动标记、宿主后推签收），取 max 时把它算上只影响**排序**，
+     *   不影响「能不能归档」。
      *
      * 三处都缺（旧记录没有轨迹也没有 arrivalAt）才兜底 [ExpressRecord.timestamp]：
      * 判不了就别乱归档，宁可让它在首页多待一会儿。

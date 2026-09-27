@@ -31,6 +31,15 @@ data class ExpressRecord(
     val rawText: String,
     /** 运单号。带前缀的会归一化成大写。 */
     val trackingNumber: String? = null,
+    /**
+     * 电商平台订单号，如 `260922-999000000000001`（拼多多；前 6 位是下单日期）。
+     *
+     * 目前只有拼多多「发现」腿给得出它（缓存里的 `order_sn` 字段）。两个用途：
+     * 详情页展示（用户核对「这是哪一单」），以及经 [PddCacheDiscovery.orderDateMillis]
+     * 推出下单时刻 —— 对物流痕迹已被缓存淘汰的老件，那是「这是什么时候的件」唯一
+     * 可证明的证据。其他来源拿不到就是 null。
+     */
+    val orderSn: String? = null,
     /** 快递公司。由运单号前缀或文案里的公司名推得。 */
     val courier: Courier = Courier.UNKNOWN,
     /** 取件码，如 "8-2-3021"。 */
@@ -290,6 +299,8 @@ data class ExpressRecord(
 
         val merged = copy(
             trackingNumber = mergedTracking,
+            // 订单号同样只填空：通知侧永远给不出它，有值的必然来自发现腿，不存在竞争。
+            orderSn = orderSn ?: other.orderSn,
             courier = if (courier == Courier.UNKNOWN) other.courier else courier,
             // 驿站名比别的字段多一条规则：**没有地点信息的写法要让位**。
             // 淘宝通知只写「已送达代收点」，解析出来是个占位词 —— 它非空，按纯粹的「只填空」

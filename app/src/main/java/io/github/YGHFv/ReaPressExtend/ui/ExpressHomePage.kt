@@ -65,8 +65,8 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  * @param onOpenDetail 单击卡片进包裹详情页（看全轨迹 / 驿站完整地址 / 商品图）。
  *   传 null 表示不提供入口 —— 与 [onTogglePickup] 同一种约定，且两者互相独立：
  *   取件开关关掉之后，单击进详情仍然应该可用。
- * @param onOpenArchive 底部「归档快递」那一行的入口（已签收超过 7 天的记录）。传 null 就整行不排
- *   —— 与上面两个参数同一种约定。归档件本身**不在这一页**，这一行只是去二级页的入口。
+ * @param onOpenArchive 底部「归档快递」那一行的入口（物流签收件按归档设置过期后进那里）。
+ *   传 null 就整行不排 —— 与上面两个参数同一种约定。归档件本身**不在这一页**，这一行只是去二级页的入口。
  */
 @Composable
 internal fun HomePage(
@@ -75,6 +75,8 @@ internal fun HomePage(
     onTogglePickup: ((ExpressRecord) -> Unit)?,
     onOpenDetail: ((ExpressRecord) -> Unit)? = null,
     onOpenArchive: (() -> Unit)? = null,
+    /** 归档窗口（毫秒）：设置选「签收后归档」传 0，「签收7天后归档」传 [ExpressHomeGrouper.ARCHIVE_RETENTION_MS]。 */
+    archiveRetentionMs: Long = ExpressHomeGrouper.ARCHIVE_RETENTION_MS,
 ) {
     if (records.isEmpty()) {
         EmptyHome()
@@ -84,10 +86,10 @@ internal fun HomePage(
     // 「已入站2天」这种相对时间需要一个「现在」。在 UI 层取一次再往下传 —— core 层刻意不碰
     // 系统时钟（见 ExpressFormatter.inStationLabel），所以这里是整条链路上唯一的时间来源。
     //
-    // 它同时决定**归档切分**（超期 7 天的已签收件不在这页显示，见 ExpressHomeGrouper.archive），
+    // 它同时决定**归档切分**（超期的物流签收件不在这页显示，见 ExpressHomeGrouper.archive），
     // 所以必须在下面那次 group() 之前取好 —— 一次计算、两处使用，两边不会差出几毫秒。
     val now = System.currentTimeMillis()
-    val sections = ExpressHomeGrouper.group(records, rules, now)
+    val sections = ExpressHomeGrouper.group(records, rules, now, archiveRetentionMs)
     // 驿站显示名表：整页算一次。到站卡片抬头是分组时就带出来的（同一张表），下面那些
     // 平铺卡片（运输中 / 已签收）自己取一次 —— 它们不在分组里，拿不到 group.station。
     //
@@ -118,15 +120,19 @@ internal fun HomePage(
     // （用户从这里知道「签收超过 7 天的会去哪」，否则那些记录只是悄悄从列表里消失，
     // 看着像数据丢了）。件数写在副标题上，不用进去就能知道里面有多少。
     if (onOpenArchive != null) {
-        val archivedCount = ExpressHomeGrouper.archive(records, now).size
+        val archivedCount = ExpressHomeGrouper.archive(records, now, archiveRetentionMs).size
         GroupTitle("归档")
         SettingsCard {
             ArrowPreference(
                 title = "归档快递",
+                // 副标题必须跟着归档设置走：说了「签收超过 7 天」结果立刻就归档，
+                // 用户只会以为模块把数据弄丢了（设置页那两个选项的语义以这里+归档页为准）。
                 summary = if (archivedCount == 0) {
-                    "暂无 · 签收超过 7 天会自动移到这里"
+                    if (archiveRetentionMs == 0L) "暂无 · 物流签收后自动移到这里"
+                    else "暂无 · 物流签收超过 7 天会自动移到这里"
                 } else {
-                    "$archivedCount 件 · 签收超过 7 天"
+                    if (archiveRetentionMs == 0L) "$archivedCount 件 · 物流签收后归档"
+                    else "$archivedCount 件 · 物流签收超过 7 天"
                 },
                 onClick = onOpenArchive,
             )

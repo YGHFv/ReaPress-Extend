@@ -625,6 +625,12 @@ private fun ExpressApp(
         settings = next
     }
 
+    // 归档窗口跟设置走：签收后归档 = 0（物流一签收就进归档页），签收7天后归档 = 7 天。
+    // 首页分组、归档入口、归档页三处共用这一个值 —— 各自推导的话，改设置后三处会在
+    // 重组顺序里短暂地用上不一致的窗口，同一件包裹会在两页之间闪。
+    val archiveRetentionMs =
+        if (settings.isArchiveOnSign) 0L else ExpressHomeGrouper.ARCHIVE_RETENTION_MS
+
     // 首页的包裹列表。拦截事件由 system_server 广播到本进程，而用户多半是「收到通知 →
     // 点开模块」—— 也就是 Activity 还活着但已离开前台时数据就变了。
     // 所以 [resumeTick] 每次 onResume 自增，这里随之重读；切回首页标签时也重读一次。
@@ -1043,6 +1049,8 @@ private fun ExpressApp(
             rules = stationRules,
             onBack = { archiveOpen = false },
             onOpenDetail = { record -> detailRecord = record },
+            // 归档窗口跟设置走（「签收后归档」= 0，立即；默认 7 天）。
+            archiveRetentionMs = archiveRetentionMs,
         )
         return
     }
@@ -1238,6 +1246,8 @@ private fun ExpressApp(
                             // 底部「归档快递」那一行。归档页是**只读视图**，不需要提前准备数据 ——
                             // 它拿的还是同一份 homeRecords，存储重读后它自己会重组。
                             onOpenArchive = { archiveOpen = true },
+                            // 归档窗口跟设置走（「签收后归档」= 0，立即；默认 7 天）。
+                            archiveRetentionMs = archiveRetentionMs,
                         )
                         // 「记录」那一栏只看**投递**记录（模块发出去的通知）。拦截记录是另一个视图
                         // （设置 → 通知拦截 → 拦截记录）—— 两者混在一页里，「已发出 N/M」这个统计
@@ -1565,6 +1575,22 @@ private fun SettingsPage(
             selected = settings.traceFetchMode,
             onSelect = { mode -> update { it.copy(traceFetchMode = mode) } },
         )
+    }
+
+    GroupTitle("归档")
+    SettingsCard {
+        // 什么时候把结束的件从首页挪进「归档快递」。判据是**物流**签收时刻（轨迹末节点 /
+        // arrivalAt）—— 双击标记的「已取件」不算：那是用户的手上动作，物流可能永远不推，
+        // 拿它归档会让「取了但宿主一直没推签收」的件凭空从首页消失（那条语义在
+        // ExpressHomeGrouper 里，这里只负责把选项摆出来）。
+        SegmentedRow(
+            options = ExpressSettingsKeys.ARCHIVE_MODE_OPTIONS,
+            selected = settings.archiveMode,
+            onSelect = { mode -> update { it.copy(archiveMode = mode) } },
+        )
+        // 这句必须写：单看「签收后归档」四个字，用户多半以为双击取件也算签收 ——
+        // 实际行为是等物流推来签收才归档，不说清就是「我取完了怎么还在」的疑惑源。
+        HintText("以物流签收为准；手动标记取件的包裹要等物流签收后才归档")
     }
 
     GroupTitle("自动轮查")
