@@ -94,6 +94,16 @@ class ExpressRelayReceiver : BroadcastReceiver() {
                         notifyRecordsChanged(app, throttled = false)
                     }
                     ?: ModuleAndroidLog.error(LOG_TAG, "host query report with empty payload, dropped")
+            // 新接平台（拼多多）的字段探针：**只记日志**，不碰任何状态。
+            //
+            // 与上面那条分开的理由见 ExpressRelay.ACTION_HOST_PROBE 的注释（上面那条会顺手给
+            // 菜鸟直连兜底报到，按到拼多多头上是错的）。这里也**不**发 RECORDS_CHANGED ——
+            // 探针不落任何记录，界面没什么可重读的。
+            ExpressRelay.ACTION_HOST_PROBE ->
+                intent.getStringExtra(ExpressRelay.EXTRA_HOST_PROBE)
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { ModuleAndroidLog.legacy(LOG_TAG, "host probe: $it") }
+                    ?: ModuleAndroidLog.error(LOG_TAG, "host probe with empty payload, dropped")
             // system_server 对「借它身份代发唤醒销」的应答（[ACTION_WAKE_REQUEST]）：
             // 通道就绪播报一次、每次代发一行回执。**只记日志**。
             //

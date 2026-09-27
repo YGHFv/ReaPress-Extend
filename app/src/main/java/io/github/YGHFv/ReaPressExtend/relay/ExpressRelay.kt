@@ -313,6 +313,30 @@ object ExpressRelay {
     const val ACTION_HOST_QUERY_REPORT = "io.github.YGHFv.ReaPressExtend.HOST_QUERY_REPORT"
 
     /**
+     * 宿主进程 → 模块进程：**新接平台的字段探针**结论（拼多多的第一版接入）。
+     *
+     * ## 为什么不复用 [ACTION_HOST_QUERY_REPORT]
+     *
+     * 那条的接收侧除了记日志，还会调 `CainiaoDirectFetcher.noteHostReport()` —— 那是
+     * 「**菜鸟**还活着」的证据，打开模块后它没来才会轮到菜鸟直连兜底上场。拼多多的探针
+     * 按到那个头上是错的（会让菜鸟的兜底逻辑以为宿主还活着，从而不去直连）。
+     *
+     * 这正是项目里那条老规矩：**同一条 action 的接收期望不同就不共用**
+     * （另见 [ACTION_TRACE_ARRIVED] 与 [ACTION_RECORDS_CHANGED] 的分工）。
+     *
+     * ## 它存在的理由与那条完全一样
+     *
+     * 探针跑在宿主进程里，`XposedBridge.logAlways` 走 logcat，而 MIUI / HyperOS 上
+     * logcat 整条不可读、LSPosed 的日志文件 adb 也碰不到 —— 宿主侧的结论**不落字就等于没发生**。
+     * 所以经 relay 送回模块进程，落进 `files/module-log.txt`：那是唯一一处
+     * `adb shell run-as` 能直接读、且不受「简洁日志」开关影响的地方。
+     *
+     * ⚠️ 载荷是**诊断文本**，会包含运单号这类真机数据 —— 只进模块私有目录里的日志文件，
+     * **不进仓库**（`log/` 与模块文件都不在版本控制里）。
+     */
+    const val ACTION_HOST_PROBE = "io.github.YGHFv.ReaPressExtend.HOST_PROBE"
+
+    /**
      * 反向请求：模块进程 → 菜鸟进程，「用你自己的会话替我取一份身份码」。
      *
      * ## 为什么不能让模块自己取（2026-09-26 两轮真机实证）
@@ -571,6 +595,14 @@ object ExpressRelay {
     const val EXTRA_HOST_QUERY_REPORT = "hostQueryReport"
 
     /**
+     * [ACTION_HOST_PROBE] 的载荷：宿主侧探针摊出来的一行（哪个实体、哪些字段有值）。
+     *
+     * 与 [EXTRA_HOST_QUERY_REPORT] 的区别只在**接收侧的处置**（见那个 action 的说明）；
+     * 载荷形状本身是一样的「一句人话」。
+     */
+    const val EXTRA_HOST_PROBE = "hostProbeText"
+
+    /**
      * [ACTION_WAKE_REQUEST] 的载荷：这一记唤醒是干什么用的（只进日志）。
      *
      * 与 [io.github.YGHFv.ReaPressExtend.relay.HostWakePin.wake] 的 `reason` 同一个字符串，
@@ -593,6 +625,16 @@ object ExpressRelay {
 
     /** 宿主（菜鸟）包名。广播请求的寻址目标 —— relay 是字符串契约层，这里只此一处。 */
     const val HOST_PACKAGE = "com.cainiao.wireless"
+
+    /**
+     * 拼多多包名 —— 第三个受作用域影响的宿主。
+     *
+     * 缓存发现（`hook/PddCacheScanner`）构造的记录用它填 `sourcePackage`：
+     * 首页卡片据此分清「这件是哪来的」。**它不是广播的寻址目标**（PDD 侧没有反向
+     * receiver），只是来源标记 —— 放进契约层与 [HOST_PACKAGE] 作伴，是为了让
+     * 「哪些包名是这个模块认识的宿主」只在一处维护。
+     */
+    const val PDD_PACKAGE = "com.xunmeng.pinduoduo"
 
     /**
      * 淘宝包名 —— 第二个「宿主」。

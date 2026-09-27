@@ -62,6 +62,8 @@ dependencies {
 
     // 只存在于被注入的进程，绝不能打进模块 APK —— compileOnly 是硬要求，
     // 打成 implementation 会让模块进程加载到一份假的 API 实现。
+    // ⚠️ 宿主的其他类（包括 Gson）同样不能编译依赖：模块类加载器在宿主进程里
+    // 解析不到它们，直接引用会 NoClassDefFoundError —— 只能反射 / 鸭子类型。
     compileOnly("io.github.libxposed:api:102.0.0")
 
     testImplementation("junit:junit:4.13.2")

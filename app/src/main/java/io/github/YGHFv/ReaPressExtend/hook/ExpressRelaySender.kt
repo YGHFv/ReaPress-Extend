@@ -145,6 +145,27 @@ internal object ExpressRelaySender {
     }
 
     /**
+     * 宿主 App 进程侧：把**新接平台（拼多多）的字段探针**结论送回模块进程
+     * （[ExpressRelay.ACTION_HOST_PROBE]，发起者是 [PddPackageHook]）。
+     *
+     * 与 [sendHostQueryReport] 逐字同一套理由（宿主侧结论在模块侧不落字就等于没发生，
+     * 见那个函数的说明），**刻意不共用 action** 也见 [ExpressRelay.ACTION_HOST_PROBE]
+     * 的注释：那条的接收侧会顺手给「菜鸟直连兜底」报个到，按到拼多多头上是错的。
+     *
+     * 只送一句诊断文本；失败只记日志（诊断信息丢了不影响任何功能）。
+     */
+    fun sendHostProbe(context: Context, text: String) {
+        runCatching {
+            val intent = Intent(ExpressRelay.ACTION_HOST_PROBE)
+                .setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
+                .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                .putExtra(ExpressRelay.EXTRA_HOST_PROBE, text)
+            context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+            XposedBridge.logAlways("host probe report sent: $text")
+        }.onFailure { XposedBridge.logError("host probe report failed", it) }
+    }
+
+    /**
      * system_server 侧：把「代发唤醒销」的结果送回模块进程
      * （[ExpressRelay.ACTION_WAKE_REPORT]，执行者是 [SystemWakeRelay]）。
      *

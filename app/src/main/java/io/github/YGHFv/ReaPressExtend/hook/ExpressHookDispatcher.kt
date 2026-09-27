@@ -100,10 +100,23 @@ object ExpressHookDispatcher {
                 }
                 XposedBridge.logAlways("$packageName: taobao credential hook installed=$ok")
             }
-            // 拼多多的富化还没做。这里刻意只记一行日志、不做任何反射动作 ——
-            // 否则日志看起来像"已经装上了"，真机验证时会白跑一轮。
-            PINDUODUO ->
-                XposedBridge.logAlways("$packageName: enrichment hook not implemented yet")
+            // 拼多多：挂它**网络回调的 JSON 出口** `CommonCallback#parseResponseString`。
+            //
+            // 与菜鸟那条（本地 ORM 门面）不同 —— 拼多多的包裹列表是服务端响应即时反序列化成
+            // 实体的，本地不留表，所以出口只能在「响应 → 实体」这一步。选点依据与字段清单
+            // 全在 [PddPackageHook] 的类注释里（含 smali 证据）。
+            //
+            // 每个进程各装一份：拼多多的进程很多（`:titan` / `:pdd_network` 等），
+            // 而真正在跑的是哪一个不确定 —— 探针报告里带进程名，第一次就能看清。
+            PINDUODUO -> {
+                val ok = runCatching {
+                    PddPackageHook.install(classLoader, isMainProcess = process == PINDUODUO)
+                }.getOrElse { error ->
+                    XposedBridge.logError("$packageName: pdd package hook install threw", error)
+                    false
+                }
+                XposedBridge.logAlways("$packageName: pdd package hook installed=$ok")
+            }
             else ->
                 XposedBridge.logAlways("$packageName: no hook registered, ignoring")
         }
