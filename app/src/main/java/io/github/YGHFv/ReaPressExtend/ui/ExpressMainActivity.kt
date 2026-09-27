@@ -50,6 +50,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerDefaults.flingBehavior
 import androidx.compose.foundation.pager.rememberPagerState
@@ -546,6 +547,8 @@ private fun ExpressApp(
     var stationAdminOpen by remember { mutableStateOf(false) }
 
     var archiveOpen by remember { mutableStateOf(false) }
+    // 归档页滚动状态提升到这一层：归档页进详情时整页被移出组合，状态留在这里返回后才能恢复原位。
+    val archiveListState = rememberLazyListState()
 
     // 授权是异步的，回调里没有别的办法知道「谁在等」，必须在发起申请时存下 keys。
     var stationCapture by remember { mutableStateOf<StationCaptureState?>(null) }
@@ -784,6 +787,7 @@ private fun ExpressApp(
         ExpressArchivePage(
             records = homeRecords,
             rules = stationRules,
+            listState = archiveListState,
             onBack = { archiveOpen = false },
             onOpenDetail = { record -> detailRecord = record },
             archiveRetentionMs = archiveRetentionMs,
@@ -1557,9 +1561,19 @@ private fun RecordPage(
 
     GroupTitle("通知投递记录 · 已发出 ${entries.count { it.delivered }} / ${entries.size}")
 
+    // todayStart 只在重组时算一次：放 dayLabel 里每条记录都要重建 Calendar，30 条 × 每次重组就是 30 个。
+    val todayStart = remember {
+        java.util.Calendar.getInstance().apply {
+            set(java.util.Calendar.HOUR_OF_DAY, 0)
+            set(java.util.Calendar.MINUTE, 0)
+            set(java.util.Calendar.SECOND, 0)
+            set(java.util.Calendar.MILLISECOND, 0)
+        }.timeInMillis
+    }
+
     entries.take(30).forEachIndexed { index, entry ->
-        val day = dayLabel(entry.at)
-        val previousDay = entries.getOrNull(index - 1)?.let { dayLabel(it.at) }
+        val day = dayLabel(entry.at, todayStart)
+        val previousDay = entries.getOrNull(index - 1)?.let { dayLabel(it.at, todayStart) }
         if (index == 0 || previousDay != day) {
             GroupTitle(day)
         }
@@ -1583,25 +1597,21 @@ private fun RecordPage(
     }
 }
 
-private fun dayLabel(at: Long): String {
-    val calendar = java.util.Calendar.getInstance()
-    val today = calendar.clone() as java.util.Calendar
-    today.set(java.util.Calendar.HOUR_OF_DAY, 0)
-    today.set(java.util.Calendar.MINUTE, 0)
-    today.set(java.util.Calendar.SECOND, 0)
-    today.set(java.util.Calendar.MILLISECOND, 0)
-    val todayStart = today.timeInMillis
-    return when {
-        at >= todayStart -> "今天"
-        at >= todayStart - 24 * 60 * 60 * 1000L -> "昨天"
-        else -> java.text.SimpleDateFormat("MM-dd", java.util.Locale.getDefault())
-            .format(java.util.Date(at))
-    }
+/** 归档判据用的「一天」毫秒数。 */
+private const val DAY_MS = 24 * 60 * 60 * 1000L
+
+/** SimpleDateFormat 构造不便宜且非线程安全；所有调用都在重组（主线程）里，缓存成单例即可。 */
+private val recordDayFormat = java.text.SimpleDateFormat("MM-dd", java.util.Locale.getDefault())
+private val recordClockFormat = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+
+/** [todayStart] 由调用方在重组里 remember，避免每条记录重建 Calendar；跨天后下一次重组自然刷新。 */
+private fun dayLabel(at: Long, todayStart: Long): String = when {
+    at >= todayStart -> "今天"
+    at >= todayStart - DAY_MS -> "昨天"
+    else -> recordDayFormat.format(java.util.Date(at))
 }
 
-private fun clockLabel(at: Long): String =
-    java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
-        .format(java.util.Date(at))
+private fun clockLabel(at: Long): String = recordClockFormat.format(java.util.Date(at))
 
 // ---------------------------------------------------------------- 关于页（含诊断）
 

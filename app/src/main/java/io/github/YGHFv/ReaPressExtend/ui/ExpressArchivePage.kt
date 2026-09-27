@@ -18,13 +18,11 @@
 package io.github.YGHFv.ReaPressExtend.ui
 
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -40,6 +38,7 @@ import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Back
+import top.yukonga.miuix.kmp.utils.overScrollVertical
 
 /**
  * 「归档快递」二级页：[ExpressHomeGrouper.archive] 挑出的物流签收后按归档设置过期的包裹，
@@ -47,11 +46,13 @@ import top.yukonga.miuix.kmp.icon.extended.Back
  * 不删除任何记录 —— 归档只是换一页显示，仍可搜索、可在详情页看全轨迹。
  *
  * @param records 全量记录而非归档子集：驿站名聚类必须拿完整集合做，只喂归档件会让同一驿站在两页印出两个名字。
+ * @param listState 由调用方持有：本页进详情时会被整页移出组合，滚动状态放在这里才能在返回后原地恢复。
  */
 @Composable
 internal fun ExpressArchivePage(
     records: List<ExpressRecord>,
     rules: ExpressStationRules,
+    listState: LazyListState,
     onBack: () -> Unit,
     onOpenDetail: ((ExpressRecord) -> Unit)? = null,
     archiveRetentionMs: Long = ExpressHomeGrouper.ARCHIVE_RETENTION_MS,
@@ -81,28 +82,37 @@ internal fun ExpressArchivePage(
             )
         },
     ) { padding ->
-        Column(
+        // 归档件可能积累到上百张卡，必须 Lazy 化；整页 Column + verticalScroll 会在打开时一次性组合全部卡片。
+        // overScrollVertical 在 nestedScroll 之前挂：与主界面 pager 页同序，miuix 的越界节点检测读外层状态。
+        LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
-                .nestedScroll(scrollBehavior.nestedScrollConnection)
-                .verticalScroll(rememberScrollState())
-                .padding(top = padding.calculateTopPadding())
-                .padding(vertical = 4.dp),
+                .overScrollVertical()
+                .nestedScroll(scrollBehavior.nestedScrollConnection),
+            state = listState,
+            contentPadding = PaddingValues(
+                top = padding.calculateTopPadding() + 4.dp,
+                bottom = padding.calculateBottomPadding() + 4.dp,
+            ),
         ) {
             if (archived.isEmpty()) {
-                GroupTitle("归档快递")
-                SettingsCard {
-                    HintText(
-                        if (archiveRetentionMs == 0L) {
-                            "暂无归档。物流签收后的包裹会自动移到这里，首页就不再显示它们。"
-                        } else {
-                            "暂无归档。物流签收超过 7 天的包裹会自动移到这里，首页就不再显示它们。"
-                        },
-                    )
+                item(key = "empty") {
+                    GroupTitle("归档快递")
+                    SettingsCard {
+                        HintText(
+                            if (archiveRetentionMs == 0L) {
+                                "暂无归档。物流签收后的包裹会自动移到这里，首页就不再显示它们。"
+                            } else {
+                                "暂无归档。物流签收超过 7 天的包裹会自动移到这里，首页就不再显示它们。"
+                            },
+                        )
+                    }
                 }
             } else {
-                GroupTitle("归档快递 · ${archived.size}件")
-                for (record in archived) {
+                item(key = "header") {
+                    GroupTitle("归档快递 · ${archived.size}件")
+                }
+                items(archived, key = { it.dedupeKey }) { record ->
                     ParcelCard(
                         record = record,
                         stationLabel = ExpressHomeGrouper.stationLabelOf(record, stationLabels),
@@ -114,8 +124,6 @@ internal fun ExpressArchivePage(
                     )
                 }
             }
-            Spacer(Modifier.height(padding.calculateBottomPadding()))
-            Spacer(Modifier.height(4.dp))
         }
     }
 }
