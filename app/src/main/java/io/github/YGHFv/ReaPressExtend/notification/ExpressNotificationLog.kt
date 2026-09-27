@@ -123,6 +123,20 @@ object ExpressNotificationLog {
          * [NotificationIntentLauncher]。空串 = 没有（旧记录 / 那条通知没有 contentIntent）。
          */
         val intentUri: String = "",
+        /**
+         * 这块跳转令牌在 **system_server 侧**的寄存句柄
+         * （[io.github.YGHFv.ReaPressExtend.relay.ExpressRelay.EXTRA_INTENT_TOKEN]）。
+         *
+         * 与 [id] 是两把不同的钥匙，别混：
+         * - [id] 开的是**模块进程内存**里那张表（[NotificationIntentCache]），快但没有持久性；
+         * - 这个开的是 **system_server** 里那张表（hook 侧 `IntentTokenStore`）——
+         *   模块进程重启后，详情页靠它把令牌**取回来**（`IntentTokenFetcher`）。
+         *
+         * 是个普通字符串（模块自己生成的 UUID），所以**可以落盘** —— 而令牌本体不行。
+         * 拿到它不等于令牌还在（system_server 可能已 LRU 淘汰、或设备重启过），
+         * 取回时要按「可能空手」处理。空串 = 没有（旧记录 / 那条通知没有 contentIntent）。
+         */
+        val tokenId: String = "",
     )
 
     /**
@@ -141,6 +155,7 @@ object ExpressNotificationLog {
         detail: String = "",
         contentIntent: PendingIntent? = null,
         intentUri: String? = null,
+        intentToken: String? = null,
     ) {
         runCatching {
             val entry = Entry(
@@ -156,6 +171,7 @@ object ExpressNotificationLog {
                 id = UUID.randomUUID().toString(),
                 kind = Kind.DELIVERED,
                 intentUri = intentUri.orEmpty(),
+                tokenId = intentToken.orEmpty(),
             )
             append(context, entry, contentIntent)
         }
@@ -181,6 +197,7 @@ object ExpressNotificationLog {
         category: String,
         contentIntent: PendingIntent? = null,
         intentUri: String? = null,
+        intentToken: String? = null,
     ) {
         runCatching {
             val entry = Entry(
@@ -198,6 +215,7 @@ object ExpressNotificationLog {
                 kind = Kind.INTERCEPTED,
                 category = category,
                 intentUri = intentUri.orEmpty(),
+                tokenId = intentToken.orEmpty(),
             )
             append(context, entry, contentIntent)
         }
@@ -263,6 +281,9 @@ object ExpressNotificationLog {
                     put("kind", entry.kind.name)
                     put("cat", entry.category)
                     put("iuri", entry.intentUri)
+                    // 「tk」= system_server 侧的令牌句柄。短键是既有约定（见本文件的历史），
+                    // 而且它进的是 prefs 里那个 JSON 串 —— 100 条记录每条多 36 字节不值得。
+                    put("tk", entry.tokenId)
                 },
             )
         }
@@ -296,6 +317,9 @@ object ExpressNotificationLog {
                     },
                     category = obj.optString("cat"),
                     intentUri = obj.optString("iuri"),
+                    // 2026-09-27 加的键：旧记录读出来是空串，表现是「这条的令牌取不回来」
+                    // （本来就取不回来，它们落盘时这个键还不存在）。
+                    tokenId = obj.optString("tk"),
                 )
             }
         }.getOrDefault(emptyList())

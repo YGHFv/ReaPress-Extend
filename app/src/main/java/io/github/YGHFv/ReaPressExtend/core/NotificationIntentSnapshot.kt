@@ -65,6 +65,20 @@ object NotificationIntentSnapshot {
     }
 
     /**
+     * 这条记录**属于哪个应用** —— 「打开原通知」要打开的就是它，界面上那个「（菜鸟）」也是它。
+     *
+     * 取**来源包名优先**、快照串兜底。理由：用户在这一页看到的是「来源：菜鸟」，点「打开」
+     * 时期望回到的就是菜鸟；而快照串里的 component 指向的是宿主**内部**的落地页
+     * （推送 SDK 那种，见 [io.github.YGHFv.ReaPressExtend.notification.NotificationIntentLauncher]），
+     * 两者偶有分属不同包的情况。按钮措辞与实际打开的目标必须同源 —— 各算一遍迟早会分叉，
+     * 变成「按钮写着菜鸟、打开的是别的」。
+     *
+     * @return 认不出返回 null（既没有来源包名，快照串里也抠不出 component / package）。
+     */
+    fun targetPackageOf(sourcePackage: String?, uri: String?): String? =
+        sourcePackage?.takeIf { it.isNotBlank() } ?: packageOf(uri)
+
+    /**
      * 取 `key=` 之后到下一个 `;` 之间的内容。
      *
      * **不走 `removeSuffix("end")`**：`Intent.toUri` 的输出一定以 `;end` 结尾，

@@ -33,6 +33,7 @@ import io.github.YGHFv.ReaPressExtend.logging.ModuleLogBuffer
 import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationLog
 import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationPoster
 import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
+import io.github.YGHFv.ReaPressExtend.notification.IntentTokenFetcher
 
 /**
  * 接收被注入进程投来的事件，在本进程发替换通知、把包裹数据落库。
@@ -105,6 +106,9 @@ class ExpressRelayReceiver : BroadcastReceiver() {
                     ?.takeIf { it.isNotBlank() }
                     ?.let { ModuleAndroidLog.legacy(LOG_TAG, "host wake: $it") }
                     ?: ModuleAndroidLog.error(LOG_TAG, "wake report with empty payload, dropped")
+            // system_server 把模块索要的跳转令牌还回来了（[ACTION_INTENT_RESOLVE_REQUEST] 的应答）。
+            // 收到就填进进程内的令牌表，然后叫界面重算一次措辞 —— 见 IntentTokenFetcher。
+            ExpressRelay.ACTION_INTENT_TOKEN_ARRIVED -> IntentTokenFetcher.submitFromSystemServer(app, intent)
             WatchdogReporter.ACTION_WATCHDOG_STATUS -> {
                 WatchdogReporter.persistLocally(app, intent)
                 val installed = intent.getBooleanExtra(WatchdogReporter.EXTRA_INSTALLED, false)
@@ -132,6 +136,7 @@ class ExpressRelayReceiver : BroadcastReceiver() {
             record,
             contentIntent = readContentIntent(intent),
             intentUri = readIntentUri(intent),
+            intentToken = readIntentToken(intent),
         )
         // 界面正开着时要能看见这一条（用户收到通知后没退出模块是常态）。
         // 这条**不节流**：通知是一对一的、分钟级的事件，不会十几条一起来 ——
@@ -168,6 +173,7 @@ class ExpressRelayReceiver : BroadcastReceiver() {
             category = category,
             contentIntent = readContentIntent(intent),
             intentUri = readIntentUri(intent),
+            intentToken = readIntentToken(intent),
         )
         ModuleAndroidLog.legacy(
             LOG_TAG,
@@ -329,6 +335,19 @@ class ExpressRelayReceiver : BroadcastReceiver() {
      */
     private fun readIntentUri(intent: Intent): String? = runCatching {
         intent.getStringExtra(ExpressRelay.EXTRA_NOTIFICATION_INTENT_URI)?.takeIf { it.isNotBlank() }
+    }.getOrNull()
+
+    /**
+     * 令牌在 **system_server** 侧的寄存句柄（[ExpressRelay.EXTRA_INTENT_TOKEN]）。
+     *
+     * 与 [readIntentUri] 同构的一份「字符串 extra」：它是模块自己生成的 UUID，读失败的概率
+     * 极低 —— 仍然 `runCatching` 包一层，理由与那两个一样（读不出来只该让「跨进程重启后
+     * 还能跳转」这一个能力消失，不该丢掉整条记录）。
+     *
+     * 不做日志：富化那条路没有它，正常情形下就是 null，写日志只会刷屏。
+     */
+    private fun readIntentToken(intent: Intent): String? = runCatching {
+        intent.getStringExtra(ExpressRelay.EXTRA_INTENT_TOKEN)?.takeIf { it.isNotBlank() }
     }.getOrNull()
 
     private fun parseRecord(intent: Intent): ExpressRecord? {

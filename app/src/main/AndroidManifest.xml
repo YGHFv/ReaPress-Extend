@@ -50,10 +50,20 @@
         android:protectionLevel="signature" />
     <uses-permission android:name="io.github.YGHFv.ReaPressExtend.permission.TRACE_REQUEST" />
 
+    <!--
+      包可见性（Android 11+）。点名的三个是模块主要的来源 App；最后那条**通用 LAUNCHER 查询**
+      是给「打开原通知」用的：记录里的来源还可能是别的应用（例如系统短信），而
+      `getLaunchIntentForPackage` 在没声明可见性时一律返回 null —— 少了它，那些记录
+      就只能退回「按快照重建」，正是会卡在宿主启动页的那条路。
+    -->
     <queries>
         <package android:name="com.cainiao.wireless" />
         <package android:name="com.xunmeng.pinduoduo" />
         <package android:name="com.taobao.taobao" />
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
     </queries>
 
     <application

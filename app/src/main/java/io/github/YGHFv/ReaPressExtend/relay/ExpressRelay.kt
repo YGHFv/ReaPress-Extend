@@ -229,6 +229,70 @@ object ExpressRelay {
     const val ACTION_WAKE_REPORT = "io.github.YGHFv.ReaPressExtend.WAKE_REPORT"
 
     /**
+     * 反向请求：模块进程 → **system_server**，「这条记录的跳转令牌还在你手里吗？在就还给我」
+     * （[ACTION_WAKE_REQUEST] 之外第二条走 system_server 的链路）。
+     *
+     * ## 为什么需要它（2026-09-27 用户要求补的增强）
+     *
+     * [EXTRA_NOTIFICATION_INTENT] 那条路把令牌塞进广播交给模块进程，模块侧存内存 ——
+     * **模块进程一重启就没了**，用户清个后台、系统回收一次，记录页里全变成
+     * 「打开 XX」（只能开 App 首页）而不是「打开原通知（XX）」（回到那条通知的页面）。
+     * 而「进程重启」在这个模块上是**常态**：它常年没有界面，随手就被系统收走。
+     *
+     * 令牌没法落盘（binder 句柄，见 [EXTRA_NOTIFICATION_INTENT] 的说明），但它**可以留在
+     * 系统里**：system_server 与被注入的应用同寿 —— 它替我们一直揣着，模块进程随时来取。
+     * 于是令牌的寿命从「模块进程」变成「**设备本次开机**」（上限在 AMS：设备一重启，
+     * 连同 `PendingIntentRecord` 一起重建，谁都留不住）。
+     *
+     * ## 双向都用广播的理由
+     *
+     * 与 [ACTION_WAKE_REQUEST] 同一套：模块进程与 system_server 之间没有可用的 binder 通道，
+     * 而 system_server 不是包、没法用 `setPackage` 寻址 —— 只能发隐式广播，安全性靠接收侧的
+     * 权限闸（[PERMISSION_TRACE_REQUEST]，signature 级，只有本模块签得出）。载荷只有
+     * [EXTRA_INTENT_TOKEN] 与 [EXTRA_INTENT_ENTRY_ID]（两个都是模块自己生成的 UUID，
+     * 不含任何用户数据）。
+     *
+     * ⚠️ 这条**不是**「请 system_server 替我启动」—— 令牌取回模块进程后由模块自己 `send()`，
+     * 与内存命中时走的是同一条代码路径（见 `NotificationIntentLauncher`）。让 system_server
+     * 替我们启动是另一件事（多做一层远程调用，却换不来任何保真度）。
+     *
+     * 载荷：[EXTRA_INTENT_TOKEN]（要取哪个令牌）、[EXTRA_INTENT_ENTRY_ID]（原样回传，
+     * 接收侧靠它把令牌归到哪一条记录上）。
+     */
+    const val ACTION_INTENT_RESOLVE_REQUEST = "io.github.YGHFv.ReaPressExtend.INTENT_RESOLVE_REQUEST"
+
+    /**
+     * system_server → 模块进程：[ACTION_INTENT_RESOLVE_REQUEST] 的应答。
+     *
+     * **空手也要回**（没带 [EXTRA_NOTIFICATION_INTENT]）：那条记录被 LRU 淘汰了、或者
+     * 设备重启过 —— 两种情形的处置都是「继续用快照那条路」，但**原因**要能看见，
+     * 否则下一步又是「静默失败」。这与 [EXTRA_COOKIE_ERROR] / [EXTRA_IDENTITY_ERROR]
+     * 「见到回执即视为答复」的约定是同一条。
+     *
+     * 显式组件寻址（`setClassName` 到模块的 receiver）：载荷里是令牌本体，只有本模块能收。
+     */
+    const val ACTION_INTENT_TOKEN_ARRIVED = "io.github.YGHFv.ReaPressExtend.INTENT_TOKEN_ARRIVED"
+
+    /**
+     * 模块进程内部：令牌到货，界面该重算「这次能做到什么」了。
+     *
+     * ## 为什么不复用 [ACTION_INTENT_TOKEN_ARRIVED]
+     *
+     * 那条是 system_server 发来的**显式**广播 —— 它只投给 `ExpressRelayReceiver` 这一个组件，
+     * 详情页里动态注册的接收器收不到；而且它带 `PendingIntent` 这种重载荷，本来也不该再广播一次。
+     *
+     * ## 它解决什么
+     *
+     * 详情页的动作行按「令牌在不在手」换措辞（`faithful`）与说明文字。而令牌是**异步**取回来的
+     * （要经一次 system_server 往返），页面早已渲染完了。没有这条信号，用户看到的会一直停在
+     * 取回之前的那份措辞上 —— 明明令牌已经到手，界面却还是「打开菜鸟」。
+     *
+     * 按项目那条老规矩：**同一条 action 的接收期望不同就不共用**（见 [ACTION_TRACE_ARRIVED]
+     * 与 [ACTION_RECORDS_CHANGED] 的分工）。这条只做一件事：让界面重读一次内存里的令牌表。
+     */
+    const val ACTION_INTENT_TOKEN_READY = "io.github.YGHFv.ReaPressExtend.INTENT_TOKEN_READY"
+
+    /**
      * 宿主进程 → 模块进程：**自查结果的一句播报**（查到了几行 / 三次都没查成）。
      *
      * ## 为什么必须有这条（2026-09-26）
@@ -397,6 +461,36 @@ object ExpressRelay {
      * 是 `String` 而不是 Parcelable：字符串能**落盘**，Parcelable 出了这次广播就没了。
      */
     const val EXTRA_NOTIFICATION_INTENT_URI = "notificationIntentUri"
+
+    /**
+     * 这块令牌在 **system_server 侧的缓存键**（[ACTION_INTENT_RESOLVE_REQUEST] 的载荷）。
+     *
+     * ## 与 [EXTRA_NOTIFICATION_INTENT] 的分工
+     *
+     * | | [EXTRA_NOTIFICATION_INTENT] | 这个 |
+     * |---|---|---|
+     * | 内容 | 令牌本体（Parcelable） | 一个 UUID 字符串 |
+     * | 存在哪 | 模块进程内存 | system_server 进程内存 |
+     * | 寿命 | 模块进程 | **设备本次开机** |
+     * | 能落盘吗 | 不能 | **能**（就是这串 UUID） |
+     *
+     * 所以两条路并存：进程内那份**最快**（同一次广播就送到了，零往返），这份**最持久**
+     * （模块进程重启后仍能把它取回来）。记录里存的是这个 —— 它是个普通字符串。
+     *
+     * ⚠️ 它只是一个**句柄**：拿到它不代表令牌还在（system_server 可能已被 LRU 淘汰、
+     * 或设备重启过），所以取回时要按「可能空手」处理（见 [ACTION_INTENT_TOKEN_ARRIVED]）。
+     * 这也正是它**可以**随便落盘的原因 —— 光有它拿不到任何东西。
+     */
+    const val EXTRA_INTENT_TOKEN = "intentToken"
+
+    /**
+     * 模块侧那条审计记录的 `Entry.id`，[ACTION_INTENT_RESOLVE_REQUEST] 带出去、
+     * [ACTION_INTENT_TOKEN_ARRIVED] **原样带回**。
+     *
+     * 令牌按记录归口（`NotificationIntentCache.get(entry.id)`），所以取回时必须知道
+     * 这一份是还给哪条记录的。system_server 侧只做搬运，不解释这个值。
+     */
+    const val EXTRA_INTENT_ENTRY_ID = "intentEntryId"
 
     /**
      * [ACTION_INTERCEPTED] 的载荷：这条通知被归到哪一类（`NotificationCategory` 的枚举名）。

@@ -70,6 +70,37 @@ class NotificationIntentSnapshotTest {
     }
 
     @Test
+    fun `来源包名优先_快照串兜底`() {
+        // 有来源包名 → 以它为准。界面上的「（菜鸟）」与实际打开的目标必须同一个，
+        // 所以快照串里那个内部组件的包名不参与决策。
+        assertEquals(
+            "com.cainiao.wireless",
+            NotificationIntentSnapshot.targetPackageOf(
+                "com.cainiao.wireless",
+                "intent://#Intent;component=com.other.thing/.A;end",
+            ),
+        )
+        // 老记录没有来源包名 / 是空白 → 退回快照串。
+        assertEquals(
+            "com.taobao.taobao",
+            NotificationIntentSnapshot.targetPackageOf(
+                null,
+                "intent://#Intent;package=com.taobao.taobao;end",
+            ),
+        )
+        assertEquals(
+            "com.taobao.taobao",
+            NotificationIntentSnapshot.targetPackageOf(
+                "   ",
+                "intent://#Intent;package=com.taobao.taobao;end",
+            ),
+        )
+        // 两边都给不出 → null（调用方据此走「按快照重建」那条兜底）。
+        assertNull(NotificationIntentSnapshot.targetPackageOf(null, null))
+        assertNull(NotificationIntentSnapshot.targetPackageOf("", ""))
+    }
+
+    @Test
     fun `认不出时返回 null`() {
         assertNull(NotificationIntentSnapshot.packageOf(null))
         assertNull(NotificationIntentSnapshot.packageOf(""))

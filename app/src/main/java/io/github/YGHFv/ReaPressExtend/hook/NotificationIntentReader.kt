@@ -19,6 +19,7 @@ package io.github.YGHFv.ReaPressExtend.hook
 
 import android.app.PendingIntent
 import android.content.Intent
+import android.os.Binder
 import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
 
 /**
@@ -43,7 +44,38 @@ import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
  *
  * 被注入的 system_server（[SystemServerHook] 拦通知时）—— 那里读 hidden API 不受限制，
  * 而 `PendingIntent.getIntent()` 是 `@UnsupportedAppUsage` 的公开方法，反射能拿到。
- * 拿不到时退一步读 `mIntent` 字段（不同 ROM 上两者各自可能缺席）。
+ *
+ * ## 🔴 清掉 binder 调用身份这一步不能省（2026-09-27 真机定位）
+ *
+ * **症状**：记录页里每一条都写着「没有可用的跳转信息」，没有任何一条能跳 ——
+ * 不是偶尔失败，是**一条都没成过**。
+ *
+ * **根因**：AOSP 里 `PendingIntent#getIntent()` 的实现是
+ * `ActivityManager.getService().getIntentForIntentSender(mTarget)`，而 AMS 那个方法做的第一件事是
+ * `enforceCallingPermission(GET_INTENT_SENDER_INTENT)` —— 一个 **signature 级**权限。
+ * `enforceCallingPermission` 检查的是 `Binder.getCallingUid()`，即**当前这个 binder 事务的发起方**。
+ * 我们的调用点跑在 `NotificationManagerService#enqueueNotificationInternal` 的投递主路径上
+ * （见 [SystemServerHook.deliver] / [SystemServerHook.reportIntercepted]），
+ * 此刻那个 uid 是**发通知的那个应用**（菜鸟 / 淘宝 / 拼多多 / 短信），它当然没有签名权限 → 必被拒：
+ *
+ * ```
+ * SecurityException: Permission Denial: getIntentForIntentSender() from pid=…, uid=…
+ *     requires android.permission.GET_INTENT_SENDER_INTENT
+ *   at ActivityManagerService.enforceCallingPermission
+ *   at ActivityManagerService.getIntentForIntentSender
+ *   at android.app.PendingIntent.getIntent
+ * ```
+ *
+ * 更坏的是这个异常被底下的 `runCatching` 吞掉了，现场只剩一句「取不到内部 Intent」——
+ * 看上去像 ROM 结构变了，于是往错的方向找。
+ *
+ * **修法**（framework 内部处理这件事的标准做法，见 AOSP 各 binder 回调）：
+ * `Binder.clearCallingIdentity()` 把身份换成 system_server 自己（uid 1000），
+ * `ActivityManager#checkComponentPermission` 对 `SYSTEM_UID` 直接放行，取完立刻 `restore`。
+ * 设备 `framework.jar` 里 `GET_INTENT_SENDER_INTENT` 与 `getIntentForIntentSender` 两个串都在
+ * （`grep -a` 各命中 2 处），说明这条权限闸确实在这台机器上生效。
+ *
+ * ⚠️ **改动这个文件之后必须重启设备**：hook 只在注入时装载，换 APK 不会重新注入 system_server。
  */
 internal object NotificationIntentReader {
 
@@ -56,6 +88,15 @@ internal object NotificationIntentReader {
     private const val MAX_URI_LENGTH = 5000
 
     /**
+     * 正常路径失败只播报一次。
+     *
+     * 这个函数跑在每条被识别的通知上，成了热路径 —— 每次都打会把 LSPosed 日志刷没
+     * （项目约定：热路径日志按原因去重）。失败原因在同一次进程里是稳定的
+     * （权限被拒 / 方法不存在都是结构性的），一次足够定位。
+     */
+    @Volatile private var getIntentFailureLogged = false
+
+    /**
      * @return 可落盘的快照串；拿不到（没有令牌 / 反射失败 / 太长）时返回 null。
      *
      * 全过程 `runCatching`：调用点在 system_server 的通知投递主路径上，
@@ -64,7 +105,7 @@ internal object NotificationIntentReader {
     fun snapshot(pendingIntent: PendingIntent?): String? = runCatching {
         val pi = pendingIntent ?: return null
         val intent = intentOf(pi) ?: run {
-            XposedBridge.log("notification intent snapshot: 取不到内部 Intent（ROM 结构变了？）")
+            XposedBridge.log("notification intent snapshot: 取不到内部 Intent（调用身份没清干净？ROM 结构变了？）")
             return null
         }
         val uri = intent.toUri(Intent.URI_INTENT_SCHEME)
@@ -79,16 +120,50 @@ internal object NotificationIntentReader {
         null
     }
 
-    /** 两条取法：公开的 `getIntent()`，退而求其次读 `mIntent` 字段。 */
+    /**
+     * 取令牌内部的 `Intent`。**整段在清掉调用身份的状态下执行**（原因见类注释）。
+     */
     private fun intentOf(pendingIntent: PendingIntent): Intent? {
-        runCatching {
-            PendingIntent::class.java.getMethod("getIntent").invoke(pendingIntent) as? Intent
-        }.getOrNull()?.let { return it }
-        return runCatching {
-            PendingIntent::class.java
-                .getDeclaredField("mIntent")
-                .apply { isAccessible = true }
-                .get(pendingIntent) as? Intent
-        }.getOrNull()
+        val identity = Binder.clearCallingIdentity()
+        return try {
+            fromGetIntent(pendingIntent) ?: fromLegacyIntentField(pendingIntent)
+        } finally {
+            Binder.restoreCallingIdentity(identity)
+        }
     }
+
+    /**
+     * AOSP 的正常路径：`PendingIntent#getIntent()`（`@UnsupportedAppUsage`，`@hide`）。
+     *
+     * 它的实现是 `ActivityManager.getService().getIntentForIntentSender(mTarget)`，
+     * 所以**必须**在清掉调用身份的状态下调用（见 [intentOf]）——否则抛
+     * `SecurityException`，而异常会被这里吞成 null，现场看不出是被权限拒的。
+     */
+    private fun fromGetIntent(pendingIntent: PendingIntent): Intent? {
+        val result = runCatching {
+            PendingIntent::class.java.getMethod("getIntent").invoke(pendingIntent) as? Intent
+        }
+        result.exceptionOrNull()?.let { error ->
+            if (!getIntentFailureLogged) {
+                getIntentFailureLogged = true
+                XposedBridge.logError("PendingIntent#getIntent() failed, falling back", error)
+            }
+        }
+        return result.getOrNull()
+    }
+
+    /**
+     * 兜底路径：直接读 `mIntent` 字段。
+     *
+     * ⚠️ **AOSP 的 `PendingIntent` 没有这个字段**（核对 master 源码：它只有
+     * `private final IIntentSender mTarget`；`mIntent` 只出现在内部类 `FinishedDispatcher` 上）。
+     * 留着它是因为个别 OEM 改过的 framework 可能保留过这个字段，而代价只是一次失败的反射；
+     * 但**别指望它在 AOSP 上救场** —— 真正的主力是 [fromGetIntent]。
+     */
+    private fun fromLegacyIntentField(pendingIntent: PendingIntent): Intent? = runCatching {
+        PendingIntent::class.java
+            .getDeclaredField("mIntent")
+            .apply { isAccessible = true }
+            .get(pendingIntent) as? Intent
+    }.getOrNull()
 }

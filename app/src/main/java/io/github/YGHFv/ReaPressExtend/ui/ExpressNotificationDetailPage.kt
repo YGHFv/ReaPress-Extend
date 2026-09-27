@@ -17,6 +17,11 @@
 
 package io.github.YGHFv.ReaPressExtend.ui
 
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -27,6 +32,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -40,7 +47,9 @@ import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsSnapshot
 import io.github.YGHFv.ReaPressExtend.core.NotificationCategory
 import io.github.YGHFv.ReaPressExtend.core.NotificationIntentSnapshot
 import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationLog
+import io.github.YGHFv.ReaPressExtend.notification.IntentTokenFetcher
 import io.github.YGHFv.ReaPressExtend.notification.NotificationIntentLauncher
+import io.github.YGHFv.ReaPressExtend.relay.ExpressRelay
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
@@ -75,9 +84,11 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  * 宿主那个具体页面（某个包裹的取件码页、订单详情）就得自己去 App 里翻。
  * 这里揣着原通知的点击跳转，一点就等价于点原通知。
  *
- * **两条路**（见 [NotificationIntentLauncher]）：内存里的 `PendingIntent` 令牌（最忠实）→
- * 记录里存的快照串（基础参数级）。所以模块进程重启后按钮**不再消失** ——
- * 之前只有令牌那一条路，重启就没了，界面上只能如实说「重启后失效」。
+ * **三条来路、两条执行路**（见 [NotificationIntentLauncher]）：内存令牌 / 从 system_server
+ * 取回的令牌（两者都落进同一张表，`send()` 出去）→ 记录里那份快照串（有损，但永久有效）。
+ * 所以模块进程被回收之后按钮**不再退化**：令牌寄存在跟设备同寿的 system_server 里
+ * （[IntentTokenFetcher] 在页面打开时取回），上限是**设备本次开机**；真到了重启之后，
+ * 也还有快照那条路能打开宿主 App。
  */
 @Composable
 internal fun NotificationDetailPage(
@@ -86,10 +97,31 @@ internal fun NotificationDetailPage(
 ) {
     val context = LocalContext.current
     val scrollBehavior = MiuixScrollBehavior()
-    // 取一次就够：这条记录在页面存续期间不会变，而读取本身是个 LRU 表查询 + 一次字符串判空。
-    val canOpen = remember(entry) { NotificationIntentLauncher.canOpen(entry) }
+    // 令牌是**异步**取回来的（要过 system_server 一趟），所以这两个判断不能只在进场时算一次：
+    // 到货信号一来就 +1，下面两个 remember 跟着重算，措辞与说明文字一起切到「能回原页面」。
+    var tokenVersion by remember(entry) { mutableStateOf(0) }
+    val canOpen = remember(entry, tokenVersion) { NotificationIntentLauncher.canOpen(entry) }
+    // 令牌还在内存里 = 这次点击能真正回到那条通知的页面；只剩快照 = 只能打开宿主 App。
+    val faithful = remember(entry, tokenVersion) { NotificationIntentLauncher.isFaithful(entry) }
     val targetApp = remember(entry) { targetLabel(entry) }
     var openError by remember(entry) { mutableStateOf<String?>(null) }
+
+    // 进这一页就悄悄把令牌从 system_server 取回来（还没拿到的话）。
+    // 放在这里而不是点击时：点击那条路要**同步**返回结果（见 NotificationIntentLauncher），
+    // 而跨进程往返做不到同步。预热之后点击走的还是「内存里那块令牌」这条普通路径。
+    LaunchedEffect(entry) { IntentTokenFetcher.request(context, entry) }
+
+    // 令牌到货 → 重算。用进程内广播而不是状态容器：令牌表（NotificationIntentCache）是个
+    // 普通 object，它自己不知道谁在看；而 Compose 这一层本来就在监听各种 relay 信号。
+    DisposableEffect(entry) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(receiverContext: Context?, intent: Intent?) {
+                tokenVersion++
+            }
+        }
+        registerTokenReadyReceiver(context, receiver)
+        onDispose { runCatching { context.unregisterReceiver(receiver) } }
+    }
 
     val intercepted = entry.kind == ExpressNotificationLog.Kind.INTERCEPTED
 
@@ -144,16 +176,28 @@ internal fun NotificationDetailPage(
                 if (canOpen) {
                     CardDivider()
                     // 动作行只能走 CardActionRow（自写 Row 漏 clickable 是编译期看不出来的坑）。
-                    // 认得出目标包名就带上它 —— 「打开原通知」不说到哪儿去，而这个按钮的
-                    // 全部意义就是「回到那条通知本该去的页面」。见 targetLabel。
-                    val label = if (intercepted) "打开被拦截的通知" else "打开原通知"
-                    CardActionRow(label + (targetApp?.let { "（$it）" } ?: "")) {
+                    // 措辞跟着「这次真能做到什么」走，见 actionLabel。
+                    CardActionRow(actionLabel(intercepted, faithful, targetApp)) {
                         openError = NotificationIntentLauncher.open(context, entry)
                     }
                 }
             }
+            if (canOpen && !faithful) {
+                // 说清「为什么这次只能开首页」：令牌是内存里的东西，而它的寿命上限是**设备本次开机**
+                // —— 系统替我们寄存着（system_server 侧），可设备一重启就一起归零。
+                // 只剩快照时宿主内部页面复刻不了（推送落地页会被外部启动卡死）。
+                HintText(
+                    "原通知的跳转令牌只在设备本次开机内有效（系统替我们寄存着，重启后一起失效）。" +
+                        "所以这里只能打开${targetApp ?: "对应应用"}；令牌还在时能直接回到那条通知的页面。",
+                )
+            }
             if (!canOpen) {
-                HintText("这条通知没有可用的跳转信息（原文里没有点击动作，或发送端是旧版本）。")
+                // 说清两种成因，并明确「新收到的通知不受影响」——
+                // 旧记录是**补不回来**的（跳转只有落盘那一刻能拿到），不说清会让用户以为功能还是坏的。
+                HintText(
+                    "这条记录没有留下跳转信息：落盘时模块还读不到原通知的跳转（旧版本），" +
+                        "或者这条通知本身就没有点击动作。新收到的通知不受影响。",
+                )
             }
             openError?.let { HintText("打不开原通知：$it", color = MiuixTheme.colorScheme.error) }
 
@@ -195,18 +239,37 @@ internal fun NotificationDetailPage(
 }
 
 /**
- * 这条通知原本要跳到哪个应用，用来给动作行补一句「（菜鸟）」。
+ * 这条通知属于哪个应用，用来给动作行补一句「（菜鸟）」，或者直接写成「打开菜鸟」。
  *
- * 判据是记录里那份**快照串**（`Intent.toUri` 的输出），包名从里面纯字符串抠出来
- * （[NotificationIntentSnapshot.packageOf]，core 层有单测钉着）。
+ * 判据走 [NotificationIntentSnapshot.targetPackageOf]（来源包名优先、快照串兜底，
+ * core 层有单测钉着）—— 与 [NotificationIntentLauncher] 实际打开的目标**同源**，
+ * 不能各算一遍，否则会出现「按钮写着菜鸟、打开的是别的」。
+ *
  * 两条「不写」的规则都是刻意的：
- * - 只揣着内存令牌、没有快照串的记录（老记录）→ 拿不到包名，不写；
- * - 认不出的包名（不在已知来源表里）→ 也不写，把 `com.foo.bar` 这种串贴进按钮没有信息量。
+ * - 包名认不出（不在已知来源表里）→ 不写，把 `com.foo.bar` 这种串贴进按钮没有信息量；
+ * - 老记录既没有快照串、来源也在表外 → 同样不写。
  */
 private fun targetLabel(entry: ExpressNotificationLog.Entry): String? {
-    val pkg = NotificationIntentSnapshot.packageOf(entry.intentUri) ?: return null
+    val pkg = NotificationIntentSnapshot.targetPackageOf(entry.sourcePackage, entry.intentUri)
+        ?: return null
     val display = ExpressSettingsSnapshot.displayName(pkg)
     return display.takeIf { it != pkg }
+}
+
+/**
+ * 动作行的措辞。分开说清楚 —— 别让「打开原通知」这四个字许诺一个做不到的页面：
+ * - 揣着令牌（[faithful]）：真的能回到那条通知的页面 → 「打开原通知（菜鸟）」；
+ * - 只剩快照：只能开 App（宿主内部页面复刻不了，见 [NotificationIntentLauncher] 的类注释）
+ *   → 「打开菜鸟」；
+ * - 连包名都认不出（罕见）：退回中性措辞，不编一个应用名。
+ */
+private fun actionLabel(intercepted: Boolean, faithful: Boolean, targetApp: String?): String {
+    val base = if (intercepted) "打开被拦截的通知" else "打开原通知"
+    return when {
+        faithful -> targetApp?.let { "$base（$it）" } ?: base
+        targetApp != null -> "打开$targetApp"
+        else -> base
+    }
 }
 
 /**
@@ -217,6 +280,26 @@ private fun targetLabel(entry: ExpressNotificationLog.Entry): String? {
 private fun categoryName(name: String): String =
     name.takeIf { it.isNotBlank() }?.let { NotificationCategory.byName(it)?.displayName ?: it }
         ?: "未知"
+
+/**
+ * 注册「令牌到货」的接收器（[ExpressRelay.ACTION_INTENT_TOKEN_READY]）。
+ *
+ * 那条广播是本模块**自己发给自己**的（`setPackage` 到本包），收不到任何外部来源，
+ * 所以用 `RECEIVER_NOT_EXPORTED` —— 不需要 Android 13+ 那套导出性讨论，本来就该是私有的。
+ *
+ * 版本分支必须显式写：API 33 起 `registerReceiver` 不传 flag 直接抛 `SecurityException`；
+ * 而低版本没有那个重载的重载参数（`RECEIVER_NOT_EXPORTED` 是 API 33 的常量）。
+ * 项目里另一处（`HostReceiverRegistrar`，那个要跨进程收，用 `EXPORTED`）也是同一个写法。
+ */
+private fun registerTokenReadyReceiver(context: Context, receiver: BroadcastReceiver) {
+    val filter = IntentFilter(ExpressRelay.ACTION_INTENT_TOKEN_READY)
+    if (Build.VERSION.SDK_INT >= 33) {
+        context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+    } else {
+        @Suppress("UnspecifiedRegisterReceiverFlag")
+        context.registerReceiver(receiver, filter)
+    }
+}
 
 /**
  * 一段可以换行的整段文字。

@@ -20,15 +20,23 @@ package io.github.YGHFv.ReaPressExtend.notification
 import android.app.PendingIntent
 
 /**
- * 被拦下来的那条原通知的**点击跳转令牌**，按审计记录的 id 归口（内存）。
+ * 被拦下来的那条原通知的**点击跳转令牌**，按审计记录的 id 归口（模块进程内存）。
  *
  * ## 为什么只在内存里
  *
  * `PendingIntent` 是一个 binder 令牌（服务端拿它查 AMS 里的 `PendingIntentRecord`），
  * 它**没有**可序列化的表示 —— 写进 prefs 只会留下一串解不回来的字节。
- * 所以这份令牌的寿命 = 模块进程的寿命。
  *
- * ## 但它不是「打开原通知」的唯一来源（2026-09-27 修订）
+ * ## 但这不等于「重启就没了」（2026-09-27 增强）
+ *
+ * 令牌本体存不下来，可它能**寄存**在别的进程里 —— 而 system_server 跟设备同寿：
+ * 每次投递都会在那边留一份（hook 侧 `IntentTokenStore`），句柄随记录落盘
+ * （[ExpressNotificationLog.Entry.tokenId]）。模块进程重启后，详情页打开时向它取回来
+ * （`IntentTokenFetcher`），令牌就回到这张表里了。
+ *
+ * 于是这张表的寿命上限 = **设备本次开机**（设备一重启，system_server 那份也没了）。
+ *
+ * ## 它也不是「打开原通知」的唯一来源
  *
  * 令牌**内部装的那个 `Intent`** 是可序列化的：`Intent.toUri(Intent.URI_INTENT_SCHEME)`
  * 是系统自己用的那套编码。hook 侧把它拆出来当字符串随记录落盘
@@ -36,8 +44,8 @@ import android.app.PendingIntent
  * [ExpressNotificationLog.Entry.intentUri]），模块进程重启后 `Intent.parseUri` 重建一个
  * 普通 Intent 照样能跳 —— 这就是别的通知记录软件「过很久还能打开」的做法。
  *
- * 两者的分工见 [NotificationIntentLauncher]：**令牌优先**（连启动身份都是对的），
- * 快照兜底（有损，但不会消失）。所以这个表空了不再等于「按钮消失」。
+ * 三者的分工见 [NotificationIntentLauncher]：**令牌优先**（连启动身份都是对的，可来自内存、
+ * 也可从 system_server 取回），快照兜底（有损，但永久）。所以这个表空了不再等于「按钮消失」。
  *
  * ## 为什么值得做
  *
@@ -66,8 +74,9 @@ object NotificationIntentCache {
     }
 
     /**
-     * 取这条记录的原跳转令牌。null = 这里没有（老记录 / 这条不是通知 / 模块进程重启过）——
-     * **不等于点不开**：记录里那份快照串还能用（见类注释与 [NotificationIntentLauncher]）。
+     * 取这条记录的原跳转令牌。null = **此刻**这里没有（老记录 / 这条不是通知 / 模块进程重启过
+     * 且还没向 system_server 取回来）——**不等于点不开**：取回那条路（`IntentTokenFetcher`）
+     * 与记录里那份快照串都还在（见类注释与 [NotificationIntentLauncher]）。
      *
      * **不消费**：用户可能反复点。清理交给 LRU 与 [clear]。
      */

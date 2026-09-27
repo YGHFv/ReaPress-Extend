@@ -265,6 +265,9 @@ internal object SystemServerHook {
         // 顺带把「代发唤醒销」的通道立起来（它就是在这里拿到 system_server 自己的 Context 的）。
         // 放在这条重试链上是有意的：注册需要 context，而这条链本来就是「等 context 可用」的重试。
         SystemWakeRelay.ensureRegistered(context)
+        // 令牌寄存处的窗口一起立起来（同一时机、同一份 Context）。它比唤醒销那条**晚**用得上
+        // （要用户点记录页里的跳转才有人来取），但注册时机只有这两处靠得住，所以一并做了。
+        IntentTokenRelay.ensureRegistered(context)
         WatchdogReporter.reportBoot(context, bootReportInstalled, Watchdog.describe())
     }
 
@@ -428,6 +431,9 @@ internal object SystemServerHook {
                 category = category.name,
                 contentIntent = contentIntent,
                 intentUri = contentIntent?.let { NotificationIntentReader.snapshot(it) },
+                // 令牌的 system_server 侧寄存（见 IntentTokenStore）：模块进程被回收之后
+                // 还能来取的那份。存的是句柄，不是令牌本体。
+                intentToken = IntentTokenStore.stash(contentIntent),
             )
         }.onFailure {
             // 记不下来只是「模块里少一条记录」，拦截本身已经生效了 —— 不能让它影响 NMS。
@@ -516,6 +522,9 @@ internal object SystemServerHook {
             thisObject = param.thisObject,
             contentIntent = contentIntent,
             intentUri = contentIntent?.let { NotificationIntentReader.snapshot(it) },
+            // 令牌在 system_server 这边也留一份（句柄随记录落盘）。模块进程被回收后，
+            // 记录页里那个「打开原通知」还能靠它取回令牌 —— 见 IntentTokenStore。
+            intentToken = IntentTokenStore.stash(contentIntent),
         )
         // 兜底再试一次「代发唤醒销」通道的注册：上面那次 send 已经把 NMS 的 context 缓存下来了，
         // 走到这里必然能注册。开机那条重试链若全都落在 context 还没就绪的时刻（或本 ROM 的
@@ -523,6 +532,8 @@ internal object SystemServerHook {
         // （模块那边只是一直没收到 `host wake bridge ready`），所以不能省。
         // 幂等 + 一个 volatile 读，对通知投递这条路没有可测的开销。
         SystemWakeRelay.ensureRegistered(SystemContextHolder.acquire())
+        // 令牌寄存处的窗口同理（这个时刻 NMS 的 context 一定在手上）。
+        IntentTokenRelay.ensureRegistered(SystemContextHolder.acquire())
 
         // 放行模式：原通知不动，模块那条额外发。这里什么都不用做（NMS 会照常入队）。
         if (!settings.isInterceptMode) {

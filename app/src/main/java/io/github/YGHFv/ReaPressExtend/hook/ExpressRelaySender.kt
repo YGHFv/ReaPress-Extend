@@ -66,6 +66,7 @@ internal object ExpressRelaySender {
         thisObject: Any? = null,
         contentIntent: PendingIntent? = null,
         intentUri: String? = null,
+        intentToken: String? = null,
     ): Boolean {
         // 运行期从 NMS 实例取 context 并缓存 —— 这是 system_server 里唯一可靠的途径。
         SystemContextHolder.upgrade(thisObject)
@@ -73,7 +74,7 @@ internal object ExpressRelaySender {
             logContextFailure()
             return false
         }
-        return deliver(context, record, ExpressRelay.ACTION_DELIVER, contentIntent, intentUri)
+        return deliver(context, record, ExpressRelay.ACTION_DELIVER, contentIntent, intentUri, intentToken)
     }
 
     /**
@@ -91,10 +92,11 @@ internal object ExpressRelaySender {
         category: String,
         contentIntent: PendingIntent? = null,
         intentUri: String? = null,
+        intentToken: String? = null,
     ) {
         SystemContextHolder.upgrade(thisObject)
         val context = SystemContextHolder.acquire() ?: return logContextFailure()
-        deliver(context, record, ExpressRelay.ACTION_INTERCEPTED, contentIntent, intentUri) {
+        deliver(context, record, ExpressRelay.ACTION_INTERCEPTED, contentIntent, intentUri, intentToken) {
             putExtra(ExpressRelay.EXTRA_CATEGORY, category)
         }
     }
@@ -104,7 +106,14 @@ internal object ExpressRelaySender {
         val resolved = context ?: HostContextHolder.acquire()
         if (resolved == null) return logContextFailure()
         // 富化没有「原通知」，也就没有跳转令牌 —— 只有 deliver 那条路会带。
-        deliver(resolved, record, ExpressRelay.ACTION_ENRICH, contentIntent = null, intentUri = null)
+        deliver(
+            resolved,
+            record,
+            ExpressRelay.ACTION_ENRICH,
+            contentIntent = null,
+            intentUri = null,
+            intentToken = null,
+        )
     }
 
     /**
@@ -156,6 +165,37 @@ internal object ExpressRelaySender {
             context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
             XposedBridge.logAlways("wake report sent: $text")
         }.onFailure { XposedBridge.logError("wake report failed", it) }
+    }
+
+    /**
+     * system_server 侧：**把模块索要的跳转令牌还给它**
+     * （[ExpressRelay.ACTION_INTENT_TOKEN_ARRIVED]，执行者是 [IntentTokenRelay]）。
+     *
+     * ## 为什么要专门一个发送函数，而不是复用 [deliver]
+     *
+     * [deliver] 那一套是「一条快递记录」的载荷（十几个 extra + 记录本身），而这里的载荷只有
+     * 「是哪条记录」+「令牌本体」两样。硬套过去要先编一条假记录，反而更容易写错。
+     *
+     * ## 令牌为 null 时为什么还要发
+     *
+     * 「system_server 已经没有了」（LRU 淘汰 / 设备重启过）与「通道没注册上、请求没人接」
+     * 在模块侧看到的现象一样（都是「令牌没到」），但处置完全不同：前者只能退到快照、
+     * 后者是 hook 侧的问题。空手回执把两者分开 —— 与 [sendCookieSync] 读不到 cookie 时
+     * 也要发一条带原因的广播是同一条理由。
+     *
+     * 显式组件寻址：载荷里是令牌本体，只有本模块收得到。
+     */
+    fun sendIntentToken(context: Context, entryId: String, token: PendingIntent?) {
+        runCatching {
+            val intent = Intent(ExpressRelay.ACTION_INTENT_TOKEN_ARRIVED)
+                .setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
+                // 模块进程可能刚被回收（正是这条链路要服务的场景）—— 没这个 flag 会静默丢弃。
+                .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                .putExtra(ExpressRelay.EXTRA_INTENT_ENTRY_ID, entryId)
+            token?.let { intent.putExtra(ExpressRelay.EXTRA_NOTIFICATION_INTENT, it) }
+            context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+            XposedBridge.logAlways("intent token returned: found=${token != null}")
+        }.onFailure { XposedBridge.logError("intent token return failed", it) }
     }
 
     /** cookie 同步的最小间隔。cookie 会轮换，但不值得追着每次投递都发 —— 半小时足够新。 */
@@ -232,6 +272,8 @@ internal object ExpressRelaySender {
      *   就能直接 `send()` —— 它的创建者是宿主，AMS 会按宿主的身份放行。
      * @param intentUri 同一跳转的**可落盘快照**（见 [ExpressRelay.EXTRA_NOTIFICATION_INTENT_URI]）。
      *   两个都带：令牌保真但出不了这次广播，快照有损但能存进记录、跨进程重启仍可用。
+     * @param intentToken 令牌在 system_server 侧的句柄（[IntentTokenStore.stash]）——
+     *   模块进程被回收后再来取的那条路，见 [ExpressRelay.EXTRA_INTENT_TOKEN]。
      * @param extra 动作专属的额外字段（如拦截那条的分类）。
      * @return true = `sendBroadcastAsUser` 没有抛异常（已交给系统）。**不代表对方收到了** ——
      *   模块进程没起来、被冻结、或者接收器被停用，系统都会静默丢弃，这一层看不见。
@@ -243,6 +285,7 @@ internal object ExpressRelaySender {
         action: String,
         contentIntent: PendingIntent?,
         intentUri: String?,
+        intentToken: String?,
         extra: (Intent.() -> Unit)? = null,
     ): Boolean {
         return runCatching {
@@ -250,6 +293,8 @@ internal object ExpressRelaySender {
             contentIntent?.let { intent.putExtra(ExpressRelay.EXTRA_NOTIFICATION_INTENT, it) }
             intentUri?.takeIf { it.isNotBlank() }
                 ?.let { intent.putExtra(ExpressRelay.EXTRA_NOTIFICATION_INTENT_URI, it) }
+            intentToken?.takeIf { it.isNotBlank() }
+                ?.let { intent.putExtra(ExpressRelay.EXTRA_INTENT_TOKEN, it) }
             extra?.invoke(intent)
             // 显式指定组件：模块 App 的接收器。隐式广播在 Android 8+ 受限，且我们本来就知道
             // 目标是谁 —— 显式投递既可靠又不会被别的应用截获。

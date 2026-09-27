@@ -79,12 +79,16 @@ object ExpressNotificationPoster {
      *   本模块的界面。用户想回原 App 的具体页面时，靠的是记录页里那份令牌。
      * @param intentUri 同一跳转的可落盘快照。**它才是跨进程重启之后还能用的那份**
      *   （令牌是 binder 句柄，落盘只会得到一串解不回来的字节），见 [NotificationIntentLauncher]。
+     * @param intentToken 令牌在 **system_server** 侧的寄存句柄。模块进程被回收后，详情页靠它
+     *   把令牌取回来（见 [io.github.YGHFv.ReaPressExtend.relay.ExpressRelay.EXTRA_INTENT_TOKEN]
+     *   与 `IntentTokenFetcher`）—— 比 [intentUri] 忠实（取回的是令牌本体），但只活到设备重启。
      */
     fun post(
         context: Context,
         record: ExpressRecord,
         contentIntent: PendingIntent? = null,
         intentUri: String? = null,
+        intentToken: String? = null,
     ): Boolean {
         if (!hasPermission(context)) {
             ModuleAndroidLog.error(
@@ -94,7 +98,7 @@ object ExpressNotificationPoster {
             )
             ExpressNotificationLog.record(
                 context, record, delivered = false, detail = "未授予通知权限",
-                contentIntent = contentIntent, intentUri = intentUri,
+                contentIntent = contentIntent, intentUri = intentUri, intentToken = intentToken,
             )
             return false
         }
@@ -162,14 +166,14 @@ object ExpressNotificationPoster {
             )
             ExpressNotificationLog.record(
                 context, record, delivered = true,
-                contentIntent = contentIntent, intentUri = intentUri,
+                contentIntent = contentIntent, intentUri = intentUri, intentToken = intentToken,
             )
             true
         }.getOrElse {
             ModuleAndroidLog.error(TAG, "post replacement notification failed key=${record.dedupeKey}", it)
             ExpressNotificationLog.record(
                 context, record, delivered = false, detail = it.message.orEmpty(),
-                contentIntent = contentIntent, intentUri = intentUri,
+                contentIntent = contentIntent, intentUri = intentUri, intentToken = intentToken,
             )
             false
         }
