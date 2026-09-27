@@ -28,26 +28,12 @@ import io.github.libxposed.api.XposedInterface
 import java.lang.reflect.Executable
 import java.util.concurrent.atomic.AtomicReference
 
-/**
- * libxposed API 102 的薄封装。
- *
- * 两件事：
- * 1. 持有框架接口引用（[attachFramework] 由入口类调用）
- * 2. 把 API 102 的**拦截器链**适配成旧式 `before/after` 形状（[XC_MethodHook]），
- *    这样 hook 代码写法统一，不必每个调用点都手写 `chain.proceed()`
- */
+/** libxposed API 102 的薄封装：持有框架接口引用，把拦截器链适配成旧式 `before/after` 形状（[XC_MethodHook]）。 */
 object XposedBridge {
     private const val LOG_TAG = "ReaPress"
     private val frameworkRef = AtomicReference<XposedInterface?>()
 
-    /**
-     * 日志出口。
-     *
-     * **不能直接用 `frameworkRef` 打日志**：`libxposed` 是 `compileOnly` 依赖，只存在于被
-     * 注入的进程里。模块**自己的进程**（主界面、接收器）里没有这个类，一旦执行到引用
-     * `XposedInterface` 的字节码就会 `NoClassDefFoundError`。
-     * 所以日志走这个只用自有类型的出口：模块进程里它是 null，永远不会碰到 libxposed。
-     */
+    /** 日志出口。不能直接用 frameworkRef 打日志：libxposed 是 compileOnly 依赖，模块自己进程里没有这个类，一执行到引用它的字节码就 NoClassDefFoundError。所以走这个只用自有类型的出口。 */
     private val logSinkRef = AtomicReference<ModuleLogSink?>()
 
     fun attachFramework(framework: XposedInterface) {
@@ -78,12 +64,7 @@ object XposedBridge {
         log(Log.ERROR, Log.getStackTraceString(throwable), throwable)
     }
 
-    /**
-     * 不受「简洁日志」开关影响的日志。
-     *
-     * 只给启动自检汇总这类「必须能看到」的单行输出用：它在设置还没 attach 时打印，
-     * 那时 [ModuleLogState.conciseLogEnabled] 仍是默认的 true，走普通 log 会被整条吞掉。
-     */
+    /** 不受「简洁日志」开关影响：给启动自检这类在设置 attach 前打印（那时普通 log 会被默认的开关整条吞掉）的单行输出用。 */
     fun logAlways(text: String) {
         val sink = logSinkRef.get()
         if (sink != null) {
@@ -94,13 +75,7 @@ object XposedBridge {
         }
     }
 
-    /**
-     * 挂一个方法。
-     *
-     * 异常处理固定为 `PROTECTIVE`：hook 里抛出的任何异常都被框架吞掉并记日志，调用按「没有这个
-     * hook」继续。**这是 system_server 侧的硬要求** —— hook 抛异常绝不能冒泡到
-     * NotificationManagerService 的调用栈上。
-     */
+    /** 异常处理固定 PROTECTIVE：hook 抛出的任何异常都被框架吞掉并记日志 —— system_server 侧硬要求，异常绝不能冒泡到 NotificationManagerService 调用栈。 */
     fun hookMethod(method: Executable, callback: XC_MethodHook): XposedInterface.HookHandle? {
         method.isAccessible = true
         val framework = frameworkRef.get()
@@ -134,14 +109,7 @@ object XposedBridge {
             .toList()
     }
 
-    /**
-     * 同 [hookAllMethods]，但连**继承来的**同名方法一起挂。
-     *
-     * 只在明确需要的地方用：多数调用点的目标类自己声明了该方法，换成这个只会顺带把父类的同名
-     * 方法也挂上，可能影响别处。之所以需要它，是因为调用方的前置校验常常写成
-     * `methods + declaredMethods`（能查到继承方法），而 [hookAllMethods] 只扫 `declaredMethods`
-     * ——方法若是继承来的，校验通过、却**一个都没挂上**，日志里还打印"安装成功"。
-     */
+    /** 连继承来的同名方法一起挂：调用方前置校验常写成 methods + declaredMethods，只扫 declaredMethods 会校验通过却一个都没挂上，日志还打印"安装成功"。 */
     fun hookAllMethodsIncludingInherited(
         clazz: Class<*>,
         methodName: String,
@@ -161,14 +129,7 @@ object XposedBridge {
             .toList()
     }
 
-    /**
-     * 把拦截器链的一步展开成 before → proceed → after。
-     *
-     * 语义要点：
-     * - before 里 `setResult(x)` / `setThrowable(t)` 即「短路」，原方法不再执行
-     * - proceed 抛出的异常回填到 param，after 仍会被调用（after 能看到异常并改写）
-     * - 最后按 param 的 throwable/result 决定实际行为
-     */
+    /** 把拦截器链的一步展开成 before → proceed → after；before 里 setResult/setThrowable 即短路，proceed 抛出的异常回填到 param 后 after 仍会被调用。 */
     internal fun interceptForTest(callback: XC_MethodHook, chain: HookChain): Any? {
         val param = XC_MethodHook.MethodHookParam(
             chain.executable,
@@ -209,9 +170,8 @@ object XposedBridge {
             else -> ModuleLogLevel.INFO
         }
         val sink = logSinkRef.get()
-        // sink 为空说明这是模块**自己的进程**（没有 libxposed 注入）。这里的日志只进
-        // logcat，而模块进程的 INFO 日志受「简洁日志」抑制、logcat 里根本看不到——所以同时收进
-        // 诊断缓冲，模块主界面能直接翻到。宿主进程里 sink 非空，不会走这条。
+        // sink 为空 = 模块自己的进程（无 libxposed 注入）：INFO 日志受「简洁日志」抑制、logcat 看不到，
+        // 所以同时收进诊断缓冲，模块主界面能翻到。宿主进程里 sink 非空，不走这条。
         if (sink == null) {
             ModuleLogBuffer.record(level.name, LOG_TAG, text)
         }
@@ -233,13 +193,7 @@ object XposedBridge {
     }
 }
 
-/**
- * 把日志转给 libxposed 框架。
- *
- * 单独一个类，**只有被注入的进程**才会加载它（仅 [XposedBridge.attachFramework] 里实例化）：
- * 模块自身进程没有 libxposed，凡是引用到 [XposedInterface] 的字节码一执行就
- * `NoClassDefFoundError`，所以这些引用必须隔离在"非注入进程绝不触碰"的类里。
- */
+/** 把日志转给 libxposed 框架。只有被注入的进程才会加载它：libxposed 引用必须隔离在「非注入进程绝不触碰」的类里，否则 NoClassDefFoundError。 */
 private class FrameworkLogSink(private val framework: XposedInterface) : ModuleLogSink {
     override fun log(priority: Int, tag: String, text: String, throwable: Throwable?) {
         if (throwable != null) {

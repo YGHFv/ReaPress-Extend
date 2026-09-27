@@ -18,45 +18,18 @@
 package io.github.YGHFv.ReaPressExtend.core
 
 /**
- * 原通知那个 `PendingIntent` 的**可落盘表示**。
- *
- * ## 为什么需要（2026-09-27 用户问：为什么别的通知记录软件过很久还能打开）
- *
- * `PendingIntent` 本身是个 binder 令牌，**不能落盘** —— 但它的**内容**可以。
- * `Intent` 有官方提供的字符串序列化（`Intent.toUri(Intent.URI_INTENT_SCHEME)`，
- * 配 `Intent.parseUri` 还原），这就是系统自己用来把 Intent 塞进 URI / 存进 `AlarmManager`
- * 的那套机制。把 `PendingIntent` 内部的 `Intent` 取出来编成这个字符串存下，
- * 需要时再解回一个普通 `Intent` 去 `startActivity` —— 就能做到「重启之后还能打开」。
- *
- * 代价要说清：`toUri` 只编**基础类型**的 extras（String / int / long / boolean / 各数组），
- * `Parcelable` / `Serializable` 的那部分会被丢掉，`FLAG_GRANT_*` 也不还原。
- * 但通知的 contentIntent 绝大多数就是「打开某个 Activity + 一两个基础类型的参数」，
- * 所以重建出来的跳转通常能到**同一个页面**，最坏情况是丢一个参数。
- *
- * ## 为什么包名要单独抠出来
- *
- * 界面要写「打开原通知（菜鸟）」这种东西，而 `toUri` 的输出是一整条 `intent://…#Intent;…;end`。
- * 从里面取 component 的包名是纯字符串处理 —— 放 core 层是为了能在 JVM 单测里钉住，
- * 不用起 Android 环境。
+ * 原通知那个 `PendingIntent` 的可落盘表示：binder 令牌本身不能落盘，但内容可以 ——
+ * 把内部 `Intent` 用官方的 `Intent.toUri(URI_INTENT_SCHEME)` 编成字符串存下，需要时解回普通
+ * `Intent` 去 `startActivity`，做到重启之后还能打开。代价：只编基础类型的 extras，
+ * Parcelable / Serializable 的部分会丢、`FLAG_GRANT_*` 不还原，最坏丢一个参数。
  */
 object NotificationIntentSnapshot {
 
-    /** `Intent.toUri` 里 component 段的键名（AOSP `Intent.URI_INTENT_SCHEME` 契约）。 */
     private const val KEY_COMPONENT = "component="
 
-    /** 只声明 package、不声明 component 时（隐式 Intent）的键名。 */
     private const val KEY_PACKAGE = "package="
 
-    /**
-     * 从快照串里抠出目标包名；认不出返回 null。
-     *
-     * 取值规则（两种都按 AOSP 的写法）：
-     * - `component=com.foo.bar/.MainActivity` → `com.foo.bar`（斜杠之前）
-     * - `package=com.foo.bar` → `com.foo.bar`
-     *
-     * 段以 `;` 或串尾的 `end` 结束，所以要在这里截断 —— 不截的话会连
-     * `;action=…;launchFlags=…` 一起当成包名。
-     */
+    /** 从快照串里抠出目标包名（component= 取斜杠前，package= 直接取）；段以 `;` 结束，不截会连后面的参数一起当成包名。 */
     fun packageOf(uri: String?): String? {
         if (uri.isNullOrBlank()) return null
         segmentAfter(uri, KEY_COMPONENT)?.substringBefore('/')?.takeIf { it.isNotBlank() }
@@ -64,27 +37,11 @@ object NotificationIntentSnapshot {
         return segmentAfter(uri, KEY_PACKAGE)?.takeIf { it.isNotBlank() }
     }
 
-    /**
-     * 这条记录**属于哪个应用** —— 「打开原通知」要打开的就是它，界面上那个「（菜鸟）」也是它。
-     *
-     * 取**来源包名优先**、快照串兜底。理由：用户在这一页看到的是「来源：菜鸟」，点「打开」
-     * 时期望回到的就是菜鸟；而快照串里的 component 指向的是宿主**内部**的落地页
-     * （推送 SDK 那种，见 [io.github.YGHFv.ReaPressExtend.notification.NotificationIntentLauncher]），
-     * 两者偶有分属不同包的情况。按钮措辞与实际打开的目标必须同源 —— 各算一遍迟早会分叉，
-     * 变成「按钮写着菜鸟、打开的是别的」。
-     *
-     * @return 认不出返回 null（既没有来源包名，快照串里也抠不出 component / package）。
-     */
+    /** 这条记录属于哪个应用：「打开原通知」的目标。来源包名优先、快照串兜底 —— 按钮措辞与实际打开的目标必须同源，各算一遍迟早分叉。 */
     fun targetPackageOf(sourcePackage: String?, uri: String?): String? =
         sourcePackage?.takeIf { it.isNotBlank() } ?: packageOf(uri)
 
-    /**
-     * 取 `key=` 之后到下一个 `;` 之间的内容。
-     *
-     * **不走 `removeSuffix("end")`**：`Intent.toUri` 的输出一定以 `;end` 结尾，
-     * 所以「下一段的分号」必然存在，截到分号就够了。而按后缀剪会误伤含 "end" 的包名
-     * （`com.foo.bender` → `com.foo.b`），那是个只在畸形输入上暴露的静默错误。
-     */
+    /** 取 `key=` 之后到下一个 `;` 之间的内容；不走 removeSuffix("end") —— 会误伤含 "end" 的包名（com.foo.bender → com.foo.b）。 */
     private fun segmentAfter(uri: String, key: String): String? {
         val start = uri.indexOf(key)
         if (start < 0) return null

@@ -28,59 +28,27 @@ import java.net.URL
 import java.net.URLEncoder
 
 /**
- * 淘宝订单 → 运单号 —— **不经过菜鸟进程**的那条数据通路。
- *
- * ## 它补的是哪一格
- *
- * 模块的包裹数据一直有个前提：菜鸟得活着（hook 才有机会读它本地那张包裹表，
- * 见 `CainiaoPackageHook` 的自查）。菜鸟被系统回收后就只剩「等它下次自己起来」。
- * 这个文件是第三条路：**用菜鸟 WebView 里那份淘宝登录态，直接问淘宝要订单**，
- * 拿到运单号之后交给现有的轨迹链路 —— 菜鸟死着也能更新。
- *
- * ⚠️ **覆盖面只有淘宝 / 天猫的订单**：拼多多、京东、别人寄来的件不在这里，
- * 那些仍只有菜鸟本地表有。所以它是**兜底**，不是替代。
- *
- * ## 两跳（缺一不可）
- *
- * 1. [listOrders]：`mtop.taobao.order.queryboughtlistv2` 拿订单列表 ——
- *    **这里面没有运单号**，只有订单号和状态；
- * 2. [ssrParcel]：对每个在途订单请求物流 SSR 页，从 HTML 的首屏数据里抠出运单号。
- *
- * 拿到运单号之后的活不在这里 —— 交给 `CainiaoTraceFetcher`（它带闸门、串行、风控退避，
- * 而且拿的是完整轨迹 + 商品图 + 驿站地址，比 SSR 页那份缩写版好得多）。
- *
- * ## 风控
- *
- * 两跳都算请求数，而风控正是按**请求频率**收网的（2026-09-26 实测）。所以：
- * 第一跳走 [CainiaoTraceApi.callH5]（共用风控退避与 token 缓存），第二跳由调用方
- * （`CainiaoDirectFetcher`）拉开间隔、限制件数。
+ * 淘宝订单 → 运单号，不经过菜鸟进程的兜底通路（覆盖面只有淘宝 / 天猫订单，拼多多等仍只有菜鸟本地表有）。
+ * 两跳：[listOrders] 拉订单列表（里面没有运单号），[ssrParcel] 对在途订单打物流 SSR 页从 HTML 首屏
+ * 抠运单号，之后交给 `CainiaoTraceFetcher` 的轨迹链路。两跳都算请求数，风控按请求频率收网（实测）：
+ * 第一跳走 [CainiaoTraceApi.callH5] 共用退避，第二跳由调用方拉开间隔、限制件数。
  */
 internal object TaobaoOrderApi {
 
-    /**
-     * 订单接口的域名。**与轨迹不是同一个** —— 见 [CainiaoTraceApi.callH5] 的 host 参数，
-     * 两边的 token 也是分开缓存的。
-     */
+    /** 订单接口域名与轨迹接口不是同一个，token 也分开缓存（见 [CainiaoTraceApi.callH5]）。 */
     private const val ORDER_HOST = "https://h5api.m.taobao.com/h5/"
 
     private const val ORDER_API = "mtop.taobao.order.queryboughtlistv2"
     private const val ORDER_VERSION = "1.0"
 
-    /** 物流 SSR 页（整页 HTML，不是 mtop 接口）。 */
     private const val SSR_BASE =
         "https://pages-g.m.taobao.com/wow/z/app/mtb/logisticsV2/h5-detail"
 
     private const val CONNECT_TIMEOUT_MS = 8_000
 
-    /** SSR 页是整页 HTML，比接口响应大得多，读超时给宽一点。 */
     private const val READ_TIMEOUT_MS = 12_000
 
-    /**
-     * 订单列表。
-     *
-     * @return 空列表表示「没登录态 / 接口变了 / 被风控」——三种情况调用方的处理一样
-     *   （本次直连到此为止），具体是哪一种看模块日志里 [CainiaoTraceApi] 留下的那句。
-     */
+    /** 空列表 = 没登录态 / 接口变了 / 被风控，三种情况处理一样（本次直连到此为止），具体看 [CainiaoTraceApi] 的日志。 */
     fun listOrders(cookie: String?, page: Int = 1): List<TaobaoOrder> {
         val body = CainiaoTraceApi.callH5(
             api = ORDER_API,
@@ -92,7 +60,7 @@ internal object TaobaoOrderApi {
         return TaobaoOrderParser.parse(body)
     }
 
-    /** 某个订单的物流页 → 运单号。解析失败（登录页 / 结构变了）返回 null。 */
+    /** 某个订单的物流页 → 运单号；解析失败（登录页 / 结构变了）返回 null。 */
     fun ssrParcel(cookie: String?, orderId: String): SsrParcel? {
         if (cookie.isNullOrBlank() || orderId.isBlank()) return null
         val url = "$SSR_BASE?x-ssr=true&bizOrderId=" + URLEncoder.encode(orderId, "UTF-8")
@@ -103,11 +71,7 @@ internal object TaobaoOrderApi {
         return SsrLogisticsParser.parse(html)
     }
 
-    /**
-     * 订单列表的请求体。字段名与取值**照抄** Halo0sama/ExpressAssistant（MIT）那份实现 ——
-     * 它们不是可推导出来的（`ttid` / `requestIdentity` 这类是页面自己的埋点标识），
-     * 少一个就可能被服务端当成非正常客户端。改动前先想想值不值得。
-     */
+    /** 请求体字段与取值照抄 Halo0sama/ExpressAssistant（MIT）—— 它们不可推导（ttid 等是页面埋点标识），少一个就可能被服务端当成非正常客户端。 */
     private fun orderBody(page: Int): String = JSONObject()
         .put("tabCode", "all")
         .put("page", page)
@@ -120,17 +84,7 @@ internal object TaobaoOrderApi {
         .put("requestIdentity", "#t#ip#h5")
         .toString()
 
-    /**
-     * SSR 页的 GET。
-     *
-     * 与 [CainiaoTraceApi] 的两条差异：
-     * - **跟随重定向**：这条不是 mtop 接口，被风控时不会有那套 `ret` 响应体；
-     *   正常也会经过跳转，不跟随就什么都拿不到。
-     * - 只要 cookie，**没有签名**：SSR 页是普通网页请求。
-     *
-     * 用 `HttpURLConnection` 而不是第三方库：这段代码会被注入宿主进程，模块的依赖不会一起进去
-     * （理由同 [CainiaoTraceApi]）。
-     */
+    /** SSR 页 GET：要跟随重定向（普通网页，被风控时没有 ret 响应体）；只要 cookie 没有签名。用 HttpURLConnection，模块依赖不会进宿主进程。 */
     private fun get(url: String, cookie: String): String {
         val connection = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"

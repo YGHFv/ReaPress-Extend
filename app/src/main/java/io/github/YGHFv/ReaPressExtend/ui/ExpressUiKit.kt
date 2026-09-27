@@ -37,6 +37,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import top.yukonga.miuix.kmp.basic.Card
@@ -47,65 +48,30 @@ import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
- * 界面小件 —— **全模块唯一一套排版词汇**。
- *
- * ## 页面结构（每页都长这样）
- *
- * ```
- * GroupTitle("分组")        // miuix SmallTitle
- * SettingsCard {            // miuix Card，水平 12dp / 底部 12dp
- *     SwitchPreference(...) // miuix 自带的偏好行（开关 / 下拉）
- *     InfoRow(...)          // 本文件：只读的「标签 — 值」
- *     HintText(...)         // 本文件：一句说明
- *     CardActionRow(...)    // 本文件：卡片里的动作
- * }
- * ```
- *
- * ## 三条硬规矩
- *
- * 1. **只有两级字号**：主文本一律用 miuix [Text] 的默认字号（不写 `fontSize`），
- *    副文本 / 说明一律走 [SecondaryText]（12sp + 次要色）。
- *    之前设置的 11/13/14/17sp 混用是「文本乱七八糟」的主因 —— 层级靠**颜色和位置**表达，
- *    不靠字号微调。**不要在组件外自己写 `fontSize`**，那是把这条规矩又拆开一次。
- * 2. **对齐**：卡片水平外边距 12dp + 行内边距 16dp = 28dp，正好等于 miuix [SmallTitle]
- *    的默认水平内边距。所以 [GroupTitle] **不传 insideMargin**，传了就会错位。
- * 3. **不写 Markdown**：miuix 的 [Text] 不吃 `**粗体**` 这类标记，星号会原样显示出来。
- *    强调用词序和分行，不用符号。
+ * 界面小件——全模块唯一一套排版词汇（GroupTitle + SettingsCard + InfoRow + HintText +
+ * CardActionRow）。硬规矩：主文本用 miuix Text 默认字号、小字只用 [SecondaryText]（12sp + 次要色），
+ * 层级靠颜色和位置表达，不要在组件外自己写 fontSize；[GroupTitle] 不传 insideMargin（默认 28dp
+ * 才与卡片内文字对齐）；miuix 的 Text 不吃 Markdown 星号，强调用词序和分行。
  */
 
 /** 副文本 / 说明文字的字号。全模块只有这一个「小字」。 */
 private val SECONDARY = 12.sp
 
-/**
- * 刷新指示器的四段文案（下拉 / 松手 / 刷新中 / 完成）。miuix 默认是英文，必须覆盖。
- *
- * 放在 [ExpressUiKit] 而不是各页面自持一份：这是「模块里所有下拉刷新共用的一套话」，
- * 分开写迟早有一处被改得跟别处不一样。
- */
+/** 全模块下拉刷新共用的四段文案（miuix 默认英文，必须覆盖），别各页面自持一份。 */
 internal val REFRESH_TEXTS = listOf("下拉刷新", "松手刷新", "正在刷新…", "刷新成功")
 
-/** 卡片水平外边距。与 [GroupTitle] 的对齐关系见文件头。 */
 private val CARD_MARGIN = 12.dp
 
-/** 分组标题。**不要传 insideMargin**：默认的 28dp 才是与卡片内文字对齐的那个值。 */
+/** 分组标题。不要传 insideMargin：默认的 28dp 才是与卡片内文字对齐的那个值。 */
 @Composable
 internal fun GroupTitle(text: String) {
     SmallTitle(text = text)
 }
 
 /**
- * 设置 / 关于页的标准卡片。
- *
- * 存在的意义是**把 12dp + 12dp 这套边距收在一处**：以前每个分组都手写一遍
- * `Card(modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp),
- * insideMargin = PaddingValues(0.dp))`，十几处里只要有一处写漏，那一组卡片就会比别的
- * 宽一点或贴得紧一点 —— 单看没问题，一屏扫下来就是「乱」。
- *
- * `insideMargin` 默认 `0` 是**故意的**：行内边距由各行的组件自己给（16dp），卡片只负责外框。
- * 这样 [SwitchPreference] 这类 miuix 原生偏好行才能撑满整行、按下反馈铺满卡片宽度。
- *
- * @param insideMargin 只有「卡片里不是标准行」时（空状态那种整块居中的内容）才传，
- *   传了就要自己保证与 16dp 的行内边距是一路的，别再引入第三套数值。
+ * 设置 / 关于页的标准卡片，把 12dp 外边距收在一处（十几处里写漏一处，整屏就是「乱」）。
+ * insideMargin 默认 0 是故意的：行内边距由各行组件自给（16dp），miuix 原生偏好行才能撑满整行。
+ * 只有「卡片里不是标准行」的空状态类内容才传。
  */
 @Composable
 internal fun SettingsCard(
@@ -122,11 +88,8 @@ internal fun SettingsCard(
 }
 
 /**
- * 卡片里的一行只读信息：左侧标签，右侧值。
- *
- * 值短时（「已授予」「开启」）左右并排；值长时（设置摘要那种一整句话）改成上下堆叠 ——
- * 并排会把左侧标签挤成一列竖排的字（实测「设置摘要」被压成四行）。
- * 用长度而不是测量结果判断，是为了让布局在组合期就确定，不必等一帧。
+ * 卡片里的一行只读信息。值短左右并排，值长（超 [LONG_VALUE_THRESHOLD]）改上下堆叠——
+ * 并排会把左侧标签挤成一列竖排的字。按长度而不是测量结果判断，让布局在组合期就确定。
  */
 @Composable
 internal fun InfoRow(label: String, value: String, valueColor: Color? = null) {
@@ -155,16 +118,9 @@ internal fun InfoRow(label: String, value: String, valueColor: Color? = null) {
     }
 }
 
-/** 超过这个长度就认为「一句话」而不是「一个值」，改走上下堆叠。 */
 private const val LONG_VALUE_THRESHOLD = 24
 
-/**
- * 分段选择（模式、阈值这种三选一）。
- *
- * miuix 没有这个形状的组件（它只有 TabRow，那是给页面切换用的），所以自己画一个，
- * 但**取色全部走主题**：选中 `primary` + 白字，未选中 `secondaryContainer`。
- * 不自己挑灰阶 —— 那样夜间主题下就糊了。
- */
+/** 分段选择（miuix 没有这个形状的组件）；取色全走主题，别自己挑灰阶——夜间主题下会糊。 */
 @Composable
 internal fun SegmentedRow(
     options: List<Pair<String, String>>,
@@ -205,15 +161,9 @@ internal fun SegmentedRow(
 }
 
 /**
- * 一条记录 / 一个条目的标准卡片（记录页用）。
- *
- * 与 [SettingsCard] 的分工：那个是「若干设置行拼成的组」，这个是「一条独立的东西」——
- * 自带 16dp 内边距，标题行右侧放时间。**两者不要互相替代**：设置行有自己的行高，
- * 塞进这个骨架会被压扁。
- *
- * @param onClick 整卡可点（记录页点进详情）。传 null 就用**没有点击反馈**的那个重载 ——
- *   不传 onClick 却挂上点击会得到一个按下去有涟漪、松手什么也不发生的卡片，
- *   那比不能点更让人困惑。
+ * 一条记录 / 一个条目的标准卡片（自带 16dp 内边距），与 [SettingsCard] 不要互相替代——
+ * 设置行有自己的行高，塞进这个骨架会被压扁。onClick 为 null 时走无点击反馈的重载：
+ * 按下去有涟漪、松手什么也不发生，比不能点更让人困惑。
  */
 @Composable
 internal fun RecordCard(
@@ -262,31 +212,21 @@ internal fun RecordCard(
     }
 }
 
-/**
- * 副文本。**全模块唯一的一种小字**（12sp + 次要色），不要再另起一种字号。
- *
- * 单独成组件而不是各处自己写 `Text(fontSize = 12.sp, ...)`：字号一旦散落开，
- * 「只有两级字号」这条规矩就守不住了 —— 之前设置 / 关于页的乱正是这么来的
- * （11/12/13/17sp 各写各的）。需要小字就找它。
- */
+/** 全模块唯一的小字（12sp + 次要色）。需要小字就找它，别另起一种字号。 */
 @Composable
 internal fun SecondaryText(text: String, modifier: Modifier = Modifier, color: Color? = null) {
     Text(text, modifier = modifier, fontSize = SECONDARY, color = color ?: secondaryColor())
 }
 
-/** 记录卡片右上角的时刻。尺寸与其它副文本一致，只是位置在标题行。 */
+/** 记录卡片右上角的时刻。 */
 @Composable
 internal fun RecordTime(text: String) {
     SecondaryText(text)
 }
 
 /**
- * 卡片里的动作行：整行可点、文字居中。
- *
- * 不放在右侧做成小按钮：miuix 的偏好行动作是**整行**的，右侧小按钮会跟卡片里其它
- * 行的左边距对不齐，看着像临时拼上去的。
- *
- * @param danger 破坏性动作（删数据、复位 hook 这类）用错误色，与普通动作区分开
+ * 卡片里的动作行：整行可点、文字居中——右侧小按钮会跟卡片里其它行的左边距对不齐。
+ * [danger] 破坏性动作用错误色，与普通动作区分开。
  */
 @Composable
 internal fun CardActionRow(
@@ -310,21 +250,19 @@ internal fun CardActionRow(
 }
 
 /**
- * 卡片内的说明文字。**全模块唯一的一种小字**，不要再另起一种。
- *
- * @param color 只有「这条说明是个错误」（看门狗失败原因、投递失败原因）才传，
- *   传 [MiuixTheme.colorScheme.error]。字号不变 —— 错误靠颜色表达，不靠字号。
+ * 卡片内的说明文字。color 只在「这条说明是个错误」时传 error 色（字号不变，错误靠颜色表达）。
+ * horizontalPadding 默认 16dp 与卡片行内边距对齐；弹窗里传 0.dp——弹窗自己有 24dp 内边距，再缩进会错位。
  */
 @Composable
-internal fun HintText(text: String, color: Color? = null) {
+internal fun HintText(text: String, color: Color? = null, horizontalPadding: Dp = 16.dp) {
     SecondaryText(
         text = text,
-        modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+        modifier = Modifier.padding(horizontal = horizontalPadding, vertical = 6.dp),
         color = color,
     )
 }
 
-/** 卡片里的分隔线：0.5dp、outline 50% 透明，上下留 8dp。 */
+/** 卡片内的分隔线：0.5dp、outline 50% 透明，上下留 8dp。 */
 @Composable
 internal fun CardDivider() {
     HorizontalDivider(
@@ -335,11 +273,8 @@ internal fun CardDivider() {
 }
 
 /**
- * 卡片内**相邻同类条目**之间的分隔线：0.5dp、两侧留 16dp（与行内边距对齐），**不留上下空白**。
- *
- * 与 [CardDivider] 的分工：那个是「一行一段话」之间的空档，自带 8dp 留白；这个用在
- * 「同一张卡里连续排十来个条目」的场合（驿站下的多件包裹、日志列表）——
- * 每行都塞 8dp 空白的话，十几条会被撑成一屏半，扫读时反而更乱。
+ * 相邻同类条目之间的分隔线：两侧留 16dp、不留上下空白，密排列表用——
+ * 每行塞 8dp 空白会把十几条撑成一屏半。与 [CardDivider]（段落之间的空档）分工。
  */
 @Composable
 internal fun RowDivider() {

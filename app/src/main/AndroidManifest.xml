@@ -136,7 +136,9 @@
                 android:value="按用户设定的时间与频率查询其本人已授权的快递物流轨迹" />
         </service>
 
-        <!-- 开机把自动轮查接回去（用户开了它却不进模块时，这条是唯一的重启路径）。 -->
+        <!--
+          开机把自动轮查接回去（用户开了它却不进模块时，这条是唯一的重启路径）。
+        -->
         <receiver
             android:name=".relay.BootCompletedReceiver"
             android:enabled="true"
@@ -145,5 +147,41 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+
+        <!--
+          定时备份的闹钟（BackupScheduler.ensureScheduled 排下）。
+
+          exported=false + 无 intent-filter：这是给自己发的闹钟投递用的，别的应用既不需要
+          也不应该能触发它。用广播接收器而不是 WorkManager：这件事一秒内就做完，也没有
+          「必须做完」的语义（下一次到点、或用户打开模块时都会补），不值得引入一套调度框架。
+
+          闹钟用的是**不精确**的那种（setInexactRepeating）：备份晚半小时没有任何后果，
+          而精确闹钟要 SCHEDULE_EXACT_ALARM，还有被系统回收的风险。
+        -->
+        <receiver
+            android:name=".backup.BackupAlarmReceiver"
+            android:enabled="true"
+            android:exported="false" />
+
+        <!--
+          免 root 方案的通知来源：用户授予「通知使用权」后由系统绑定，模块进程内读宿主通知原文。
+
+          exported=true + 那条 intent-filter 是系统要求的写法（绑定方是 system_server）；
+          安全性由 android:permission 保证 —— 只有持有 BIND_NOTIFICATION_LISTENER_SERVICE
+          （signature 级，只有系统签得出）的一方绑得上，别的应用既绑不了也调不动它。
+
+          它与 Xposed 的 hook 是两条独立的腿：hook 在投递前拦，这里在出现后读；两条都在时
+          靠 ExpressDeliveryLedger 去重（见那个类的注释）。没有 LSPosed 也能用这一条。
+        -->
+        <service
+            android:name=".noroot.ExpressNotificationListener"
+            android:enabled="true"
+            android:exported="true"
+            android:label="@string/module_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

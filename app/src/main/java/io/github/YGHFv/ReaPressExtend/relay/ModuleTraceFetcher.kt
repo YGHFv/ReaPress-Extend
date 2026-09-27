@@ -23,42 +23,22 @@ import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
 import io.github.YGHFv.ReaPressExtend.core.ExpressStatus
 import io.github.YGHFv.ReaPressExtend.hook.CainiaoTraceApi
 import io.github.YGHFv.ReaPressExtend.hook.CainiaoTraceFetcher
+import io.github.YGHFv.ReaPressExtend.notification.ExpressChangeNotifier
 import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
 import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
 import java.util.Collections
 
 /**
- * 模块进程侧的轨迹拉取入口。
- *
- * 轨迹拉取已整体收拢到模块进程（2026-09-26）：cookie 由 hook 侧经 `ACTION_COOKIE_SYNC`
- * 同步进 [TraceCookieCache]（内存 + 模块私有目录），拉取引擎复用 [CainiaoTraceFetcher]（闸门、串行、
- * 风控退避都在那）。两个进程各自调 [CainiaoTraceFetcher.requestFetch]，互不知晓、互不重复
- * —— 闸门（成功表 / 冷却表）是**进程内**的，但同一次拉取只有一个进程会发起（见下）。
- *
- * ## 两种模式怎么分工
- *
- * - **点击时获取**（默认）：[onDemand] —— 详情页点开 / 下拉时拉当前单号。
- *   cookie 缓存在 → 模块进程静默直拉（**菜鸟不在后台也行**，这正是收拢到模块的原因）；
- *   没有缓存 → 发 `ACTION_TRACE_REQUEST` 给菜鸟进程兜底（活着时它自己拉 + 顺带同步 cookie）。
- * - **自动更新**：[maybeAutoFetch] —— 模块收到宿主富化时，对到站 / 派送中 / 运输中的件
- *   主动批量拉。内部闸门和间隔保证「批量」也是 2.5s 一发、风控退避全局生效。
- * - **自动轮查**：[watchFetch] —— 与宿主毫无关系的一条路：`AutoWatchService` 在后台按
- *   3 分钟一件（±1 分钟抖动）、一轮结束等 30 分钟的节奏自己拉。前两条都需要外部触发
- *   （用户点、宿主刷新），宿主几小时不刷新时它们一个都不会响 —— 轮查补的就是这一格。
+ * 模块进程侧的轨迹拉取入口。拉取已整体收拢到模块进程（2026-09-26）：cookie 由 hook 侧经
+ * `ACTION_COOKIE_SYNC` 同步进 [TraceCookieCache]（内存 + 模块私有目录），引擎复用 [CainiaoTraceFetcher]
+ * （闸门、串行、风控退避都在那）。四条路：[onDemand] 点击时拉当前单号；[maybeAutoFetch] 富化到达时
+ * 主动批量拉；[watchFetch] 自动轮查（`AutoWatchService` 后台 3 分钟一件，前两条都需要外部触发，
+ * 轮查补的是宿主几小时不刷新的那一格）；[foregroundRefresh] 打开模块/下拉时对首页该刷的件自动做一遍
+ * 「点开详情」—— 打开模块只让宿主重读它自己的本地表，那张表不会因此变新。
  */
 object ModuleTraceFetcher {
 
-    /**
-     * 自动 / 保底拉取覆盖的状态。
-     *
-     * **「运输中」2026-09-27 才纳进来**：原先只拉到站 / 待取 / 派送中（判据是「用户马上要
-     * 动手去找的件」），于是「在等的那件」反倒成了唯一**永远不会自己更新**的 —— 用户打开
-     * 模块，到站件的卡片会自己补上动态和取件码，运输中那张却永远停在旧句子上，除非他逐个
-     * 点开详情（[onDemand] 不看状态，所以点开就有）。用户报的就是这一档。
-     *
-     * 节奏不变：保底仍是 3 分钟一件（[BACKSTOP_MIN_INTERVAL_MS]），只是可选范围变完整 ——
-     * 把在途件排除在外并不会让请求变少，只会让那份预算永远花不到它们身上。
-     */
+    /** 自动/保底拉取覆盖的状态。「运输中」2026-09-27 才纳入：原先在等的那件反倒是唯一永远不会自己更新的。 */
     private val AUTO_STATUSES = setOf(
         ExpressStatus.ARRIVED_STATION,
         ExpressStatus.READY_FOR_PICKUP,
@@ -66,35 +46,45 @@ object ModuleTraceFetcher {
         ExpressStatus.IN_TRANSIT,
     )
 
-    /**
-     * 保底拉取的最小间隔。保底的定位是「菜鸟运行时数据自己慢慢补齐」——富化是**成批**
-     * 到来的（首页刷新一次十几条），不挡的话一批就又是一串请求，14:33 那波风控就是这么来的。
-     * 3 分钟一件：一小时内自然补 20 件上限，正常首页刷新频率（几分钟一次）下感知不到延迟，
-     * 详情页数据多半在用户点开之前就已经在了。
-     */
+    /** 保底最小间隔：富化成批到来，不挡的话一批就是一串请求（14:33 那波风控）。 */
     private const val BACKSTOP_MIN_INTERVAL_MS = 3 * 60_000L
 
     @Volatile private var lastBackstopAt = 0L
 
-    private const val PREFS = "trace_fetch"
-    private const val KEY_RISK_UNTIL = "riskBlockedUntil"
+    /** 前台刷新的单号级节流（5 分钟）；用单号做键，容量天然被记录数封顶。 */
+    private val lastForegroundAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
-    /** 退避状态恢复只做一次（prefs 读一次、回调装一次）。 */
-    @Volatile private var riskRestored = false
+    /** 一次最多 6 件：真机实证 1.5s 间隔五连发第 6 个吃到风控；打开模块是高频动作，宁可多开几轮。 */
+    private const val FOREGROUND_BATCH = 6
 
     /**
-     * 诊断：已经记过的那几种「没发起拉取」的原因。
+     * 同一个单号两次「前台刷新」之间的最小间隔。
      *
-     * 三条静默 return 曾经让整条链路不可观测 —— 用户在菜鸟里没登录过淘宝账号时，模块侧
-     * 的表现是「点开详情转几秒、然后显示暂无轨迹」，和「风控退避中」「广播没送到」完全同形。
-     * 加了日志之后这三种才分得开。
-     *
-     * **必须去重**：这些判断在热路径上（[maybeBackstopFetch] 每次富化都过一遍），不去重的话
-     * 一次首页刷新就能把环形缓冲刷满，把真正有用的行挤出去。
-     *
-     * 用 `logAlways` 而非 `log`：模块进程的 INFO 受「简洁日志」开关抑制（默认开），
-     * 而这恰恰是排查时唯一想看的那一段。
+     * 5 分钟：这是**体验与风控额度的折中**，取值理由见 [lastForegroundAt]。
      */
+    private const val FOREGROUND_MIN_INTERVAL_MS = 5 * 60_000L
+
+    /**
+     * 两次「前台刷新」批次的最小间隔（用户主动下拉用 [FOREGROUND_FORCED_GAP_MS]）。
+     * `onResume` 一次启动可能跑不止一次，per-单号节流挡不住「第二批挑另外 6 件」的翻倍，所以加批次闸门；
+     * 自动与主动各记各的（2026-09-28）：用户下拉是明确指令，不能被模块刚发的自动批次吞掉。
+     */
+    private const val FOREGROUND_BATCH_GAP_MS = 60_000L
+
+    /** 用户主动下拉时的批次间隔，比自动那条短。 */
+    private const val FOREGROUND_FORCED_GAP_MS = 30_000L
+
+    @Volatile private var lastAutoBatchAt = 0L
+
+    @Volatile private var lastForcedBatchAt = 0L
+
+    /** 本地存储文件名。`internal` 是为了让备份清单引用同一份来源（同 `ExpressRecordStore.PREFS`）。 */
+    internal const val PREFS = "trace_fetch"
+    private const val KEY_RISK_UNTIL = "riskBlockedUntil"
+
+    @Volatile private var riskRestored = false
+
+    /** 已记过的「没发起拉取」原因。必须去重（热路径，否则一次首页刷新就刷满环形缓冲）；用 `logAlways`（模块 INFO 受「简洁日志」开关抑制）。 */
     private val skipNotes = Collections.synchronizedSet(HashSet<String>())
 
     private fun noteSkip(reason: String) {
@@ -102,14 +92,7 @@ object ModuleTraceFetcher {
         XposedBridge.logAlways("trace 未发起：$reason")
     }
 
-    /**
-     * 把风控退避状态接上持久化（模块进程首次用到拉取时调用）。
-     *
-     * 没有这一步，退避只活在内存里 —— 模块进程被杀（装新包 / 划掉后台 / 系统回收）就归零，
-     * 下次点详情立刻再撞一次线。15:32 的日志抓到过实证：上一进程 15:16 撞线进了 20 分钟
-     * 退避，新进程在退避期内照发不误。hook 进程不走这里（它没有模块 prefs 可写，且兜底
-     * 路径很少触发）—— 那边保持纯内存。
-     */
+    /** 把风控退避接上持久化：进程被杀退避就归零、退避期内照发不误（15:32 实证）。hook 进程不走这里（无模块 prefs 可写）。 */
     private fun ensureRiskPersisted(context: Context) {
         if (riskRestored) return
         riskRestored = true
@@ -120,20 +103,13 @@ object ModuleTraceFetcher {
         }
     }
 
-    /**
-     * 详情页点开 / 下拉：拉**当前**这一个单号。
-     *
-     * @return true 表示本进程接下了这个请求（结果会经 `ACTION_TRACE_ARRIVED` 通知 UI）；
-     *   false 表示本地没有 cookie，调用方应改发 `ACTION_TRACE_REQUEST` 给菜鸟进程兜底。
-     */
+    /** 详情页点开/下拉拉当前单号。@return false 表示本地没有 cookie，调用方应改发 `ACTION_TRACE_REQUEST` 给菜鸟进程兜底。 */
     fun onDemand(context: Context, tracking: String): Boolean {
-        // 先绑一次缓存：进程重启后内存是空的，得把上次落到模块私有目录的那份登录态读回来。
-        // 没有这一步，「模块重启 → 磁盘里明明有 cookie 却当没有」会一直存在（2026-09-26 修）。
+        // 先绑缓存：进程重启后内存是空的，要把磁盘上那份登录态读回来。
         TraceCookieCache.attach(context)
         if (TraceCookieCache.get() == null) {
             noteSkip("模块手里没有登录态（已回退给菜鸟进程拉；宿主到底有没有登录态，看有没有 cookie sync 回执）")
-            // 顺手向两个宿主各要一次：这一条由调用方转给菜鸟代拉，但**下一次**点开模块就该
-            // 能自己拉了 —— 而凭据可能在淘宝那边（菜鸟没绑淘宝账号时正是如此）。
+            // 凭据可能在淘宝那边（菜鸟没绑淘宝账号时正是如此），顺手各要一次，下次点开就能自己拉。
             HostCredentialRequester.requestFromHosts(context)
             return false
         }
@@ -146,14 +122,7 @@ object ModuleTraceFetcher {
         return true
     }
 
-    /**
-     * 保底拉取（**点击时获取**模式下的静默补充）：菜鸟运行时富化不断到来，每 3 分钟
-     * 捎带拉一件还没拉过的件（范围见 [AUTO_STATUSES]，含在途）—— 详情页的数据
-     * 多半在用户点开前就已就位。
-     *
-     * 「自动更新」模式不走这里（[maybeAutoFetch] 已经覆盖）；两者都受同一套引擎闸门
-     * （成功表 / 冷却 / 风控退避）约束，所以就算叠加也不会重复请求。
-     */
+    /** 保底拉取：每 3 分钟捎带拉一件还没拉过的（范围 [AUTO_STATUSES]）。与自动更新同受引擎闸门约束，叠加也不重复请求。 */
     fun maybeBackstopFetch(context: Context, record: ExpressRecord) {
         if (record.status !in AUTO_STATUSES) return
         val tracking = record.trackingNumber?.takeIf { it.isNotBlank() } ?: return
@@ -164,7 +133,7 @@ object ModuleTraceFetcher {
         }
         ensureRiskPersisted(context)
         val now = System.currentTimeMillis()
-        // 占坑在判断之后：间隔未到直接返回，不更新时刻（否则批内第一条之后的永远没机会）。
+        // 占坑在判断之后：间隔未到不更新时刻，否则批内第一条之后的永远没机会。
         if (now - lastBackstopAt < BACKSTOP_MIN_INTERVAL_MS) return
         lastBackstopAt = now
         CainiaoTraceFetcher.requestFetch(
@@ -174,18 +143,7 @@ object ModuleTraceFetcher {
         )
     }
 
-    /**
-     * 自动轮查的一次拉取（[AutoWatchService] 调用）。
-     *
-     * 与 [onDemand] 的区别只有一处：**允许重拉成功过的单号**（`recheck = true`）。
-     * 成功表是为「用户反复进出详情页不重复请求」建的，而轮查存在的全部意义就是
-     * 「隔一段时间再问一次」—— 被那张表挡住，轮查会安静地什么都不做（第二轮开始全被跳过），
-     * 而日志上看不出来。风控这边由轮查自己的节奏兜（3 分钟±1 分钟一件、一轮 30 分钟），
-     * 与「点开详情」那条路的节奏完全不同，所以两条必须用不同的闸门语义。
-     *
-     * 范围过滤（哪些状态值得问）在调用方 —— 那属于排程规则（`core/WatchSchedule`），
-     * 这里只负责「问一次」。
-     */
+    /** 自动轮查的一次拉取。与 [onDemand] 唯一区别是 `recheck = true`：被成功表挡住的话轮查第二轮起会安静地什么都不做；风控由轮查自己的节奏兜。范围过滤在调用方（排程规则）。 */
     fun watchFetch(context: Context, tracking: String) {
         TraceCookieCache.attach(context)
         if (TraceCookieCache.get() == null) {
@@ -201,7 +159,81 @@ object ModuleTraceFetcher {
         )
     }
 
-    /** 自动更新：富化到达时对到站 / 派送中的件主动拉（有 cookie 才拉，没有等下次同步）。 */
+    /**
+     * 打开模块/首页下拉时的前台刷新：替用户把「点开详情」那一击对首页上该刷的件自动做一遍
+     * （2026-09-27 用户报「必须点开轨迹详情才有最新信息」——叫醒宿主不会让它去问服务端）。
+     * 只碰 [AUTO_STATUSES]；每单号 [FOREGROUND_MIN_INTERVAL_MS] 内一次、一次至多 [FOREGROUND_BATCH] 件
+     * （最久没问优先）；批次闸门见 [FOREGROUND_BATCH_GAP_MS]；最后仍受引擎闸门（2.5s 串行、
+     * 风控退避）约束，不绕过风控。[force] 是用户主动刷新，不受单号级节流挡，引擎闸门照旧。
+     */
+    fun foregroundRefresh(
+        context: Context,
+        records: List<ExpressRecord>,
+        reason: String,
+        force: Boolean = false,
+    ): Int {
+        val candidates = records
+            .filter { it.status in AUTO_STATUSES }
+            .mapNotNull { it.trackingNumber?.takeIf { tn -> tn.isNotBlank() } }
+            .distinct()
+        if (candidates.isEmpty()) return 0
+
+        TraceCookieCache.attach(context)
+        if (TraceCookieCache.get() == null) {
+            noteSkip("前台刷新跳过：模块手里没有登录态（等一次宿主回执，或先在免 root 页登录淘宝）")
+            // 顺手要一次：凭据可能在淘宝那边（菜鸟没绑淘宝账号时正是如此），下一次打开就能自己拉了。
+            HostCredentialRequester.requestFromHosts(context)
+            return 0
+        }
+        if (CainiaoTraceApi.riskBlocked()) {
+            // 退避期内不占节流坑，否则退避结束时所有件都被记成「刚问过」，反而一件都问不了。
+            noteSkip(
+                "前台刷新跳过：正在风控退避中，约 " +
+                    "${((CainiaoTraceApi.riskBlockedUntil - System.currentTimeMillis()) / 60_000L).coerceAtLeast(1L)} " +
+                    "分钟后可再试",
+            )
+            return 0
+        }
+        ensureRiskPersisted(context)
+
+        val now = System.currentTimeMillis()
+        // 批次闸门排在 per-单号 节流之前：先决定这批做不做。被挡时不占单号的坑，
+        // 否则重复触发把件白白记成「刚问过」；自动与主动各查各的时刻。
+        val previousBatchAt = if (force) lastForcedBatchAt else lastAutoBatchAt
+        val batchGap = if (force) FOREGROUND_FORCED_GAP_MS else FOREGROUND_BATCH_GAP_MS
+        if (previousBatchAt > 0L && now - previousBatchAt < batchGap) {
+            // 文案不带秒数：noteSkip 按整串去重，带上变化的数字会让这条每次都记一遍。
+            val gapSeconds = batchGap / 1000L
+            noteSkip("前台刷新跳过：刚刷过一批（批次间隔 $gapSeconds 秒）")
+            return 0
+        }
+
+        val due = candidates
+            .filter { tn -> force || now - (lastForegroundAt[tn] ?: 0L) >= FOREGROUND_MIN_INTERVAL_MS }
+            // 最久没问过的排前面，固定的「前 N 件」会让后面的件永远排不上。
+            .sortedBy { lastForegroundAt[it] ?: 0L }
+            .take(FOREGROUND_BATCH)
+        if (due.isEmpty()) return 0
+
+        if (force) lastForcedBatchAt = now else lastAutoBatchAt = now
+        due.forEach { tn ->
+            lastForegroundAt[tn] = now
+            CainiaoTraceFetcher.requestFetch(
+                cookieProvider = { TraceCookieCache.get() },
+                tracking = tn,
+                // recheck = true：默认 false 会被成功表挡住（那是「点开详情不重复请求」用的）。
+                recheck = true,
+                deliver = { enriched -> deliverLocally(context, enriched) },
+            )
+        }
+        XposedBridge.logAlways(
+            "trace 前台刷新（$reason）：发起 ${due.size} 件 / 候选 ${candidates.size} 件" +
+                if (force) "（用户主动）" else "",
+        )
+        return due.size
+    }
+
+    /** 自动更新：富化到达时对到站/派送中的件主动拉（有 cookie 才拉，没有等下次同步）。 */
     fun maybeAutoFetch(context: Context, record: ExpressRecord) {
         if (record.status !in AUTO_STATUSES) return
         val tracking = record.trackingNumber?.takeIf { it.isNotBlank() } ?: return
@@ -219,24 +251,13 @@ object ModuleTraceFetcher {
     }
 
     /**
-     * 拉取结果直接落库（同进程，不用绕广播），再发内部通知让 UI 重读。
-     *
-     * 落库走 [ExpressRecordStore.enrich]：按运单号配对、「只填空」合并 —— 与广播通道
-     * 完全同一套规则，只是少了一次进程间跳转。
-     *
-     * ## 两条广播都要发（2026-09-27）
-     *
-     * [ExpressRelay.ACTION_TRACE_ARRIVED] 是给**详情页**的（收掉刷新指示器 + 重读），
-     * [ExpressRelay.ACTION_RECORDS_CHANGED] 是给**首页**的（重读列表）——
-     * 拉取多半发生在后台，而用户此刻可能停在首页：只发前者的话，首页那张卡片上的
-     * 地址 / 商品图要等下一次 onResume 才更新。两条的接收语义不同（见各自的注释），
-     * 不能合并成一条。
-     *
-     * 这里不节流：拉取本身被引擎的闸门挡着（成功表 / 冷却 / 风控退避），一次一件。
-     *
-     * `internal` 是给直连兜底（`CainiaoDirectFetcher`）用的：它拿到运单号之后的落库与广播
-     * 必须走**同一份实现** —— 抄一份出来迟早漏发那条 `RECORDS_CHANGED`，而那种 bug 的表现是
-     * 「数据其实到了，首页就是不动」。
+     * 拉取结果直接落库（同进程，走 [ExpressRecordStore.enrich] 按运单号配对、只填空）再发通知让 UI 重读。
+     * 两条广播都要发：[ExpressRelay.ACTION_TRACE_ARRIVED] 给详情页，[ExpressChangeNotifier]（内部发
+     * `ACTION_RECORDS_CHANGED`）给首页 —— 拉取多半发生在后台，只发前者的话首页要等下一次 onResume
+     * 才更新，两条接收语义不同不能合并。后者交给 [ExpressChangeNotifier]：免 root 采集也发那条，
+     * 「怎么发、怎么节流」必须只有一份实现。
+     * `internal` 给直连兜底（`CainiaoDirectFetcher`）共用同一份实现：抄一份会漏发 `RECORDS_CHANGED`，
+     * 表现是「数据其实到了，首页就是不动」。
      */
     internal fun deliverLocally(context: Context, record: ExpressRecord) {
         val applied = ExpressRecordStore.enrich(context, record)
@@ -245,9 +266,7 @@ object ModuleTraceFetcher {
             context.sendBroadcast(
                 Intent(ExpressRelay.ACTION_TRACE_ARRIVED).setPackage(context.packageName),
             )
-            context.sendBroadcast(
-                Intent(ExpressRelay.ACTION_RECORDS_CHANGED).setPackage(context.packageName),
-            )
         }
+        ExpressChangeNotifier.notify(context)
     }
 }

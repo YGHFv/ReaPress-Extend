@@ -27,40 +27,13 @@ import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
 
 /**
  * 被注入进程 → 模块 App 进程的事件投递。
- *
- * ## 两个来源，同一份协议
- *
- * - [send]：system_server 拦到通知后投递（`ACTION_DELIVER`）
- * - [sendEnrichment]：宿主 App 进程富化出包裹后投递（`ACTION_ENRICH`）
- *
- * 两者的 Context 来源完全不同，这是这个类里唯一需要分情况的地方：
- * system_server 没有现成 Context（见 [SystemContextHolder]），而宿主进程里
- * `ActivityThread.currentApplication()` 直接就能拿到（见 [HostContextHolder]）。
- * Intent 的构造、显式组件寻址、flag 组合则完全共用 —— 协议只有一份，
- * 两个发送端如果各写一份 `putExtra` 迟早会漏字段。
- *
- * ## 为什么是广播
- *
- * - `RemotePreferences` 是给设置用的（hooked 侧只读），不适合流式事件
- * - `XposedService` 的 binder 只递到模块 App 进程，别的进程里拿不到
- * - 广播 + **显式组件** + `FLAG_INCLUDE_STOPPED_PACKAGES` 是唯一能在「模块 App 从没启动过」
- *   的情况下把事件送到的通道。模块装完长期处于 stopped 状态，这个 flag 是必需的。
+ * 广播 + 显式组件 + `FLAG_INCLUDE_STOPPED_PACKAGES`：模块装完长期 stopped，这个 flag 是必需的。
  */
 internal object ExpressRelaySender {
 
-    /** 取不到 context 时只记一次日志，避免刷屏。 */
     @Volatile private var contextFailureLogged = false
 
-    /**
-     * system_server 侧：拦到通知之后投递。
-     *
-     * @return true = 广播已经交给系统。**它只说明「这一跳发出去了」，不说明模块侧处理成功** ——
-     *   后面还有异步的一跳（模块进程落库 + 发通知），这里看不到结果。
-     *
-     *   返回值唯一的用途在 [SystemServerHook.deliver]：**拦截模式靠它决定要不要吞掉原通知**。
-     *   取不到 context、或发广播抛异常时返回 false —— 那种情况下后面不可能再有人发通知，
-     *   还吞掉原通知就是**静默丢通知**（用户什么都看不到）。
-     */
+    /** system_server 侧投递。false 时 [SystemServerHook.deliver] 不可再吞原通知（否则静默丢通知）。 */
     fun send(
         record: ExpressRecord,
         thisObject: Any? = null,
@@ -77,15 +50,7 @@ internal object ExpressRelaySender {
         return deliver(context, record, ExpressRelay.ACTION_DELIVER, contentIntent, intentUri, intentToken)
     }
 
-    /**
-     * system_server 侧：这条通知按「通知拦截」设置被**吞掉**了（[ExpressRelay.ACTION_INTERCEPTED]）。
-     *
-     * 与 [send] 走同一套 Intent 构造：接收侧只需要落一条审计记录，但记录里要有原文、
-     * 有分类、有跳转 —— 这些载荷与投递那条完全一样，不值得再写第二份 `putExtra`。
-     *
-     * **它必须与「吞掉」这个动作分开成功/失败**：广播送不到时，拦截照样生效（用户要的结果
-     * 就是别出现），只是模块里看不到这条记录 —— 那个缺口由 `EXPRESS DROPPED` 那行日志兜着。
-     */
+    /** 通知按「通知拦截」被吞掉时的投递；广播失败时拦截照样生效，缺口由 `EXPRESS DROPPED` 日志兜着。 */
     fun sendIntercepted(
         record: ExpressRecord,
         thisObject: Any? = null,
@@ -101,11 +66,10 @@ internal object ExpressRelaySender {
         }
     }
 
-    /** 宿主 App 进程侧：富化出包裹之后投递。 */
+    /** 宿主 App 进程侧富化投递。 */
     fun sendEnrichment(record: ExpressRecord, context: Context?) {
         val resolved = context ?: HostContextHolder.acquire()
         if (resolved == null) return logContextFailure()
-        // 富化没有「原通知」，也就没有跳转令牌 —— 只有 deliver 那条路会带。
         deliver(
             resolved,
             record,
@@ -116,23 +80,7 @@ internal object ExpressRelaySender {
         )
     }
 
-    /**
-     * 宿主 App 进程侧：把「本地包裹表自查」的结论送回模块进程
-     * （[ExpressRelay.ACTION_HOST_QUERY_REPORT]）。
-     *
-     * ## 为什么这条日志不能就地打
-     *
-     * 自查跑在**宿主进程**里，那里的 `XposedBridge.logAlways` 走 libxposed 的出口 → logcat；
-     * 而 MIUI / HyperOS 上 logcat 读不出来（`logcat -g` 报 `0 B readable`），LSPosed 的
-     * 日志文件 adb 也碰不到。结果是「自查跑没跑成」在宿主侧完全不可观测 ——
-     * 而排查时需要的恰恰就是这一句：跑没跑 / 跑了但查成空 / 压根没跑，三种情况的修法不同。
-     *
-     * 所以走 relay 送回模块进程，由它记进 `files/module-log.txt`（唯一一处
-     * `adb shell run-as` 能直接读、且不受「简洁日志」开关影响的地方）。
-     *
-     * **只送结论，不送包裹内容** —— 数据走 [sendEnrichment] 那条老路。
-     * 失败只记日志：这是诊断信息，丢了不影响任何功能。
-     */
+    /** 宿主自查结论送回模块进程；MIUI logcat 不可读，结论必须 relay 落盘。只送结论，不送包裹内容。 */
     fun sendHostQueryReport(context: Context, text: String) {
         runCatching {
             val intent = Intent(ExpressRelay.ACTION_HOST_QUERY_REPORT)
@@ -144,16 +92,7 @@ internal object ExpressRelaySender {
         }.onFailure { XposedBridge.logError("host self query report failed", it) }
     }
 
-    /**
-     * 宿主 App 进程侧：把**新接平台（拼多多）的字段探针**结论送回模块进程
-     * （[ExpressRelay.ACTION_HOST_PROBE]，发起者是 [PddPackageHook]）。
-     *
-     * 与 [sendHostQueryReport] 逐字同一套理由（宿主侧结论在模块侧不落字就等于没发生，
-     * 见那个函数的说明），**刻意不共用 action** 也见 [ExpressRelay.ACTION_HOST_PROBE]
-     * 的注释：那条的接收侧会顺手给「菜鸟直连兜底」报个到，按到拼多多头上是错的。
-     *
-     * 只送一句诊断文本；失败只记日志（诊断信息丢了不影响任何功能）。
-     */
+    /** 同上送回拼多多探针结论；不共用 action（那条接收侧会顺手给菜鸟直连兜底报到）。 */
     fun sendHostProbe(context: Context, text: String) {
         runCatching {
             val intent = Intent(ExpressRelay.ACTION_HOST_PROBE)
@@ -165,18 +104,7 @@ internal object ExpressRelaySender {
         }.onFailure { XposedBridge.logError("host probe report failed", it) }
     }
 
-    /**
-     * system_server 侧：把「代发唤醒销」的结果送回模块进程
-     * （[ExpressRelay.ACTION_WAKE_REPORT]，执行者是 [SystemWakeRelay]）。
-     *
-     * 与 [sendHostQueryReport] 是同一个理由的两份实例：**system_server 里的结论在模块侧
-     * 不落字就等于没发生**（logcat 在 HyperOS 上读不出来、LSPosed 的日志文件 adb 碰不到）。
-     * 而这一跳失败的形态恰恰是「静默」—— 通道没注册上时没人接模块的请求，两边都不写日志，
-     * 于是「通道没立起来」和「销发了但被 ROM 拦」分不开。所以注册成功要播报一次，
-     * 每次代发要给回执。
-     *
-     * **只送结论，不送数据**；失败只记日志。
-     */
+    /** 唤醒销代发结果回执；这一跳失败的形态是静默，故注册播报一次、每次代发给回执。 */
     fun sendWakeReport(context: Context, text: String) {
         runCatching {
             val intent = Intent(ExpressRelay.ACTION_WAKE_REPORT)
@@ -188,29 +116,11 @@ internal object ExpressRelaySender {
         }.onFailure { XposedBridge.logError("wake report failed", it) }
     }
 
-    /**
-     * system_server 侧：**把模块索要的跳转令牌还给它**
-     * （[ExpressRelay.ACTION_INTENT_TOKEN_ARRIVED]，执行者是 [IntentTokenRelay]）。
-     *
-     * ## 为什么要专门一个发送函数，而不是复用 [deliver]
-     *
-     * [deliver] 那一套是「一条快递记录」的载荷（十几个 extra + 记录本身），而这里的载荷只有
-     * 「是哪条记录」+「令牌本体」两样。硬套过去要先编一条假记录，反而更容易写错。
-     *
-     * ## 令牌为 null 时为什么还要发
-     *
-     * 「system_server 已经没有了」（LRU 淘汰 / 设备重启过）与「通道没注册上、请求没人接」
-     * 在模块侧看到的现象一样（都是「令牌没到」），但处置完全不同：前者只能退到快照、
-     * 后者是 hook 侧的问题。空手回执把两者分开 —— 与 [sendCookieSync] 读不到 cookie 时
-     * 也要发一条带原因的广播是同一条理由。
-     *
-     * 显式组件寻址：载荷里是令牌本体，只有本模块收得到。
-     */
+    /** 把模块索要的跳转令牌还给它。token 为 null 也要发：空手回执把「通道没注册上」和「没找到」分开。 */
     fun sendIntentToken(context: Context, entryId: String, token: PendingIntent?) {
         runCatching {
             val intent = Intent(ExpressRelay.ACTION_INTENT_TOKEN_ARRIVED)
                 .setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
-                // 模块进程可能刚被回收（正是这条链路要服务的场景）—— 没这个 flag 会静默丢弃。
                 .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
                 .putExtra(ExpressRelay.EXTRA_INTENT_ENTRY_ID, entryId)
             token?.let { intent.putExtra(ExpressRelay.EXTRA_NOTIFICATION_INTENT, it) }
@@ -219,24 +129,12 @@ internal object ExpressRelaySender {
         }.onFailure { XposedBridge.logError("intent token return failed", it) }
     }
 
-    /** cookie 同步的最小间隔。cookie 会轮换，但不值得追着每次投递都发 —— 半小时足够新。 */
+    /** cookie 同步的最小间隔。 */
     private const val COOKIE_SYNC_INTERVAL_MS = 30 * 60_000L
 
     @Volatile private var lastCookieSyncAt = 0L
 
-    /**
-     * 宿主 App 进程侧：把淘宝登录态 cookie 同步给模块进程（[ExpressRelay.ACTION_COOKIE_SYNC]）。
-     *
-     * 模块进程自己发 MTOP 请求要有登录态，而 cookie 只在菜鸟私有目录里，只能由这里读出来送。
-     * 接收侧落内存 + 模块私有目录（[io.github.YGHFv.ReaPressExtend.relay.TraceCookieCache]）。
-     *
-     * @param force 模块主动索要时传 true，跳过 [COOKIE_SYNC_INTERVAL_MS] 节流。
-     *
-     * **为什么需要 force**：节流是按「宿主什么时候刷新首页」算的，而模块可能**刚重启**
-     * （内存缓存归零、磁盘那份又过期或被清），此刻它是真没有登录态 —— 而节流不会因为
-     * 「接收方丢了」而放行。用户正站在驿站门口点「获取身份码」，等 30 分钟是不行的。
-     * 节流防的是「每次首页查询都传一遍登录态」，不是防「对方明确要了一次」。
-     */
+    /** 宿主侧把淘宝登录态 cookie 同步给模块进程；force 供模块主动索要时跳过节流。 */
     fun sendCookieSync(context: Context, force: Boolean = false) {
         val now = System.currentTimeMillis()
         if (!force && now - lastCookieSyncAt < COOKIE_SYNC_INTERVAL_MS) return
@@ -246,16 +144,10 @@ internal object ExpressRelaySender {
             val intent = Intent(ExpressRelay.ACTION_COOKIE_SYNC)
                 .setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
             if (cookie.isNullOrBlank()) {
-                // 读不到也**发一条只带原因的广播**，而不是静默返回。
-                //
-                // 静默的代价（2026-09-26 实测）：模块侧看到的是一片空白 —— 没有 `cookie synced`、
-                // 没有轨迹、没有报错，与「宿主这半天没刷新过首页」完全同形，用户报的「这台设备
-                // 怎么都获取不了」就卡在无法区分上。带上原因之后，模块日志里能直接读到
-                // 「宿主说它没有登录态」，而不是继续猜。
+                // 读不到也发一条只带原因的回执：静默与「宿主没刷新过首页」完全同形、无法区分。
                 intent.putExtra(
                     ExpressRelay.EXTRA_COOKIE_ERROR,
-                    // 具体原因由读取侧给出（文件不见了 / 库里没有这个域 / 打开失败），
-                    // 这里只兜住「连原因都没记下来」的情况。
+                    // 具体原因由读取侧给出，这里只兜住「连原因都没记下来」的情况。
                     HostCredentialSource.lastReason
                         .ifBlank { "宿主侧没有可用登录态（读取方没记下原因）" },
                 )
@@ -264,17 +156,13 @@ internal object ExpressRelaySender {
                 return
             }
             intent.putExtra(ExpressRelay.EXTRA_COOKIE, cookie)
-                // 菜鸟 WebView 的真实 UA 随 cookie 一起送过去：模块进程发 MTOP 请求时用它，
-                // 让 UA 与 cookie 的画像一致（浏览器 UA 配菜鸟登录态本身就是风控特征）。
-                // getDefaultUserAgent 首次调用会起 WebView 进程，可能要几百毫秒 —— 但这条
-                // 链路 30 分钟才走一次，且在 hook 回调线程上，不卡宿主主线程。
+                // UA 随 cookie 一起送：让 MTOP 请求的 UA 与 cookie 画像一致。
                 .putExtra(ExpressRelay.EXTRA_COOKIE_UA, webviewUa(context))
             context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
             XposedBridge.log("cookie synced to module (${cookie.length} chars, force=$force)")
         }.onFailure { XposedBridge.logError("cookie sync failed", it) }
     }
 
-    /** 菜鸟进程内 WebView 的默认 UA；拿不到返回 null（模块侧退回内置的浏览器 UA）。 */
     private fun webviewUa(context: Context): String? = runCatching {
         android.webkit.WebSettings.getDefaultUserAgent(context)
     }.getOrNull()
@@ -286,20 +174,7 @@ internal object ExpressRelaySender {
         }
     }
 
-    /**
-     * 统一的投递出口。
-     *
-     * @param contentIntent 原通知的跳转令牌（只有通知侧有）。传的是 Parcelable，接收侧拿到
-     *   就能直接 `send()` —— 它的创建者是宿主，AMS 会按宿主的身份放行。
-     * @param intentUri 同一跳转的**可落盘快照**（见 [ExpressRelay.EXTRA_NOTIFICATION_INTENT_URI]）。
-     *   两个都带：令牌保真但出不了这次广播，快照有损但能存进记录、跨进程重启仍可用。
-     * @param intentToken 令牌在 system_server 侧的句柄（[IntentTokenStore.stash]）——
-     *   模块进程被回收后再来取的那条路，见 [ExpressRelay.EXTRA_INTENT_TOKEN]。
-     * @param extra 动作专属的额外字段（如拦截那条的分类）。
-     * @return true = `sendBroadcastAsUser` 没有抛异常（已交给系统）。**不代表对方收到了** ——
-     *   模块进程没起来、被冻结、或者接收器被停用，系统都会静默丢弃，这一层看不见。
-     *   唯一的例外用途见 [send] 的说明。
-     */
+    /** 统一投递出口。true 只代表 sendBroadcastAsUser 没抛异常，不代表对方收到了（系统会静默丢弃）。 */
     private fun deliver(
         context: Context,
         record: ExpressRecord,
@@ -317,12 +192,7 @@ internal object ExpressRelaySender {
             intentToken?.takeIf { it.isNotBlank() }
                 ?.let { intent.putExtra(ExpressRelay.EXTRA_INTENT_TOKEN, it) }
             extra?.invoke(intent)
-            // 显式指定组件：模块 App 的接收器。隐式广播在 Android 8+ 受限，且我们本来就知道
-            // 目标是谁 —— 显式投递既可靠又不会被别的应用截获。
             intent.setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
-            // 投到**发起方所在用户**。system_server 里用 Process.myUserHandle()；
-            // 宿主进程里用自己进程的 user —— 两者语义一致，避免写死 UserHandle.of(0)
-            // （后者在部分 SDK 上是 @hide，编译期过不去）。
             context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
 
             XposedBridge.log(
@@ -331,7 +201,6 @@ internal object ExpressRelaySender {
             )
             true
         }.getOrElse {
-            // 投递失败只记日志，绝不让异常冒到宿主/系统的调用栈上。
             XposedBridge.logError("relay failed", it)
             false
         }
@@ -339,9 +208,7 @@ internal object ExpressRelaySender {
 
     private fun buildIntent(record: ExpressRecord, action: String): Intent =
         Intent(action).apply {
-            // 模块 App 可能处于 stopped 状态（装完没打开过），没有这个 flag 收不到广播。
             addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
-            // 提升优先级：快递通知有时效性，别排在后台广播队列末尾。
             addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
             putExtra(ExpressRelay.EXTRA_SOURCE_PACKAGE, record.sourcePackage)
             putExtra(ExpressRelay.EXTRA_TITLE, record.title)
@@ -356,18 +223,14 @@ internal object ExpressRelaySender {
             putExtra(ExpressRelay.EXTRA_TIMESTAMP, record.timestamp)
             putExtra(ExpressRelay.EXTRA_PLATFORM, record.platform)
             putExtra(ExpressRelay.EXTRA_GOODS_NAME, record.goodsName)
-            // 0 表示「没有」：putExtra 收不了 null，而时间戳本身不可能是 0。
             putExtra(ExpressRelay.EXTRA_ARRIVAL_AT, record.arrivalAt ?: 0L)
             putExtra(ExpressRelay.EXTRA_LOGISTICS_DETAIL, record.logisticsDetail)
             putExtra(ExpressRelay.EXTRA_STATION_HOURS, record.stationHours)
-            // 坐标用 NaN 表示「没有」：putExtra 收不了 null，而 NaN 本身也不是合法坐标
-            // （0 是几内亚湾上的一个点，接收端会把它当成有效值）。
+            // 坐标用 NaN 表示「没有」：接收端会把 0 当有效值。
             putExtra(ExpressRelay.EXTRA_STATION_LAT, record.stationLat ?: Double.NaN)
             putExtra(ExpressRelay.EXTRA_STATION_LNG, record.stationLng ?: Double.NaN)
             putExtra(ExpressRelay.EXTRA_STATION_ADDRESS, record.stationAddress)
             putExtra(ExpressRelay.EXTRA_GOODS_IMAGE, record.goodsImage)
-            // 轨迹条数不定，编成一个字符串传（编解码只有 ExpressTraceCodec 一处）。
-            // 空轨迹传 null —— 接收端解出来就是空表，与「没查过」等价。
             putExtra(
                 ExpressRelay.EXTRA_TRACE,
                 record.trace.takeIf { it.isNotEmpty() }?.let { ExpressTraceCodec.encode(it) },

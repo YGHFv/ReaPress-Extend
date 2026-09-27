@@ -23,22 +23,8 @@ import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsKeys
 import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
 
 /**
- * 看门狗状态回传。
- *
- * ## 为什么必须走广播
- *
- * 看门狗状态存在 `/data/system/`（system_server 是 `system` uid，只能写自己的地盘）。
- * 那个目录权限是 `0771 system:system`，模块 App 连**目录都进不去** —— 文件设成 0644 也没用，
- * 因为路径解析在目录那一层就被拒绝了（实测 `Permission denied`）。
- *
- * 所以状态只能由 system_server 主动推过来。推送时机是**每次开机安装 hook 之后**：
- * 那时 [SystemContextHolder.acquireFromActivityThread] 已经能拿到 context，
- * 且「被拒绝安装」这个最关键的信息正好在这时产生。
- *
- * ## 为什么每次开机都推，而不是只在熔断时推
- *
- * 只在熔断时推的话，用户看到的是「上次的旧状态」或「从未收到」—— 分不清
- * 「一切正常」和「广播没送到」。每次开机推一次，UI 就能显示带时间戳的确定状态。
+ * 看门狗状态回传。`/data/system` 模块 App 连目录都进不去，状态只能由 system_server 主动广播推过来；
+ * 推送时机是每次开机安装 hook 之后（「被拒绝安装」这个最关键的信息正好在那时产生）。
  */
 internal object WatchdogReporter {
 
@@ -49,15 +35,10 @@ internal object WatchdogReporter {
     const val EXTRA_REASON = "reason"
     const val EXTRA_DESCRIBE = "describe"
 
-    /**
-     * 把本次开机的看门狗决定推给模块 App 进程。
-     *
-     * @param installed hook 是否装上了
-     * @param describe [Watchdog.describe] 的输出（attempt/ok/failures）
-     */
+    /** 把本次开机的看门狗决定推给模块 App 进程。 */
     fun reportBoot(context: Context?, installed: Boolean, describe: String) {
         if (context == null) {
-            // 拿不到 context 只影响 UI 显示，不影响 hook 本身。记一行即可。
+            // 拿不到 context 只影响 UI 显示，不影响 hook。
             XposedBridge.log("watchdog report skipped: no system context available")
             return
         }
@@ -79,8 +60,7 @@ internal object WatchdogReporter {
                 putExtra(EXTRA_DESCRIBE, describe)
             }
             context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
-            // logAlways 而不是 log：这行是「状态有没有推出去」的唯一证据，
-            // 被「简洁日志」吞掉的话，用户报「诊断页一直显示未知」时就无从查起。
+            // logAlways：这行是「状态有没有推出去」的唯一证据，不能被简洁日志吞掉。
             XposedBridge.logAlways("watchdog state pushed to module app: installed=$installed $describe")
         }.onFailure {
             XposedBridge.logError("watchdog report failed", it)
@@ -88,14 +68,9 @@ internal object WatchdogReporter {
     }
 
     /**
-     * 模块 App 侧：把收到的状态落进本地 prefs。
-     *
-     * 落盘而不是只留在内存：模块进程随时可能被回收，界面每次打开都要能显示上次开机的结果。
-     *
-     * **不写 `KEY_HOOK_DISABLED_BY_WATCHDOG`**：广播只知道「装没装上」，分不清是看门狗熔断
-     * 还是 ROM 不兼容（方法被改名、框架缺 PROP_CAP_SYSTEM）。把后者也标成「看门狗熔断」会让
-     * 用户去复位一个根本没熔断的东西。熔断是真事时会由 [lastBootDescribe] 里的
-     * `disabled=true` 体现，界面据此显示。
+     * 模块 App 侧：把收到的状态落进本地 prefs（模块进程随时可能被回收）。
+     * 不写 `KEY_HOOK_DISABLED_BY_WATCHDOG`：广播分不清看门狗熔断与 ROM 不兼容，
+     * 后者被标成熔断会让用户去复位一个没熔断的东西；真熔断由 describe 里的 `disabled=true` 体现。
      */
     fun persistLocally(context: Context, intent: Intent) {
         if (intent.action != ACTION_WATCHDOG_STATUS) return

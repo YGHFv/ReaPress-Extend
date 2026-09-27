@@ -27,44 +27,18 @@ import java.util.Collections
 import java.util.concurrent.Executors
 
 /**
- * 补齐宿主首页给不出的东西：全轨迹、驿站完整地址、商品图、以及**运单动态**
- * （末条轨迹，见 [apply] 里那段说明 —— 首页卡片那句动态以前只跟着宿主富化走）。
- *
- * ## 按需拉，不批量自动拉
- *
- * 2026-09-26 真机实证：首页刷新时批量自动拉，1.5s 间隔五连发后第 6 个就吃到淘宝
- * `RGV587` 风控 —— 批量节奏天然撞风控。改为**用户点开详情页时拉单个**（模块 App 经
- * `ExpressRelay.ACTION_TRACE_REQUEST` 把单号发过来）：用户的一次点击就是一次请求，
- * 时机、频率全由人手决定，节奏和人手一致，风控压力最小。也因此**不再按状态过滤** ——
- * 用户点开哪个就看哪个，运输中 / 待揽收的轨迹同样有价值。
- *
- * ## 三道闸门
- *
- * 1. **单号去重**：成功过**的运单号永不再拉（[succeeded]）—— 用户反复进出详情页、反复下拉
- *    都不会重复请求。**失败的只进冷却表（[failedAt]），不进成功表**：一次风控之后占坑的
- *    单号永远静默（「详情怎么都刷新不出来」的原始 bug），失败必须给重试的机会，只是要隔够
- *    [RETRY_COOLDOWN_MS]；
- * 2. **串行 + 最小间隔**（[executor] + [MIN_INTERVAL_MS]）：用户快速连点几个详情也不会
- *    打出连发（那是最容易被风控盯上的形状）。撞到风控时再加全线退避
- *    （[CainiaoTraceApi.riskBlocked]），那 10 分钟里连坑都不占；
- * 3. **不重试不追赶**：请求被闸门挡下就是挡下了，不排队不补拉 —— 下次点开详情再试。
- *
- * ## 结果怎么回去
- *
- * 复用现有的 `ACTION_ENRICH` 通道，投一条**带新字段的记录**出去（[stubRecord] 拼的最小原型，
- * 只带运单号）。模块 App 侧 `ExpressRecordStore.enrich` 会按运单号匹配回原来那条，然后走
- * `mergeEnrichment` 的「只填空」把轨迹 / 地址 / 商品图补上 —— 不需要为这条数据另开一套协议。
+ * 按需拉单个运单号的全轨迹、驿站地址、商品图、运单动态（模块 App 点开详情时经
+ * ACTION_TRACE_REQUEST 把单号发过来）。9-26 实证：批量自动拉 1.5s 间隔五连发，第 6 个就吃到
+ * 淘宝 RGV587 风控——改用户点开才拉，不再按状态过滤。
+ * 闸门：成功过的单号永不再拉，失败的只进冷却表（隔够 [RETRY_COOLDOWN_MS] 才能重试，否则一次
+ * 风控后单号永远静默）；串行 + 最小间隔；被挡下就挡下，不重试不追赶。
+ * 结果经 [stubRecord] 走 ACTION_ENRICH 通道，模块侧按运单号匹配回原记录走「只填空」合并。
  */
 internal object CainiaoTraceFetcher {
 
-    /**
-     * 相邻两次请求的最小间隔。真机实证（2026-09-26）：1.5s 五连发成功、第 6 个的预热就吃到
-     * `RGV587` 风控 —— 临界就在 5~6 连发之间。按需拉取后连点详情仍可能打成小连发，
-     * 保留这条间隔把请求拉开。
-     */
+    /** 相邻两次请求的最小间隔。真机实证临界在 5~6 连发之间，按需拉取后连点详情仍可能打成小连发。 */
     private const val MIN_INTERVAL_MS = 2_500L
 
-    /** 单号失败后的重试冷却。风控的处罚窗口是分钟级的，撞完立刻重试只会延长它。 */
     private const val RETRY_COOLDOWN_MS = 10 * 60_000L
 
     private const val MAX_SUCCEEDED = 256
@@ -73,34 +47,23 @@ internal object CainiaoTraceFetcher {
         Thread(runnable, "reapress-cainiao-trace").apply { isDaemon = true }
     }
 
-    /** 拉成功过的运单号，永不再拉。容量到顶就整体清空 —— 清空的代价（重拉几次）远小于无限增长。 */
+    /** 拉成功过的运单号，永不再拉。容量到顶就整体清空——重拉几次的代价远小于无限增长。 */
     private val succeeded = Collections.synchronizedSet(HashSet<String>())
 
-    /** 失败过的运单号 → 上次尝试时刻（epoch ms）。冷却期内不重试；成功后从中移除。 */
     private val failedAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
-    /** 已入队还没记账的运单号：防并发重复入队（add 原子，第二个线程会直接返回）。 */
     private val inFlight = Collections.synchronizedSet(HashSet<String>())
 
-    /** 上次发出请求的时刻，用于拉开间隔。只有 [executor] 那一个线程访问，不需要同步。 */
     private var lastRequestAt = 0L
 
     @Volatile private var fetched = 0
 
     /**
      * 拉单个运单号的全轨迹（闸门 → 串行执行 → [deliver] 投递结果）。
-     *
-     * @param cookieProvider 每次执行时现取 cookie（hook 进程读菜鸟文件；模块进程读
-     *   [io.github.YGHFv.ReaPressExtend.relay.TraceCookieCache] 内存缓存）
-     * @param deliver 拉到结果后怎么投：hook 进程走 relay 广播；模块进程直接落库
-     * @param recheck true = **允许重拉成功过的单号**（自动轮查用）。默认 false，
-     *   成功表（[succeeded]）是「用户反复进出详情页不重复请求」的判据；而轮查的整个
-     *   意义就是**隔一段时间再问一次**，被那张表挡住就等于轮查什么都没干。
-     *   两种语义不能共用一个默认值，所以做成显式开关而不是放宽成功表 ——
-     *   放宽会让「点开详情」也变成每次重拉，风控压力立刻翻几倍。
-     *
-     * 被任何一道闸门挡下都**静默返回**：调用方（UI）另有超时降级，这里不需要也不应该
-     * 反向通知 —— 反向通道会把「UI 等 hook 回应」变成双向协议，复杂度翻倍收益为零。
+     * recheck=true 允许重拉成功过的单号（自动轮查用）：轮查的意义就是隔段时间再问一次，
+     * 被成功表挡住等于什么都没干；放宽成功表会让「点开详情」也每次重拉、风控压力翻倍，
+     * 所以做成显式开关。被任何闸门挡下都静默返回：调用方另有超时降级，反向通知会把
+     * 「UI 等 hook 回应」变成双向协议。
      */
     fun requestFetch(
         cookieProvider: () -> String?,
@@ -108,11 +71,10 @@ internal object CainiaoTraceFetcher {
         recheck: Boolean = false,
         deliver: (ExpressRecord) -> Unit,
     ) {
-        // 退避期内的所有判断都放在占坑**之前**：这时候连「成功表」「冷却表」都不该动，
-        // 否则一次退避期里的连点会把整批单号记成失败，退避一结束又全被冷却挡住。
+        // 退避期内的所有判断放在占坑之前：否则一次退避期里的连点会把整批单号记成失败，
+        // 退避一结束又全被冷却挡住。
         if (CainiaoTraceApi.riskBlocked()) return
         val now = System.currentTimeMillis()
-        // in-flight 占坑防的是并发重复入队，不代表结果成败 —— 成败由 executor 闭包最后一步记账。
         if (!inFlight.add(tracking)) return
         if (!recheck && tracking in succeeded) {
             inFlight.remove(tracking)
@@ -141,10 +103,8 @@ internal object CainiaoTraceFetcher {
                         "img=${info.goodsImage != null}",
                 )
             }.onFailure {
-                // 这条链路是「锦上添花」，任何异常都不该影响宿主 —— 记日志就行。
                 XposedBridge.logError("cainiao trace 失败（已忽略）", it)
             }
-            // 记账是闭包的最后一步：不管走的是 return@execute、异常还是正常路径都会执行。
             inFlight.remove(tracking)
             if (ok) {
                 if (succeeded.size >= MAX_SUCCEEDED) succeeded.clear()
@@ -156,7 +116,6 @@ internal object CainiaoTraceFetcher {
         }
     }
 
-    /** 与上一次请求拉开 [MIN_INTERVAL_MS]。第一次不等待。 */
     private fun pace() {
         val since = System.currentTimeMillis() - lastRequestAt
         if (lastRequestAt > 0L && since < MIN_INTERVAL_MS) {
@@ -166,11 +125,9 @@ internal object CainiaoTraceFetcher {
     }
 
     /**
-     * 把查到的信息挂回原记录。
-     *
-     * 这里**不做「只填空」判断** —— 那是 `mergeEnrichment` 的职责，两边都判会让规则散成两处。
-     * 只有 [courier] 例外：它要做的是「换一家」，而 `mergeEnrichment` 里旧值非 UNKNOWN 时
-     * 会保留旧值，所以从公司名认不出时传 UNKNOWN 进去也不会污染已有结果。
+     * 把查到的信息挂回原记录。这里不做「只填空」判断——那是 mergeEnrichment 的职责，
+     * 两边都判会让规则散成两处；courier 例外：认不出时传 UNKNOWN 也不会污染已有结果
+     * （mergeEnrichment 里旧值非 UNKNOWN 时保留旧值）。
      */
     private fun apply(record: ExpressRecord, info: CainiaoTraceInfo): ExpressRecord = record.copy(
         courier = Courier.fromCompanyName(info.courierName),
@@ -178,28 +135,14 @@ internal object CainiaoTraceFetcher {
         trace = info.points,
         stationAddress = info.stationAddress,
         goodsImage = info.goodsImage,
-        // 运单动态也补一份：**卡片副行和通知正文读的是这个字段，不是 `trace`**。
-        // 它原来只有宿主的 `lastLogisticDetail` 一个来源，而宿主富化只在用户打开菜鸟时
-        // 才发生 —— 于是「模块自己拉到新轨迹、详情页看得见，首页那句动态纹丝不动」
-        // （2026-09-27 用户报的）。轨迹末条和宿主那句是同一件事，刚拉到的这份只会更新。
-        //
-        // 谁新谁旧的取舍在 [ExpressRecord.mergeEnrichment] 的时序规则里，这里不判 ——
-        // 拉不出轨迹（列表全被广告清洗掉）时给 null，那边会原样保留已有值。
+        // 运单动态与轨迹是两个字段：卡片副行和通知正文读的是这个字段，不是 trace。
+        // 它原来只有宿主富化一个来源，导致「拉到新轨迹而首页动态纹丝不动」。
         logisticsDetail = latestTraceDetail(info.points) ?: record.logisticsDetail,
-        // 状态同理：卡片右上角那个词 + 分档（运输中 / 到站包裹）都读它，而它以前只有宿主富化
-        // 会给 —— 宿主几小时不刷新，用户看到的就是「轨迹都拉到新节点了，右上角还是旧状态」。
-        // 只认**结论型**状态（白名单见 [CainiaoTraceParser.TRACE_ADVANCE_STATUSES]），
-        // 且是否真的收下由 `mergeEnrichment` 的 `isAdvanceFrom` 判（不回退）。
+        // 状态同理：卡片右上角那个词读它。只认结论型状态，是否收下由 mergeEnrichment 判（不回退）。
         status = info.status ?: record.status,
     )
 
-    /**
-     * 按需拉取的请求里只有运单号，拼一份最小原型给 [apply]。
-     *
-     * 所有富化字段留空、状态 UNKNOWN：`ExpressRecordStore.enrich` 按运单号把这份记录
-     * 匹配回真正那条，`mergeEnrichment` 的「只填空」保证除轨迹 / 地址 / 图 / 公司外的
-     * 字段一个都不会覆盖原值 —— 原型里放什么都无所谓，放少比放多安全。
-     */
+    /** 按需拉取的请求里只有运单号，拼一份最小原型。所有富化字段留空——「只填空」保证不覆盖原值，放少比放多安全。 */
     private fun stubRecord(tracking: String) = ExpressRecord(
         sourcePackage = "com.cainiao.wireless",
         rawText = "trace request",

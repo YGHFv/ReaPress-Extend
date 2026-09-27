@@ -19,56 +19,17 @@ package io.github.YGHFv.ReaPressExtend.core
 
 import org.json.JSONArray
 
-/**
- * 一个物流轨迹点。
- *
- * [time] 保留**外部原样给的字符串**（`2026-09-26 13:19:31`），不在 core 里解析成时间戳 ——
- * 相对时间（「今天 13:19」/「昨天」/ 日期）属于展示层，而 core 不碰系统时钟（项目约定）。
- * 排序也不要自己比大小：同一个来源的格式固定，按字符串倒序就是时间倒序。
- */
+/** 一个物流轨迹点。[time] 保留原样字符串不解析（core 不碰系统时钟）；同源格式固定，按字符串倒序即时间倒序。 */
 data class ExpressTracePoint(
     val time: String,
     val text: String,
 )
 
-/**
- * 轨迹里**最新一条**的文案 —— 首页卡片副行 / 通知正文上那句「运单动态」。
- *
- * [points] 是「最早 → 最新」（接口顺序），所以取末条。
- *
- * ## 为什么需要它
- *
- * 那句话原来只有宿主的 `lastLogisticDetail` 一个来源，而宿主富化只在**用户打开菜鸟**时
- * 才会发生。于是出现了一种自相矛盾的现场：模块自己把轨迹拉回来了、详情页看得见新节点，
- * 首页卡片那句动态却一直停在上一次打开菜鸟时的样子（2026-09-27 用户报的）。
- * 轨迹和宿主那句说的是同一件事（这件现在在哪），而刚拉到的这份一定不比它旧 ——
- * 拿末条兜这一格，两个界面才不会各说各话。
- *
- * 取的是**已清洗**过的文案（解析时就过了 [ExpressTraceText.clean]），所以这里不再处理。
- */
+/** 最新一条轨迹文案；宿主只在打开菜鸟时才更新，用它兜首页副行。 */
 fun latestTraceDetail(points: List<ExpressTracePoint>): String? =
     points.lastOrNull()?.text?.takeIf { it.isNotBlank() }
 
-/**
- * 轨迹文案清洗 —— 去掉快递公司夹在动态里的广告。
- *
- * 真机证据（极兔 JT0000000000000 第 13 条 `desc`）：
- *
- * ```
- * 【青山城南河东社区网点】的极兔快递员：张伟（13800138000）正在为您派件
- * （有事先呼我，勿找平台，少一次投诉，多一份感恩！），投诉电话（010-1234567/13800138001）。
- * 【952300为极兔快递员外呼专属号码，请放心接听】
- * ```
- *
- * 两处方括号 / 圆括号全是广告，真正的信息（谁在派件、电话）只占前半句。不清掉的话，
- * 通知和详情页里一条轨迹能有六七行，用户根本看不到「快件到达【城东集散点】」这种真动态。
- *
- * ## 只删「括号包住、且含广告特征词」的整段
- *
- * 保守到近乎偏执，因为**误删真实轨迹比留着广告糟得多**：`【城市中心网点】` 是网点名，
- * 长得和广告段一模一样（同为方括号），但一个特征词都不含 —— 靠特征词兜住它。
- * 特征词表只收真机见过、且不会出现在地名 / 网点名 / 状态描述里的写法。
- */
+/** 轨迹文案清洗 —— 只删「括号包住且含广告特征词」的整段：误删真实轨迹比留着广告糟得多，网点名也长着方括号。 */
 object ExpressTraceText {
 
     private val AD_MARKERS = listOf(
@@ -82,7 +43,6 @@ object ExpressTraceText {
         "外呼",
     )
 
-    /** 中英文两套括号都要处理 —— 不同快递公司的模板不一样。 */
     private val BRACKETS = listOf(
         '（' to '）',
         '(' to ')',
@@ -92,23 +52,13 @@ object ExpressTraceText {
 
     private val WHITESPACE = Regex("\\s+")
 
-    /**
-     * 清洗一条轨迹文案。
-     *
-     * 返回空串表示「整条都是广告」——调用方应该跳过它，而不是退回原文。
-     */
+    /** 返回空串表示整条都是广告，调用方应跳过它而不是退回原文。 */
     fun clean(raw: String): String {
         var text = raw
         for ((open, close) in BRACKETS) text = stripAdSegments(text, open, close)
         return WHITESPACE.replace(text, " ").trim()
     }
 
-    /**
-     * 扫描删除 [open]..[close] 之间、含广告特征词的段。
-     *
-     * 不做嵌套括号（真机没见过，模板都是平铺的）；找不到配对括号时原样保留剩下的部分 ——
-     * 半个括号多半意味着格式和我们预期的不一样，此时**什么都不动**比猜着删安全。
-     */
     private fun stripAdSegments(text: String, open: Char, close: Char): String {
         val out = StringBuilder(text.length)
         var index = 0
@@ -134,17 +84,7 @@ object ExpressTraceText {
     private fun isAd(segment: String): Boolean = AD_MARKERS.any { segment.contains(it) }
 }
 
-/**
- * 轨迹的编解码 —— 跨越「被注入进程 → 模块 App」那道进程边界，以及落盘。
- *
- * 一个入口一个出口：广播的 extra 与 SharedPreferences 的字段都用它，两边不会各自漂出
- * 一套格式。空的输入解码成空表（不是 null）：轨迹的「没有」只有一种表示，
- * 调用方不需要判两种。
- *
- * 编码成 `[["2026-09-26 13:19:31","快件已到达【城东集散点】"], …]` —— 用数组而不是对象，
- * 因为一条轨迹只有两个字段，`{"t":…,"d":…}` 的键名会占掉将近一半的体积，
- * 而这个字符串会跟着每条到站件一起落盘。
- */
+/** 轨迹编解码，跨「被注入进程 → 模块 App」与落盘共用；编码成 `[[time, text], …]` 数组对而不是对象（键名会占掉近一半体积）。 */
 object ExpressTraceCodec {
 
     fun encode(points: List<ExpressTracePoint>): String {
@@ -155,7 +95,7 @@ object ExpressTraceCodec {
         return array.toString()
     }
 
-    /** 解不出来（格式变了、被截断）就当空表 —— 轨迹是附属信息，读不出不该影响整条记录。 */
+    /** 解不出来就当空表 —— 轨迹是附属信息，读不出不该影响整条记录。 */
     fun decode(raw: String?): List<ExpressTracePoint> {
         if (raw.isNullOrBlank()) return emptyList()
         return try {

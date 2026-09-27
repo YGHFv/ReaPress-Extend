@@ -27,66 +27,31 @@ import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
 import java.io.File
 import java.util.concurrent.atomic.AtomicLong
 
-/**
- * 拼多多缓存扫描器 —— 「发现」这条腿的执行端（解析在 [PddCacheDiscovery]，纯函数）。
- *
- * ## 它做什么
- *
- * 模块跑在拼多多进程里，用宿主 uid 读宿主自己的 HTTP 响应缓存
- * （`cache/pdd_cache` 目录；与菜鸟登录态「读宿主私有目录」是同一条合法性依据）。
- * 扫到的每个包裹构造成 [ExpressRecord] 走 [ExpressRelaySender.sendEnrichment]
- * 投给模块进程 —— 那条路的接收侧（`ExpressRecordStore.enrich`）已经带着全套
- * 落库规矩：`hasIdentity` 准入（运单号是强标识，本来源必然满足）、
- * 只填空不覆盖、配不上才新建。**发现侧不需要自己的存储，也不该有。**
- *
- * ## 触发节奏
- *
- * - 宿主进程起来时扫一次（缓存里躺着的就是上次会话的全部快递数据）；
- * - parse 出口见到快递实体时（[noteExpressActivity]）**节流重扫** —— 用户在
- *   拼多多里看快递时缓存会被刷新，那是重扫的正确时机；10 分钟一挡足够新，
- *   且对宿主零压力（MIN_PRIORITY 后台线程 + 文件数/大小封顶）。
- *
- * ## 幂等
- *
- * 每个包裹按「运单号 + 全部可变字段」记指纹，内容没变就不重投 ——
- * 模块侧对重复富化本来就不改存储，但少发一条广播就少吵醒一次接收端。
- */
+/** 拼多多缓存扫描器（解析在 [PddCacheDiscovery]）：用宿主 uid 读 `cache/pdd_cache` 扫包裹投给模块进程，落库规矩（只填空不覆盖）在接收侧；宿主起来扫一次，parse 出口见快递实体按 10 分钟节流重扫；按「运单号 + 全部可变字段」记指纹，内容没变不重投。 */
 internal object PddCacheScanner {
 
-    /** 缓存目录相对宿主 data 目录的位置。 */
     private const val CACHE_DIR = "cache/pdd_cache"
 
-    /** 单文件读取上限。快递卡片缓存都是几十 KB 级，超过的几乎肯定不是。 */
     private const val MAX_FILE_BYTES = 8L * 1024 * 1024
 
-    /** 单次扫描的文件数上限（缓存会被宿主自己清理，正常远到不了这个数）。 */
     private const val MAX_FILES = 2000
 
-    /** [noteExpressActivity] 的重扫最小间隔。 */
     private const val RESCAN_INTERVAL_MS = 10 * 60_000L
 
-    /** 指纹表上限 —— 超额整体清空，代价只是把当前缓存里的件重投一遍（模块侧幂等）。 */
     private const val MAX_FINGERPRINTS = 512
 
-    /** 已投递过的内容指纹：运单号 → 「orderSn|pickupCode|phoneTail」。 */
     private val fingerprints = HashMap<String, String>()
 
-    /** 上次节流重扫的时刻（elapsedRealtime）。 */
     private val lastRescanAt = AtomicLong(0L)
 
     @Volatile private var scannedOnce = false
 
-    /** 宿主进程起来后的首次扫描（等 Context 就绪 —— install 时机早于 Application#onCreate）。 */
     fun scanOnInstallAsync() {
         if (scannedOnce) return
         scannedOnce = true
         scanAsync("install")
     }
 
-    /**
-     * parse 出口见到了快递实体 —— 用户正在看拼多多快递页，缓存可能刚被刷新。
-     * 按节流窗口决定要不要重扫。
-     */
     fun noteExpressActivity() {
         val now = android.os.SystemClock.elapsedRealtime()
         val last = lastRescanAt.get()
@@ -95,7 +60,6 @@ internal object PddCacheScanner {
         scanAsync("activity")
     }
 
-    /** 起后台线程做一次完整扫描。扫描失败只留日志，绝不影响宿主。 */
     private fun scanAsync(reason: String) {
         Thread({
             runCatching { scan(reason) }
@@ -120,8 +84,7 @@ internal object PddCacheScanner {
             return
         }
 
-        // 相对路径以宿主 data 目录为基准 —— 解析器按「路径含 pdd_cache」过滤，
-        // 基准选浅了（比如 cacheDir 自己）路径里就没有这个标记了。
+        // 相对路径以宿主 data 目录为基准 —— 解析器按「路径含 pdd_cache」过滤，基准选浅了就没这个标记了。
         val dataDir = File(context.getApplicationInfo().dataDir)
         val cacheDir = File(dataDir, CACHE_DIR)
         val files = cacheDir.listFiles()
@@ -135,7 +98,6 @@ internal object PddCacheScanner {
         }
 
         // ISO_8859_1 读入 —— mojibake 的转回在解析器里做（见 PddCacheDiscovery 的输入约定）。
-        // 路径以宿主 data 目录为基准（`cache/pdd_cache/…`），解析器按这个标记过滤。
         val contents = HashMap<String, String>()
         for (f in files) {
             contents[f.relativeTo(dataDir).path] =
@@ -145,9 +107,6 @@ internal object PddCacheScanner {
 
         var sent = 0
         for (pkg in packages) {
-            // 指纹必须覆盖所有会变的字段：状态/驿站/公司/提示升级了也要重投，
-            // 否则模块侧已落库的那条永远停在旧值。（上一版只指纹三样，升级解析器后
-            // 全量指纹必然失配 —— 正好借这次把库里那批「未知」旧记录刷一遍。）
             val fp = listOf(
                 pkg.orderSn.orEmpty(),
                 pkg.pickupCode.orEmpty(),
@@ -173,39 +132,19 @@ internal object PddCacheScanner {
         XposedBridge.logAlways(
             "pdd cache scan ($reason): files=${files.size} discovered=${packages.size} sent=$sent",
         )
-        // 一句可观测的总结送回模块侧（探索期判据链的延续：宿主侧结论不落字就等于没发生）。
         ExpressRelaySender.sendHostProbe(
             context,
             "discovery($reason): files=${files.size} found=${packages.size} sent=$sent",
         )
     }
 
-    /**
-     * 一个发现的包裹 → [ExpressRecord] → 投给模块进程落库。
-     *
-     * 字段取舍（**只送能证明的**）：
-     * - 运单号 = 强标识，`hasIdentity` 必然通过；
-     * - 取件码 / 手机尾号 / 订单号 / 驿站名+地址 / 取件提示按解析器的结论原样带上；
-     * - 快递公司优先用 `tracking_num` 值里的中文前缀（宿主自己写好的），认不出再按
-     *   运单号前缀兜底一次（`JT…` = 极兔这类字母前缀；纯数字号段认不出就 UNKNOWN）；
-     * - 状态来自分栏/提示词（见 [PddCacheDiscovery] 类注释的刻意留白），推不出 UNKNOWN。
-     */
     private fun sendEnrichment(context: Context, pkg: PddCacheDiscovery.Package) {
         val record = ExpressRecord(
             sourcePackage = ExpressRelay.PDD_PACKAGE,
-            // rawText 留空：缓存里没有「通知原文」这回事，之前那串「拼多多取快递缓存（订单 …）」
-            // 是探索期的诊断副标题，卡片退回原文首行时显示的就是它。有价值的字段
-            // （驿站/取件码/动态）各有自己的格子，不需要靠 raw 携带。
             rawText = "",
             trackingNumber = pkg.trackingNumber,
-            // 订单号原样带上：详情页展示「这是哪一单」，也是订单日期的载体（见下）。
             orderSn = pkg.orderSn,
-            // 订单日期 → arrivalAt：这是「这件是什么时候的」唯一可证明的时刻。
-            // 语义上它是订单时刻不是物流变更时刻 —— 对只有订单号、物流痕迹已被缓存
-            // 淘汰的老件，别无选择；而归档链（updatedAtOf → isStaleUnknown）正需要它：
-            // 老订单的未知件当场具备归档资格，不再无限期占着首页「其他」档
-            // （2026-09-27 用户：「挂了一堆未知是干嘛」）。date 里的归属判断见
-            // [PddCacheDiscovery.orderDateMillis]。
+            // 订单日期 → arrivalAt：「这件是什么时候的」唯一可证明的时刻；老订单的未知件靠它获得归档资格。
             arrivalAt = pkg.orderSn?.let {
                 PddCacheDiscovery.orderDateMillis(it, System.currentTimeMillis())
             },
