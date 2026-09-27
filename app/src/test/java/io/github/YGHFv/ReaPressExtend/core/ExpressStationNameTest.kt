@@ -20,6 +20,7 @@ package io.github.YGHFv.ReaPressExtend.core
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -92,9 +93,77 @@ class ExpressStationNameTest {
         assertEquals("", ExpressStationName.normalize("快递柜"))
         assertFalse(ExpressStationName.hasLocation("代收点"))
 
+        // 裸的 `驿站` 同理 —— 真机里只以两种方式出现：句子里那句 `…已到驿站…`，
+        // 以及旧解析器留下的 `驿站取尾号1234包裹` 截断后的残留。都不能当地名。
+        assertEquals("", ExpressStationName.normalize("驿站"))
+        assertFalse(ExpressStationName.hasLocation("驿站"))
+        // 但 `菜鸟驿站` 不算：剥品牌前缀时它拒绝被剥成一个品牌词，所以原样留下
+        assertEquals("菜鸟驿站", ExpressStationName.normalize("菜鸟驿站"))
+
         // 带了地名就是有效地点，不能误伤 —— `南门小区代收点` 是能找得到的地方
         assertEquals("南门小区代收点", ExpressStationName.normalize("南门小区代收点"))
         assertTrue(ExpressStationName.hasLocation("南门小区代收点"))
+    }
+
+    @Test
+    fun `关键词加半句话的抓取产物认得出来`() {
+        // 读路径的自愈（`ExpressRecordRepair`）靠这个判据决定「要不要用当前解析逻辑重扫一遍」。
+        // 判据必须是「句子的尾巴被切下来了」，不能是「归一化后变了」—— 后者把剥品牌前缀、
+        // 剥括号这些**正常包装**也算进去，那会让每条记录每读一次就重扫一次。
+        assertTrue(ExpressStationName.isNarrativeArtifact("驿站取尾号1234包裹"))
+        assertTrue(ExpressStationName.isNarrativeArtifact("代收点存放已超过24小时【取件码-8-2-3021】"))
+        assertTrue(ExpressStationName.isNarrativeArtifact("A小区驿站（存放点）"))
+        // 半句话在开头 —— 整串都是句子的其余部分，一点地名信息都没有
+        assertTrue(ExpressStationName.isNarrativeArtifact("存放已超过24小时"))
+
+        assertFalse(ExpressStationName.isNarrativeArtifact("阳光花园菜鸟驿站"))
+        assertFalse(ExpressStationName.isNarrativeArtifact("菜鸟驿站(杭州文一西路店)"))
+        assertFalse(ExpressStationName.isNarrativeArtifact("幸福小区54栋104店"))
+        assertFalse(ExpressStationName.isNarrativeArtifact(""))
+        assertFalse(ExpressStationName.isNarrativeArtifact(null))
+
+        // `取尾号1234包裹` 里的「取尾号」必须被切断：它是凭据那半句的开头，
+        // 不是店名的一部分（旧解析器就是从关键词往后啃、把它一起吃了）
+        assertEquals("", ExpressStationName.normalize("驿站取尾号1234包裹"))
+    }
+
+    @Test
+    fun `关键词后面接的句子被截掉`() {
+        // 2026-09-27 真机存下来的脏名字（淘宝「超时未取」提醒）。解析层现在不会再抽出它，
+        // 但**历史记录里已经存下的改不掉** —— 分组和显示名都过 normalize，所以这里兜一层。
+        assertEquals("", ExpressStationName.normalize("代收点存放已超过24小时\u00a0【取件码-8-2-3021】"))
+        assertFalse(ExpressStationName.hasLocation("代收点存放已超过24小时【取件码-8-2-3021】"))
+        assertEquals("", ExpressStationName.normalize("存放已超过24小时"))
+
+        // 截断而不是整条作废：前缀里的地名对「去哪取」有用，不该跟着句子一起丢
+        assertEquals("临河阳光花园代收点", ExpressStationName.normalize("临河阳光花园代收点存放已超过24小时"))
+        // 截断露出来的半个括号要刮掉，否则名字尾巴挂着一个孤零零的「（」
+        assertEquals("A小区驿站", ExpressStationName.normalize("A小区驿站（存放点）"))
+
+        // 「24小时便利店代收点」是真会出现的店名 —— 所以「小时」刻意不在判据里
+        assertEquals("24小时便利店代收点", ExpressStationName.normalize("24小时便利店代收点"))
+        // 反过来：宿主偶尔给的「网点名（服务热线…）」是**有效地点**，不许被这套判据误伤
+        // （真机里同一处会同时存在这种写法和菜鸟驿站那种写法，2026-09-27）
+        assertEquals(
+            "临河阳光花园54栋驿站（服务热线12345678）",
+            ExpressStationName.placeName("临河阳光花园54栋驿站（服务热线12345678）"),
+        )
+    }
+
+    @Test
+    fun `显示用的名字保留原始写法但丢掉句子`() {
+        // 显示层（替换通知正文、驿站管理的「原始写法」）要认得出是哪家店 ——
+        // 品牌前缀不能像 normalize 那样剥掉
+        assertEquals("菜鸟驿站(临河阳光花园店)", ExpressStationName.placeName("菜鸟驿站(临河阳光花园店)"))
+        // 句子那半截必须丢掉
+        assertEquals("临河阳光花园代收点", ExpressStationName.placeName("临河阳光花园代收点存放已超过24小时"))
+
+        // 说不出「哪一处」的串不算地点：通知正文里不再印一个零信息的「代收点」
+        assertNull(ExpressStationName.placeName("代收点"))
+        assertNull(ExpressStationName.placeName("代收点存放已超过24小时\u00a0【取件码-8-2-3021】"))
+        assertNull(ExpressStationName.placeName("存放已超过24小时"))
+        assertNull(ExpressStationName.placeName(""))
+        assertNull(ExpressStationName.placeName(null))
     }
 
     // ------------------------------------------------------------ 聚类

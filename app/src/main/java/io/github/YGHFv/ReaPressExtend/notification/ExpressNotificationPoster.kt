@@ -71,14 +71,31 @@ object ExpressNotificationPoster {
     /** 点击通知打开的界面。 */
     private val CONTENT_INTENT_CLASS = "io.github.YGHFv.ReaPressExtend.ui.ExpressMainActivity"
 
-    fun post(context: Context, record: ExpressRecord): Boolean {
+    /**
+     * 发一条替换通知，并记一条投递审计。
+     *
+     * @param contentIntent **被拦下来的那条原通知**的点击跳转（见
+     *   [NotificationIntentCache]）。只被审计记录用 —— 模块自己那条通知的点击目标永远是
+     *   本模块的界面。用户想回原 App 的具体页面时，靠的是记录页里那份令牌。
+     * @param intentUri 同一跳转的可落盘快照。**它才是跨进程重启之后还能用的那份**
+     *   （令牌是 binder 句柄，落盘只会得到一串解不回来的字节），见 [NotificationIntentLauncher]。
+     */
+    fun post(
+        context: Context,
+        record: ExpressRecord,
+        contentIntent: PendingIntent? = null,
+        intentUri: String? = null,
+    ): Boolean {
         if (!hasPermission(context)) {
             ModuleAndroidLog.error(
                 TAG,
                 "POST_NOTIFICATIONS not granted — replacement notification dropped " +
                     "for key=${record.dedupeKey}",
             )
-            ExpressNotificationLog.record(context, record, delivered = false, detail = "未授予通知权限")
+            ExpressNotificationLog.record(
+                context, record, delivered = false, detail = "未授予通知权限",
+                contentIntent = contentIntent, intentUri = intentUri,
+            )
             return false
         }
 
@@ -143,11 +160,17 @@ object ExpressNotificationPoster {
                 "replacement notification posted key=${record.dedupeKey} title=$title " +
                     "focus=${focus.protocol}/${focus.canShowFocus}",
             )
-            ExpressNotificationLog.record(context, record, delivered = true)
+            ExpressNotificationLog.record(
+                context, record, delivered = true,
+                contentIntent = contentIntent, intentUri = intentUri,
+            )
             true
         }.getOrElse {
             ModuleAndroidLog.error(TAG, "post replacement notification failed key=${record.dedupeKey}", it)
-            ExpressNotificationLog.record(context, record, delivered = false, detail = it.message.orEmpty())
+            ExpressNotificationLog.record(
+                context, record, delivered = false, detail = it.message.orEmpty(),
+                contentIntent = contentIntent, intentUri = intentUri,
+            )
             false
         }
     }

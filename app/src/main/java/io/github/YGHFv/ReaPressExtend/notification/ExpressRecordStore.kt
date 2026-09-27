@@ -24,6 +24,7 @@ import io.github.YGHFv.ReaPressExtend.core.ExpressFormatter
 import io.github.YGHFv.ReaPressExtend.core.ExpressOrigin
 import io.github.YGHFv.ReaPressExtend.core.ExpressPlatform
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
+import io.github.YGHFv.ReaPressExtend.core.ExpressRecordRepair
 import io.github.YGHFv.ReaPressExtend.core.ExpressStationName
 import io.github.YGHFv.ReaPressExtend.core.ExpressStationRules
 import io.github.YGHFv.ReaPressExtend.core.ExpressStatus
@@ -95,6 +96,28 @@ object ExpressRecordStore {
     internal const val NO_MATCH = -1
 
     /**
+     * 判两个驿站名是不是同一处时，短名至少要有这么长。
+     *
+     * 与 [ExpressStationName] 内部那个 `MIN_SHARED_SUFFIX` 同一个尺度（4 字）：`花园店` 这种
+     * 泛称谁都能以它结尾，拿它当判据会把无关的两处并到一起。
+     */
+    private const val MIN_STATION_SUFFIX = 4
+
+    /** [logTailMiss] 的节流窗口。 */
+    private const val TAIL_MISS_LOG_INTERVAL_MS = 10 * 60_000L
+
+    /** [logTailMiss] 的表上限，防长期运行后无限增长（超额整体清空，代价只是多几行日志）。 */
+    private const val MISS_LOG_MAX_ENTRIES = 128
+
+    /**
+     * 「尾号的码还没认领到包裹」的节流表。
+     *
+     * 挂在对象上（进程级）而不是每次新建：节流本来就是跨调用的状态。取的是
+     * `SystemClock.elapsedRealtime()`（不是墙钟）—— 墙钟被改时不该把节流窗口整个跳过去。
+     */
+    private val tailMissLogTimes = HashMap<String, Long>()
+
+    /**
      * 写入一条记录（合并同一个包裹的旧记录）。
      *
      * 判断逻辑在 [applyUpsert]（纯函数，可单测），这里只负责读写存储。
@@ -131,6 +154,16 @@ object ExpressRecordStore {
      * @return 新列表；null 表示这条记录不该改动存储（状态倒退，或同级但更旧）
      */
     internal fun applyUpsert(
+        current: List<ExpressRecord>,
+        record: ExpressRecord,
+    ): List<ExpressRecord>? {
+        val merged = applyUpsertOnce(current, record) ?: return null
+        // 尾号匹配跑在**每一次写入之后**：包裹可能比带来取件码的那条通知晚到（宿主几小时后
+        // 才推过来），所以不能只在通知到达那一次判 —— 见 [applyTailMatches]。
+        return applyTailMatches(merged).records
+    }
+
+    private fun applyUpsertOnce(
         current: List<ExpressRecord>,
         record: ExpressRecord,
     ): List<ExpressRecord>? {
@@ -195,16 +228,215 @@ object ExpressRecordStore {
     private fun mergeVersions(existing: ExpressRecord, incoming: ExpressRecord): ExpressRecord =
         incoming.mergeEnrichment(existing.mergeEnrichment(incoming))
 
+    /**
+     * 尾号匹配 —— 通知里的取件码按「**运单号尾段**」认领到包裹上（2026-09-27 用户要求）。
+     *
+     * ## 解决的是什么
+     *
+     * 短信/驿站通知里取件码是有的，但**没有任何公共字段**能把它和宿主给的包裹对上：
+     * 通知只说「凭1-1-2001到阳光花园菜鸟驿站**取尾号1234**包裹」，宿主手里是
+     * `7903000000000` 这样的全号、而且对一部分包裹根本不下发 `authCode`。于是通知自成一张
+     * 卡片、真正的包裹那张没有码 —— 用户在驿站门口要念的码长在一张他不敢信的卡上。
+     *
+     * 尾号是通知侧唯一的认领凭据（[ExpressRecord.parcelTail]），所以匹配就是：
+     * **运单号以该尾号结尾**，且驿站在两边说得通。
+     *
+     * ## 三条护栏
+     *
+     * 1. **认领方必须是「没有运单号的通知」**（[isTailClaimant]）。这条同时挡住一个自激回路：
+     *    被认领的包裹若也带上尾号，下一轮它就会变成认领方去认领别人。
+     * 2. **必须唯一命中**。同一尾号在同驿站有两件候选（同一货架格先后放过两件，真实存在）
+     *    时**一件都不动** —— 把码给错件比不给更糟：用户会拿着错的码白跑一趟。
+     * 3. **驿站要说得通**：宿主名常带楼栋号（`阳光23号楼109阳光花园菜鸟驿站`），
+     *    所以判据是「归一化后相等，或短的是长的后缀」，不是相等。两边都说得出来却对不上
+     *    → 不是同一处，不认领。一边说不出地点时不拦（那时尾号是唯一线索）。
+     *
+     * ## 换下来的旧码不丢
+     *
+     * 覆盖 [ExpressRecord.pickupCode] 时把原来那个存进 [ExpressRecord.previousPickupCode]
+     * （用户 2026-09-27 拍板：两个都写进记录、界面上都显示），尾号只有 4 位，认错了还能看出来。
+     *
+     * ## 认领掉的那条通知会被**移出记录表**
+     *
+     * 它和包裹本来就是同一件东西，留着就是首页上一张重复卡片。通知本身没有丢 ——
+     * 投递审计在 [ExpressNotificationLog] 里另存一份（记录页看的就是那份）。
+     *
+     * @param anchor 需要在结果里定位的那条记录（`applyEnrichment` 用它回报命中下标）。
+     * @return 结果列表 + [anchor] 的新下标（[NO_MATCH] = 它不在了）。
+     */
+    internal fun applyTailMatches(
+        current: List<ExpressRecord>,
+        anchor: ExpressRecord? = null,
+    ): TailMatchResult {
+        var anchorIndex = anchor?.let { a -> current.indexOfFirst { it === a } } ?: NO_MATCH
+        val claimants = current.filter { isTailClaimant(it) }
+        if (claimants.isEmpty()) return TailMatchResult(current, anchorIndex)
+
+        val work = ArrayList(current)
+        val dropped = HashSet<Int>()
+        val claimed = HashSet<Int>()
+        for (claimant in claimants) {
+            val tail = claimant.parcelTail.orEmpty().trim()
+            val candidates = work.indices.filter { i ->
+                i !in dropped && i !in claimed &&
+                    work[i].trackingNumber?.takeIf { it.isNotBlank() }?.endsWith(tail) == true
+            }
+            val compatible = candidates.filter { stationCompatible(work[it].station, claimant.station) }
+            if (compatible.size != 1) {
+                if (compatible.size > 1) {
+                    ModuleAndroidLog.legacy(
+                        LOG_TAG,
+                        "tail match skipped: tail=$tail 命中 ${compatible.size} 件（要求唯一），一件都不动",
+                    )
+                }
+                logTailMiss(claimant, tail, candidates.size)
+                continue
+            }
+            val targetIndex = compatible.first()
+            work[targetIndex] = claimTail(work[targetIndex], claimant)
+            claimed += targetIndex
+            // 认领方自己被并掉。注意 work[targetIndex] 是**原地替换**，所以 anchor 的下标
+            // 只需要按「它前面被删掉几条」平移，不必重新查找。
+            dropped += work.indexOfFirst { it === claimant }
+        }
+        if (dropped.isEmpty()) {
+            // 一条都没被认领（只有日志副作用）—— 原样返回，避免调用方误以为存储变了。
+            return TailMatchResult(current, anchorIndex)
+        }
+        val kept = work.filterIndexed { i, _ -> i !in dropped }
+        anchorIndex = if (anchorIndex in dropped) {
+            NO_MATCH
+        } else {
+            (anchorIndex - dropped.count { it < anchorIndex }).coerceAtLeast(NO_MATCH)
+        }
+        return TailMatchResult(kept, anchorIndex)
+    }
+
+    /**
+     * 谁能拿尾号去认领包裹：**带尾号、带取件码，而且自己没有运单号**。
+     *
+     * 最后一条是护栏本身（见 [applyTailMatches]）——有运单号的记录已经是「包裹」了，
+     * 让包裹去认领包裹只会把两件无关的东西并成一件。
+     */
+    private fun isTailClaimant(record: ExpressRecord): Boolean =
+        record.trackingNumber.isNullOrBlank() &&
+            !record.pickupCode.isNullOrBlank() &&
+            !record.parcelTail.isNullOrBlank()
+
+    /** 把通知的取件码写到包裹上，并留下换下来的那个码。 */
+    private fun claimTail(target: ExpressRecord, claimant: ExpressRecord): ExpressRecord {
+        val claimedCode = claimant.pickupCode.orEmpty()
+        val previous = target.pickupCode?.takeIf { it.isNotBlank() && it != claimedCode }
+            ?: target.previousPickupCode
+        val matched = target.copy(
+            pickupCode = claimedCode,
+            previousPickupCode = previous,
+            // 驿站只填空：宿主那条通常更全（带楼栋号），没有才用通知里的。
+            station = target.station?.takeIf { ExpressStationName.hasLocation(it) }
+                ?: claimant.station?.takeIf { ExpressStationName.hasLocation(it) },
+            // 状态只**推进**，而且不认 UNKNOWN：通知是「凭码取件」这类消息，状态表认不出它，
+            // 拿 UNKNOWN 去比会把包裹已有的状态抹平（`isAdvanceFrom` 允许同级）。
+            status = if (claimant.status != ExpressStatus.UNKNOWN &&
+                claimant.status.order > target.status.order
+            ) {
+                claimant.status
+            } else {
+                target.status
+            },
+        )
+        ModuleAndroidLog.legacy(
+            LOG_TAG,
+            "tail matched: tail=${claimant.parcelTail} code=$claimedCode -> tn=${target.trackingNumber}" +
+                (previous?.let { " (原码 $it 已保留)" } ?: "") +
+                " station=${matched.station ?: "-"}",
+        )
+        return matched
+    }
+
+    /**
+     * 「这条通知的码没认领到包裹」的诊断行，按（尾号 + 驿站 + 码）节流。
+     *
+     * 为什么要节流：这条判据在**每一次写入**时都会对全表重跑一遍（包裹迟到时必须能补上），
+     * 于是「暂时还没有那件包裹」会以每分钟一条的频率刷屏，把真正的事件挤掉。
+     * 节流窗口内同一条只留一行 —— 它回答的正是用户会问的那句「我的取件码怎么没上到卡片上」。
+     */
+    private fun logTailMiss(claimant: ExpressRecord, tail: String, candidateCount: Int) {
+        val key = "$tail|${claimant.station}|${claimant.pickupCode}"
+        val now = android.os.SystemClock.elapsedRealtime()
+        synchronized(tailMissLogTimes) {
+            val last = tailMissLogTimes[key]
+            if (last != null && now - last < TAIL_MISS_LOG_INTERVAL_MS) return
+            tailMissLogTimes[key] = now
+            if (tailMissLogTimes.size > MISS_LOG_MAX_ENTRIES) tailMissLogTimes.clear()
+        }
+        ModuleAndroidLog.legacy(
+            LOG_TAG,
+            "tail miss: tail=$tail code=${claimant.pickupCode} station=${claimant.station ?: "-"} " +
+                "同尾号候选=$candidateCount 件 → 这条通知先留着",
+        )
+    }
+
+    /**
+     * 两个驿站名说的是不是同一处。
+     *
+     * 判据与 [ExpressStationName.isSameStation] 同源（后缀），但这里不经过用户的改名规则 ——
+     * 认领包裹这一步发生在**写路径**上，拿不到 UI 那份规则表；而它的用途只是「排除明显不是同一处
+     * 的候选」，宁可漏也不能把规则依赖引进来（那会让纯函数变成不可单测的）。
+     * 一边说不出地点（归一化后为空）时不拦：那时尾号是唯一线索。
+     */
+    private fun stationCompatible(a: String?, b: String?): Boolean {
+        val na = ExpressStationName.normalize(a)
+        val nb = ExpressStationName.normalize(b)
+        if (na.isEmpty() || nb.isEmpty()) return true
+        if (na == nb) return true
+        val shorter = if (na.length <= nb.length) na else nb
+        val longer = if (na.length <= nb.length) nb else na
+        return shorter.length >= MIN_STATION_SUFFIX && longer.endsWith(shorter)
+    }
+
+    /** [applyTailMatches] 的结果。 */
+    internal data class TailMatchResult(
+        val records: List<ExpressRecord>,
+        /** [applyTailMatches] 的 `anchor` 在新列表里的下标；[NO_MATCH] = 它已经不在了。 */
+        val anchorIndex: Int = NO_MATCH,
+    )
+
     /** 全部记录，按时间倒序（最新在前）。 */
     fun load(context: Context): List<ExpressRecord> =
         runCatching {
             parse(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_RECORDS, null))
+                // 读时用**当前**解析逻辑重扫一遍原文：解析层修好不会自动改掉已经落盘的旧值，
+                // 而脏值会继续参与分组、还会按「只填空不覆盖」挡住富化的真名。
+                // 判据与准入条件见 [ExpressRecordRepair]（纯函数、幂等，所以挂在这里不花钱）。
+                .map(ExpressRecordRepair::repair)
                 // 读时顺手清掉历史「无身份」记录：写入侧（[upsert] / [enrich]）的守卫只挡得住
                 // 新数据，挡不住守卫上线前已经躺在 XML 里的那几条。在读的这一层过滤而不另写
                 // 一次性迁移 —— 下一次任何写入都会把过滤结果存回去，历史垃圾自然蒸发。
                 .filter { it.hasIdentity }
                 .sortedByDescending { it.timestamp }
         }.getOrDefault(emptyList())
+
+    /**
+     * 把历史记录按当前解析逻辑**归并一遍并落盘**，返回是否真的改写了存储。
+     *
+     * [load] 只在内存里修，界面能立刻看到正确结果，但 XML 里那串烂字还在 —— 于是那条「取尾号」
+     * 短信每次读出来都要重新修一次，尾号认领也只能等下一次通知到达才发生。这里补上落盘那一步：
+     * 修 → 认领 → 有变化就写回，把「读时自愈」变成**一次性**的。
+     *
+     * 由界面在首次装载列表前调一次即可（此时本来就要读同一份 prefs，不额外增加一次磁盘往返）。
+     * 不需要版本号或「迁移跑没跑过」的状态：没得修时它什么都不写。
+     */
+    fun reconcile(context: Context): Boolean = runCatching {
+        val stored = load(context)
+        val merged = applyTailMatches(stored).records
+        if (merged == stored) return@runCatching false
+        save(context, merged)
+        ModuleAndroidLog.legacy(
+            LOG_TAG,
+            "records reconciled: ${stored.size} -> ${merged.size} 条（旧解析结果已按当前逻辑重算）",
+        )
+        true
+    }.getOrDefault(false)
 
     /**
      * 用 [enrichment] 补充已有记录里缺失的字段；**没有能配上的记录就新建一条**。
@@ -265,7 +497,11 @@ object ExpressRecordStore {
                 LOG_TAG,
                 "enriched: tn=${target?.trackingNumber} -> ${merged.trackingNumber} " +
                     "courier=${merged.courier.displayName} " +
-                    "station=${merged.station ?: "-"} pickup=${merged.pickupCode ?: "-"}" +
+                    "station=${merged.station ?: "-"} pickup=${merged.pickupCode ?: "-"} " +
+                    // 运单动态：首页卡片副行印的就是它，而它现在有两个来源（宿主富化 / 轨迹末条，
+                    // 见 ExpressRecord.logisticsDetail）。打出来才分得清「拉到了但动态没变」
+                    // 和「压根没拉到」—— 这两种在界面上长得一模一样（卡片那行没动）。
+                    "dyn=${merged.logisticsDetail?.take(24) ?: "-"}" +
                     // 收编是「首页少一张重复卡片」的唯一证据，必须看得见：这行出现 = 之前
                     // 那几条强标识错位的记录已经被并进来了。
                     if (result.absorbedCount > 0) " absorbed=${result.absorbedCount}" else "",
@@ -344,7 +580,10 @@ object ExpressRecordStore {
                     else -> next += record
                 }
             }
-            return EnrichResult(next, representativeIndex, target, absorbed.size)
+            // 尾号匹配（见 [applyTailMatches]）可能把这一条代表的取件码换掉、也可能把它自己
+            // 并进另一条 —— 所以命中下标要在这一步**之后**重新定位，不能沿用上面的。
+            val passed = applyTailMatches(next, anchor = representative)
+            return EnrichResult(passed.records, passed.anchorIndex, target, absorbed.size)
         }
 
         val next = applyUpsert(current, enrichment) ?: return null
@@ -474,6 +713,10 @@ object ExpressRecordStore {
                     put("goods", record.goodsName ?: JSONObject.NULL)
                     put("arrival", record.arrivalAt ?: JSONObject.NULL)
                     put("ptail", record.phoneTail ?: JSONObject.NULL)
+                    // 尾号匹配用的包裹尾号，以及被它换下来的原取件码。同样是后加的短键，
+                    // 旧 JSON 缺键 → null（升级不丢历史记录）。
+                    put("tail", record.parcelTail ?: JSONObject.NULL)
+                    put("oldpc", record.previousPickupCode ?: JSONObject.NULL)
                     put("dyn", record.logisticsDetail ?: JSONObject.NULL)
                     put("hours", record.stationHours ?: JSONObject.NULL)
                     // 用户在界面上确认的「已取件」。同样是后加的键，缺失即「没取过」。
@@ -526,6 +769,9 @@ object ExpressRecordStore {
                     // 缺键时 optLong 给 0，0 不是合法时间戳（发送端也用它表示「没有」）。
                     arrivalAt = obj.optLong("arrival").takeIf { it > 0L },
                     phoneTail = obj.optStringOrNull("ptail"),
+                    // 旧版本存下来的 JSON 里没有这两个键 —— 缺键即 null。
+                    parcelTail = obj.optStringOrNull("tail"),
+                    previousPickupCode = obj.optStringOrNull("oldpc"),
                     logisticsDetail = obj.optStringOrNull("dyn"),
                     stationHours = obj.optStringOrNull("hours"),
                     // 同上：0 不是合法时间戳，缺键（旧 JSON）就读成「没取过」。
@@ -838,7 +1084,9 @@ object ExpressHomeGrouper {
                     // 走和首页同一张显示名表：管理页里看到的名字，必须和首页卡片上的名字一样。
                     displayName = display,
                     // 归一化**之前**的原始写法：用户要在这行里认出「哦，这两个名字原来是同一处」。
-                    rawNames = items.mapNotNull { it.station?.takeIf(String::isNotBlank) }.distinct(),
+                    // 只做「丢掉句子后半截」这一件事（[ExpressStationName.placeName]），不改写法：
+                    // 历史记录里存下的脏名字不该在这里再露一次脸。
+                    rawNames = items.mapNotNull { ExpressStationName.placeName(it.station) }.distinct(),
                     records = items,
                     // 几张表任一有值都算「动过」—— 只记下一份位置指纹而没有改名，同样该给「恢复默认」。
                     renamed = keys.any { rules.hasRule(it) },

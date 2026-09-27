@@ -191,4 +191,98 @@ class ExpressClassifierTest {
         assertTrue(keywords.isNotEmpty())
         assertEquals(keywords.sortedByDescending { it.length }, keywords)
     }
+
+    // ---- 分类拦截（设置 → 通知拦截）----
+    //
+    // 这一组钉的是一条**用户主动要求**的取舍：勾上的分类原通知直接消失（连模块那条也不发）。
+    // 所以每个用例除了「拦住了」，更要钉住「不该拦的没被顺带拦掉」。
+
+    private fun classifyWith(
+        text: String,
+        categories: Set<NotificationCategory>,
+        threshold: Int = ExpressRule.DEFAULT_THRESHOLD,
+    ) = ExpressClassifier.classify(
+        "com.cainiao.wireless",
+        text,
+        ExpressRule(confidenceThreshold = threshold, interceptedCategories = categories),
+    )
+
+    @Test
+    fun `默认不勾选时不吞任何分类`() {
+        // 加这组开关之前的行为：揽件放行（原通知照常出现）、运输中照旧被替换。
+        val verdict = classify("您的顺丰快递 SF1234567890123 已揽收，点击查看物流")
+        assertNull(verdict.interceptedCategory)
+        assertEquals(ExpressStatus.PICKED_UP, verdict.ignoredStatus)
+    }
+
+    @Test
+    fun `勾选揽件后吞掉揽收通知`() {
+        // 与上一条同一个文案：默认走「放行」，勾上之后走「吞掉」。用户的选择优先于模块默认。
+        val verdict = classifyWith(
+            "您的顺丰快递 SF1234567890123 已揽收，点击查看物流",
+            setOf(NotificationCategory.ACQUISITION),
+        )
+        assertTrue(verdict.isExpress)
+        assertEquals(NotificationCategory.ACQUISITION, verdict.interceptedCategory)
+        // 仍然是快递通知（只是被吞了）——接收侧靠这个字段区分「吞」和「不是快递」。
+        assertNull(verdict.ignoredStatus)
+    }
+
+    @Test
+    fun `勾选运输动态后吞掉运输中通知`() {
+        val verdict = classifyWith(
+            "您的包裹已发出，运单号 SF1234567890123，正在运输中",
+            setOf(NotificationCategory.TRANSIT),
+        )
+        assertEquals(NotificationCategory.TRANSIT, verdict.interceptedCategory)
+    }
+
+    @Test
+    fun `没勾的分类不受影响`() {
+        // 只勾了揽件，运输中的通知不该被顺带吞掉。
+        val verdict = classifyWith(
+            "您的包裹已发出，运单号 SF1234567890123，正在运输中",
+            setOf(NotificationCategory.ACQUISITION),
+        )
+        assertTrue(verdict.isExpress)
+        assertNull(verdict.interceptedCategory)
+    }
+
+    @Test
+    fun `到站通知永远不会被分类拦截`() {
+        // 到站/取件是核心价值，连判定层都不认 ARRIVAL 这个分类 —— 界面上没有它的开关，
+        // 而这里给它一条没有取件码、没法靠「含码不吞」兜住的文案：
+        // 「您的包裹已到站，请及时取件」，配置硬写 ARRIVAL 也不该被吞。
+        val verdict = classifyWith(
+            "您的包裹已到站，请及时取件",
+            setOf(NotificationCategory.ARRIVAL, NotificationCategory.ACQUISITION),
+        )
+        assertTrue(verdict.isExpress)
+        assertNull(verdict.interceptedCategory)
+    }
+
+    @Test
+    fun `带取件码的通知不会被分类拦截`() {
+        // 用户要清的是「不含取件码的动态」，凭据不该因为一个分类开关被清掉。
+        // 「已签收…取件码 8-2-3021」是最容易撞上这条兜底的形状（状态判成签收、但文案带码）。
+        val verdict = classifyWith(
+            "您的包裹已签收，取件码 8-2-3021",
+            setOf(NotificationCategory.SIGNED),
+        )
+        assertTrue(verdict.isExpress)
+        assertNull(verdict.interceptedCategory)
+    }
+
+    @Test
+    fun `置信度不达标时宁可放行也不吞`() {
+        // 阈值 95 之下「您的包裹已发出」只有 70 分 —— 本来就可能是误判，吞掉的代价
+        // （用户丢掉一条真通知）远大于留着的代价。
+        val verdict = classifyWith(
+            "您的包裹已发出",
+            setOf(NotificationCategory.TRANSIT),
+            threshold = 95,
+        )
+        assertFalse(verdict.isExpress)
+        assertNull(verdict.interceptedCategory)
+    }
 }

@@ -19,6 +19,8 @@ package io.github.YGHFv.ReaPressExtend.config
 
 import android.content.Context
 import android.content.SharedPreferences
+import io.github.YGHFv.ReaPressExtend.core.NotificationCategory
+import io.github.YGHFv.ReaPressExtend.core.WatchSchedule
 
 /**
  * 设置键与默认值。
@@ -83,6 +85,19 @@ object ExpressSettingsKeys {
     /** 置信度阈值 0..100。 */
     const val KEY_CONFIDENCE_THRESHOLD = "confidence_threshold"
 
+    /**
+     * 用户选择**直接吞掉**的通知分类（设置 → 通知拦截），换行分隔的分类名。
+     *
+     * 存的是 [io.github.YGHFv.ReaPressExtend.core.NotificationCategory] 的 `name`，
+     * 与关键词那两条一样用「换行拼的字符串」而不是 `putStringSet`：
+     * 三个读取方（模块 UI / system_server / 宿主进程）走的是同一份 `writeTo`，
+     * 少一种类型就少一处 RemotePreferences 的实现差异要对。
+     *
+     * 未勾选 = 键不存在 = 空集，与加这个键之前的行为一致。认不出的名字、
+     * 以及不可拦截的分类会被 [io.github.YGHFv.ReaPressExtend.core.NotificationCategory.parse] 丢掉。
+     */
+    const val KEY_INTERCEPTED_CATEGORIES = "intercepted_categories"
+
     // ---- 值 ----
 
     const val MODE_OFF = "off"
@@ -133,6 +148,95 @@ object ExpressSettingsKeys {
 
     const val DEFAULT_TRACE_FETCH_MODE = MODE_TRACE_ON_DEMAND
 
+    // ---- 自动轮查 ----
+    //
+    // 与上面「获取模式」的分工：那个决定**被触发时**怎么拉（点开详情 / 富化到达），
+    // 这一组决定**模块要不要自己定时拉**。前者永远需要一个外部触发（用户点击、宿主刷新），
+    // 而宿主不刷新时首页就一直停在旧数据上 —— 轮查补的就是这一格。
+
+    /**
+     * 自动轮查总开关。**默认关**。
+     *
+     * 关的理由不是「怕费电」，而是它必须**常驻一条通知**（见 `AutoWatchService`）：
+     * 后台每几分钟醒一次只能靠前台服务，而前台服务在通知栏里是撤不掉的。
+     * 这种「看得见的后台常驻」不该由默认值替用户决定，得他自己开。
+     */
+    const val KEY_AUTO_WATCH = "auto_watch"
+
+    /** 轮查范围，取值见下面的 `MODE_WATCH_*`。 */
+    const val KEY_WATCH_SCOPE = "watch_scope"
+
+    /** 夜间暂停。默认开 —— 半夜没有快递在动，那些请求纯属白花。 */
+    const val KEY_WATCH_QUIET = "watch_quiet"
+
+    /** 夜间暂停的**起**（整点小时 0..23），默认 22。 */
+    const val KEY_WATCH_QUIET_START = "watch_quiet_start"
+
+    /** 夜间暂停的**止**（整点小时 0..23），默认 8。 */
+    const val KEY_WATCH_QUIET_END = "watch_quiet_end"
+
+    /** 只问还在路上（运输中 / 派送中）的件。 */
+    const val MODE_WATCH_TRANSIT = "watch_transit"
+
+    /** 连到站待取件一起问（没闭环的都算）。到站件的动态也会推进，但请求数翻倍。 */
+    const val MODE_WATCH_UNFINISHED = "watch_unfinished"
+
+    const val DEFAULT_WATCH_SCOPE = MODE_WATCH_TRANSIT
+
+    /** 夜间暂停的**起**（整点小时 0..23），默认 22。 */
+    const val DEFAULT_WATCH_QUIET_START = 22
+    const val DEFAULT_WATCH_QUIET_END = 8
+
+    /**
+     * 件与件之间的基准间隔（**分钟**）。默认 3，与 `WatchSchedule.DEFAULT_BASE_GAP_MS` 同一个值。
+     *
+     * 2026-09-27 用户要求可调 —— 之前它写死在 `WatchSchedule` 里，用户只能接受 3 分钟。
+     * 合法区间与夹取都在 `WatchSchedule.clampGapMinutes`（core 里，带单测）。
+     */
+    const val KEY_WATCH_GAP_MIN = "watch_gap_min"
+
+    /** 一轮跑完之后等多久（**分钟**）。默认 30，含义见 `WatchSchedule.DEFAULT_CYCLE_WAIT_MS`。 */
+    const val KEY_WATCH_CYCLE_MIN = "watch_cycle_min"
+
+    /**
+     * 轮查时要不要那条前台服务通知。默认**开**。
+     *
+     * ⚠️ 关掉**不等于**通知消失：Android 要求前台服务必须有通知，否则服务会被直接杀掉。
+     * 这里能做的只是把它降成最低优先级 + 静默（不占状态栏图标、不出声），
+     * 通知栏里仍会有一条 —— 想彻底不看到只能在系统设置里把「自动轮查」渠道关掉。
+     * 界面上的说明必须把这条说清楚（见设置页那一行 HintText），不能让用户以为它不见了。
+     */
+    const val KEY_WATCH_NOTIFICATION = "watch_notification"
+
+    const val DEFAULT_WATCH_GAP_MIN = 3
+    const val DEFAULT_WATCH_CYCLE_MIN = 30
+
+    /** 件间隔可选项。键是分钟数，值是给人看的标签；UI 与写入侧共用一份，避免两处对不上。 */
+    val WATCH_GAP_OPTIONS: List<Pair<Int, String>> = listOf(
+        1 to "1 分钟",
+        2 to "2 分钟",
+        3 to "3 分钟",
+        5 to "5 分钟",
+        10 to "10 分钟",
+        20 to "20 分钟",
+    )
+
+    /** 轮间隔可选项。 */
+    val WATCH_CYCLE_OPTIONS: List<Pair<Int, String>> = listOf(
+        5 to "5 分钟",
+        15 to "15 分钟",
+        30 to "30 分钟",
+        60 to "1 小时",
+        120 to "2 小时",
+        360 to "6 小时",
+    )
+
+    /** 轮查范围的两个选项，UI 与解析共用一份（同 [MODE_OPTIONS] 的做法）。 */
+    val WATCH_SCOPE_OPTIONS: List<Pair<String, String>> = listOf(
+        MODE_WATCH_TRANSIT to "在途",
+        MODE_WATCH_UNFINISHED to "未完成",
+    )
+
     /**
      * 从 SharedPreferences 读出全部设置。
      *
@@ -150,10 +254,35 @@ object ExpressSettingsKeys {
             extraKeywords = splitKeywords(prefs.getString(KEY_EXTRA_KEYWORDS, null)),
             excludeKeywords = splitKeywords(prefs.getString(KEY_EXCLUDE_KEYWORDS, null)),
             confidenceThreshold = prefs.getInt(KEY_CONFIDENCE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD),
+            // 解析（含「丢掉不可拦截的分类」那道守卫）在 core 里，两处读取方共用同一份解释。
+            interceptedCategories = NotificationCategory.parse(
+                splitKeywords(prefs.getString(KEY_INTERCEPTED_CATEGORIES, null)),
+            ),
             hookForceEnabled = prefs.getBoolean(KEY_HOOK_FORCE_ENABLED, false),
             traceFetchMode = prefs.getString(KEY_TRACE_FETCH_MODE, DEFAULT_TRACE_FETCH_MODE)
                 ?.takeIf { it == MODE_TRACE_AUTO || it == MODE_TRACE_ON_DEMAND }
                 ?: DEFAULT_TRACE_FETCH_MODE,
+            autoWatch = prefs.getBoolean(KEY_AUTO_WATCH, false),
+            watchScope = prefs.getString(KEY_WATCH_SCOPE, DEFAULT_WATCH_SCOPE)
+                ?.takeIf { it == MODE_WATCH_TRANSIT || it == MODE_WATCH_UNFINISHED }
+                ?: DEFAULT_WATCH_SCOPE,
+            watchQuiet = prefs.getBoolean(KEY_WATCH_QUIET, true),
+            // 小时数一律夹到合法区间：手改 XML / 换地区之后算出 25 点这种值，
+            // 排程那边会一直等一个不存在的时刻（表现是「轮查再也没跑过」）。
+            watchQuietStart = prefs.getInt(KEY_WATCH_QUIET_START, DEFAULT_WATCH_QUIET_START)
+                .coerceIn(0, 23),
+            watchQuietEnd = prefs.getInt(KEY_WATCH_QUIET_END, DEFAULT_WATCH_QUIET_END)
+                .coerceIn(0, 23),
+            // 间隔同样夹取：手改 XML 写个 0 或 9999 进去，排程那边会变成「连发」或「再也不跑」，
+            // 而界面上看不出为什么。夹取规则在 core（WatchSchedule），与单测同一份出处。
+            watchGapMinutes = WatchSchedule.clampGapMinutes(
+                prefs.getInt(KEY_WATCH_GAP_MIN, DEFAULT_WATCH_GAP_MIN),
+            ),
+            watchCycleMinutes = WatchSchedule.clampCycleMinutes(
+                prefs.getInt(KEY_WATCH_CYCLE_MIN, DEFAULT_WATCH_CYCLE_MIN),
+            ),
+            // 默认开：关掉之后通知栏那一条会变成最低优先级（见 KEY_WATCH_NOTIFICATION）。
+            watchNotification = prefs.getBoolean(KEY_WATCH_NOTIFICATION, true),
         )
     }
 
@@ -201,6 +330,20 @@ object ExpressSettingsKeys {
             .putString(KEY_EXCLUDE_KEYWORDS, joinKeywords(snapshot.excludeKeywords))
             .putInt(KEY_CONFIDENCE_THRESHOLD, snapshot.confidenceThreshold)
             .putString(KEY_TRACE_FETCH_MODE, snapshot.traceFetchMode)
+            .putBoolean(KEY_AUTO_WATCH, snapshot.autoWatch)
+            .putString(KEY_WATCH_SCOPE, snapshot.watchScope)
+            .putBoolean(KEY_WATCH_QUIET, snapshot.watchQuiet)
+            .putInt(KEY_WATCH_QUIET_START, snapshot.watchQuietStart)
+            .putInt(KEY_WATCH_QUIET_END, snapshot.watchQuietEnd)
+            .putInt(KEY_WATCH_GAP_MIN, snapshot.watchGapMinutes)
+            .putInt(KEY_WATCH_CYCLE_MIN, snapshot.watchCycleMinutes)
+            .putBoolean(KEY_WATCH_NOTIFICATION, snapshot.watchNotification)
+            // 分类用 `names()` 归一化（排序 + 只留可拦截的）再拼：界面上的集合顺序随点击先后变，
+            // 不排序的话同一个配置每次存出来都不同，比对 prefs 时看不出「到底改没改」。
+            .putString(
+                KEY_INTERCEPTED_CATEGORIES,
+                joinKeywords(NotificationCategory.names(snapshot.interceptedCategories).toSet()),
+            )
             .apply()
     }
 

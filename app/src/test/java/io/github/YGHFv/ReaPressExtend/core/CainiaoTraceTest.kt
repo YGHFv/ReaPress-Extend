@@ -140,7 +140,7 @@ class CainiaoTraceTest {
     @Test
     fun `wapSign 按 token&t&appKey&data 拼接`() {
         assertEquals(
-            "411223f93f6c5ce02e915792f1938989",
+            "922e50f8507876a9254b16c53e810e2c",
             MtopSign.wapSign(
                 token = "00000000000000000000000000000000",
                 timestamp = "1790410278831",
@@ -181,6 +181,57 @@ class CainiaoTraceTest {
     fun `没有 newStatusDesc 时退回 status`() {
         val raw = """{"data":{"result":[{"mailNo":"JT1","packageStatus":{"status":"运输中"}}]}}"""
         assertEquals("运输中", CainiaoTraceParser.parse(raw)?.statusDesc)
+    }
+
+    @Test
+    fun `结论型状态可以直接拿来推进记录`() {
+        // 卡片右上角那句「派送中 / 待取件」+ 分档（运输中 → 到站包裹）读的都是 record.status，
+        // 而它以前只有宿主富化会给 —— 宿主不刷新，用户就看着旧状态（2026-09-27 用户报的）。
+        // 这个样本改的是 packageStatus（`body()` 里那个字段是写死的「待取件」）。
+        assertEquals(
+            ExpressStatus.READY_FOR_PICKUP,
+            CainiaoTraceParser.parse(statusBody("待取件"))?.status,
+        )
+        assertEquals(ExpressStatus.DELIVERING, CainiaoTraceParser.parse(statusBody("派送中"))?.status)
+        assertEquals(ExpressStatus.ARRIVED_STATION, CainiaoTraceParser.parse(statusBody("已到站"))?.status)
+        assertEquals(ExpressStatus.SIGNED, CainiaoTraceParser.parse(statusBody("已签收"))?.status)
+    }
+
+    @Test
+    fun `运输中不收_免得把已下单抬回运输中`() {
+        // 轨迹的 newStatusDesc 与宿主描述同源。收下「运输中」就等于把 mergeEnrichment 里
+        // 那条「CREATED 纠正 IN_TRANSIT」原样盖回去（界面从「已下单」跳回「运输中」）。
+        // 原话仍然照收（statusDesc），只是不当判据用。
+        assertNull(CainiaoTraceParser.parse(statusBody("运输中"))?.status)
+        assertEquals("运输中", CainiaoTraceParser.parse(statusBody("运输中"))?.statusDesc)
+    }
+
+    @Test
+    fun `认不出的状态描述不给状态`() {
+        assertNull(CainiaoTraceParser.parse(statusBody("莫名其妙的一句"))?.status)
+    }
+
+    /** 只带 `packageStatus`，用来单独钉「状态怎么取」这件事（`body()` 里那个字段是写死的）。 */
+    private fun statusBody(desc: String): String =
+        """{"data":{"result":[{"mailNo":"JT1","packageStatus":{"newStatusDesc":"$desc"}}]}}"""
+
+    @Test
+    fun `轨迹状态经合并只推进不回退`() {
+        val arrived = ExpressRecord(
+            sourcePackage = "com.cainiao.wireless",
+            rawText = "x",
+            trackingNumber = "JT1",
+            status = ExpressStatus.ARRIVED_STATION,
+        )
+        // 轨迹这一趟给的是「运输中」也不该把到站件退回去（isAdvanceFrom 拦下）。
+        val stale = arrived.copy(status = ExpressStatus.IN_TRANSIT)
+        assertEquals(ExpressStatus.ARRIVED_STATION, arrived.mergeEnrichment(stale).status)
+        // 正向：运输中的件被轨迹推到待取件，收下。
+        val transit = arrived.copy(status = ExpressStatus.IN_TRANSIT)
+        assertEquals(
+            ExpressStatus.READY_FOR_PICKUP,
+            transit.mergeEnrichment(arrived.copy(status = ExpressStatus.READY_FOR_PICKUP)).status,
+        )
     }
 
     @Test
@@ -233,6 +284,65 @@ class CainiaoTraceTest {
 
         // 反向：本记录空着时才吸收
         assertEquals("别的地方", record().mergeEnrichment(another).stationAddress)
+    }
+
+    // ------------------------------------------------------------ 运单动态（末条轨迹）
+
+    @Test
+    fun `末条轨迹就是卡片上那句运单动态`() {
+        val points = listOf(
+            ExpressTracePoint("2026-09-20 10:00:00", "快件已揽收"),
+            ExpressTracePoint("2026-09-26 13:19:31", "快件已到达【城东集散点】"),
+        )
+        // 「最早 → 最新」的末条，正是首页副行 / 通知正文上的那句运单动态
+        assertEquals("快件已到达【城东集散点】", latestTraceDetail(points))
+    }
+
+    @Test
+    fun `没有轨迹时不给动态`() {
+        // 全是广告被清洗掉、或接口返回空表时都不能编一句出来 ——
+        // 返回 null，合并时原样保留记录里已有的值
+        assertNull(latestTraceDetail(emptyList()))
+    }
+
+    @Test
+    fun `刚拉到的轨迹会顶掉过时的宿主动态`() {
+        // 2026-09-27 用户报的现场：首页那句动态停在上次打开菜鸟时的样子，点进详情能拉到
+        // 新轨迹，回到首页却不变。根因是轨迹拉取只写 trace，而卡片读的是 logisticsDetail。
+        // 轨迹是自己刚拉的（timestamp 更新），走 mergeEnrichment 的时序规则顶掉旧的。
+        val stored = ExpressRecord(
+            sourcePackage = "com.cainiao.wireless",
+            rawText = "您的包裹已到达",
+            trackingNumber = "JT0000000000000",
+            logisticsDetail = "快件离开【南宁转运中心】",
+            status = ExpressStatus.IN_TRANSIT,
+            timestamp = 1_000L,
+        )
+        val fetched = ExpressRecord(
+            sourcePackage = "com.cainiao.wireless",
+            rawText = "trace request",
+            trackingNumber = "JT0000000000000",
+            origin = ExpressOrigin.ENRICHMENT,
+            timestamp = 9_000L,
+            trace = listOf(
+                ExpressTracePoint("2026-09-25 09:00:00", "快件离开【南宁转运中心】"),
+                ExpressTracePoint("2026-09-26 13:19:31", "快件已到达【城东集散点】"),
+            ),
+            logisticsDetail = "快件已到达【城东集散点】",
+        )
+
+        val merged = stored.mergeEnrichment(fetched)
+        assertEquals("快件已到达【城东集散点】", merged.logisticsDetail)
+        // 首页卡片副行读的就是这个字段 —— 顺手把「拉回轨迹 → 卡片会变」这条链钉住
+        assertEquals("快件已到达【城东集散点】", ExpressFormatter.detailLine(merged))
+    }
+
+    @Test
+    fun `拉不到轨迹时不动已有的动态`() {
+        // 末条被广告清洗掉时 latestTraceDetail 是 null，合并不能把已有的那句抹掉
+        val stored = record().copy(logisticsDetail = "快递员正在派件")
+        val bare = record().copy(timestamp = 9_000L, logisticsDetail = null)
+        assertEquals("快递员正在派件", stored.mergeEnrichment(bare).logisticsDetail)
     }
 
     // ------------------------------------------------------------ 样本

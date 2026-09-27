@@ -21,12 +21,14 @@ import io.github.YGHFv.ReaPressExtend.core.CainiaoTraceInfo
 import io.github.YGHFv.ReaPressExtend.core.Courier
 import io.github.YGHFv.ReaPressExtend.core.ExpressOrigin
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
+import io.github.YGHFv.ReaPressExtend.core.latestTraceDetail
 import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
 import java.util.Collections
 import java.util.concurrent.Executors
 
 /**
- * 补齐宿主首页给不出的东西：全轨迹、驿站完整地址、商品图。
+ * 补齐宿主首页给不出的东西：全轨迹、驿站完整地址、商品图、以及**运单动态**
+ * （末条轨迹，见 [apply] 里那段说明 —— 首页卡片那句动态以前只跟着宿主富化走）。
  *
  * ## 按需拉，不批量自动拉
  *
@@ -91,6 +93,11 @@ internal object CainiaoTraceFetcher {
      * @param cookieProvider 每次执行时现取 cookie（hook 进程读菜鸟文件；模块进程读
      *   [io.github.YGHFv.ReaPressExtend.relay.TraceCookieCache] 内存缓存）
      * @param deliver 拉到结果后怎么投：hook 进程走 relay 广播；模块进程直接落库
+     * @param recheck true = **允许重拉成功过的单号**（自动轮查用）。默认 false，
+     *   成功表（[succeeded]）是「用户反复进出详情页不重复请求」的判据；而轮查的整个
+     *   意义就是**隔一段时间再问一次**，被那张表挡住就等于轮查什么都没干。
+     *   两种语义不能共用一个默认值，所以做成显式开关而不是放宽成功表 ——
+     *   放宽会让「点开详情」也变成每次重拉，风控压力立刻翻几倍。
      *
      * 被任何一道闸门挡下都**静默返回**：调用方（UI）另有超时降级，这里不需要也不应该
      * 反向通知 —— 反向通道会把「UI 等 hook 回应」变成双向协议，复杂度翻倍收益为零。
@@ -98,6 +105,7 @@ internal object CainiaoTraceFetcher {
     fun requestFetch(
         cookieProvider: () -> String?,
         tracking: String,
+        recheck: Boolean = false,
         deliver: (ExpressRecord) -> Unit,
     ) {
         // 退避期内的所有判断都放在占坑**之前**：这时候连「成功表」「冷却表」都不该动，
@@ -106,7 +114,7 @@ internal object CainiaoTraceFetcher {
         val now = System.currentTimeMillis()
         // in-flight 占坑防的是并发重复入队，不代表结果成败 —— 成败由 executor 闭包最后一步记账。
         if (!inFlight.add(tracking)) return
-        if (tracking in succeeded) {
+        if (!recheck && tracking in succeeded) {
             inFlight.remove(tracking)
             return
         }
@@ -129,7 +137,8 @@ internal object CainiaoTraceFetcher {
                 deliver(apply(stubRecord(tracking), info))
                 XposedBridge.logAlways(
                     "cainiao trace ok: tn=${tracking.take(8)}… pts=${info.points.size} " +
-                        "addr=${info.stationAddress} img=${info.goodsImage != null}",
+                        "st=${info.status ?: "-"} addr=${info.stationAddress} " +
+                        "img=${info.goodsImage != null}",
                 )
             }.onFailure {
                 // 这条链路是「锦上添花」，任何异常都不该影响宿主 —— 记日志就行。
@@ -169,6 +178,19 @@ internal object CainiaoTraceFetcher {
         trace = info.points,
         stationAddress = info.stationAddress,
         goodsImage = info.goodsImage,
+        // 运单动态也补一份：**卡片副行和通知正文读的是这个字段，不是 `trace`**。
+        // 它原来只有宿主的 `lastLogisticDetail` 一个来源，而宿主富化只在用户打开菜鸟时
+        // 才发生 —— 于是「模块自己拉到新轨迹、详情页看得见，首页那句动态纹丝不动」
+        // （2026-09-27 用户报的）。轨迹末条和宿主那句是同一件事，刚拉到的这份只会更新。
+        //
+        // 谁新谁旧的取舍在 [ExpressRecord.mergeEnrichment] 的时序规则里，这里不判 ——
+        // 拉不出轨迹（列表全被广告清洗掉）时给 null，那边会原样保留已有值。
+        logisticsDetail = latestTraceDetail(info.points) ?: record.logisticsDetail,
+        // 状态同理：卡片右上角那个词 + 分档（运输中 / 到站包裹）都读它，而它以前只有宿主富化
+        // 会给 —— 宿主几小时不刷新，用户看到的就是「轨迹都拉到新节点了，右上角还是旧状态」。
+        // 只认**结论型**状态（白名单见 [CainiaoTraceParser.TRACE_ADVANCE_STATUSES]），
+        // 且是否真的收下由 `mergeEnrichment` 的 `isAdvanceFrom` 判（不回退）。
+        status = info.status ?: record.status,
     )
 
     /**

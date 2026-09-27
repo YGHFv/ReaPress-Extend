@@ -28,6 +28,8 @@ import android.content.res.Configuration
 import android.graphics.drawable.ColorDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.WindowInsetsController
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
@@ -79,6 +81,7 @@ import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsSnapshot
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
 import io.github.YGHFv.ReaPressExtend.hook.CainiaoTraceApi
 import io.github.YGHFv.ReaPressExtend.core.ExpressRule
+import io.github.YGHFv.ReaPressExtend.core.NotificationCategory
 import io.github.YGHFv.ReaPressExtend.core.ExpressStationRules
 import io.github.YGHFv.ReaPressExtend.core.GeoPoint
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
@@ -88,6 +91,8 @@ import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationLog
 import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationPoster
 import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
 import io.github.YGHFv.ReaPressExtend.notification.ExpressStationRuleStore
+import io.github.YGHFv.ReaPressExtend.relay.AutoWatch
+import io.github.YGHFv.ReaPressExtend.relay.CainiaoDirectFetcher
 import io.github.YGHFv.ReaPressExtend.relay.ExpressRelay
 import io.github.YGHFv.ReaPressExtend.relay.HostCredentialRequester
 import io.github.YGHFv.ReaPressExtend.relay.HostRefreshRequester
@@ -211,8 +216,29 @@ class ExpressMainActivity : ComponentActivity() {
         super.onResume()
         resumeTick.intValue++
         refreshHostOnResume()
+        syncAutoWatchOnResume()
         // flag 记在**任务的根 Intent** 上，用户从后台划掉之后下次是全新任务 —— 每次都要重放。
         applyExcludeFromRecents(uiPrefs.hideFromRecents)
+    }
+
+    /**
+     * 上一次把自动轮查服务摆到位的时刻（见 [syncAutoWatchOnResume]）。
+     */
+    private var lastAutoWatchSyncAt = 0L
+
+    /**
+     * 「自动轮查」是后台常驻的前台服务，而拉起前台服务的合规时机只有**界面里**与**开机广播**
+     * 两处（Android 12 起后台不能随意起，见 [AutoWatch]）。这里是界面那一处：
+     * 用户开着轮查、但应用被强行停止或被系统清掉之后，再打开一次模块就是它回来的时机。
+     *
+     * 关掉开关时它同样起作用 —— `sync` 见开关关着就会把服务停掉，
+     * 这样「关掉之后通知栏还挂着一条」这种状态不会出现。
+     */
+    private fun syncAutoWatchOnResume() {
+        val now = System.currentTimeMillis()
+        if (now - lastAutoWatchSyncAt < AUTO_WATCH_SYNC_MIN_INTERVAL_MS) return
+        lastAutoWatchSyncAt = now
+        AutoWatch.sync(this, "打开模块")
     }
 
     /**
@@ -237,13 +263,20 @@ class ExpressMainActivity : ComponentActivity() {
      * 宿主的 `Application` 一创建还会自己跑一遍冷启动自查（见 `CainiaoPackageHook`）——
      * 那是第三条路，但它每进程只跑一次，覆盖不了「主进程一直活着」。
      *
-     * ⚠️ **这不是「保证刷新」**：关联启动可能被 ROM 拦下、菜鸟可能起来后又立刻被回收，
-     * 而广播发出去之后这一层什么都看不到。有没有成功，看模块日志里随后有没有
-     * `host self query: rows=N`（宿主读到本地表了）与 `enrichment received`（数据落进模块了）。
+     * ⚠️ **这不是「保证刷新」**：ROM 可能把拉起宿主的那条广播按发送方拦掉（唤醒销为此走两条路，
+     * 见 [HostWakePin]）、菜鸟可能起来后又立刻被回收，而广播发出去之后这一层什么都看不到。
+     * 有没有成功，看模块日志里随后有没有 `host self query: rows=N`（宿主读到本地表了）
+     * 与 `enrichment received`（数据落进模块了）。
      *
      * ⚠️ 也**不是「保证数据是新的」**：宿主自查读的是它**本地库**，那个库要靠宿主自己
      * （首页查询 / 推送 / 小组件）才会收到新包裹。这里解决的是「库里有、没人读」，
      * 不是「服务端有、本地没有」。
+     *
+     * 3. **直连兜底**（[scheduleDirectFetch]，2026-09-27 加）：上面两条**都要求菜鸟能被叫动**，
+     *    而 ROM 可以把第三方发起的拉起拦掉（HyperOS 实测如此，见 [HostWakePin]）。等
+     *    [CainiaoDirectFetcher.GRACE_MS] 之后宿主仍然没回话，就自己用菜鸟 WebView 里那份
+     *    淘宝登录态去问淘宝要订单 —— **整条路不经过菜鸟进程**。
+     *    ⚠️ 它只覆盖淘宝 / 天猫的件（拼多多、别人寄来的件仍只有菜鸟本地表有），是兜底不是替代。
      */
     private fun refreshHostOnResume() {
         val now = System.currentTimeMillis()
@@ -254,7 +287,33 @@ class ExpressMainActivity : ComponentActivity() {
         if (now - lastHostRefreshAt >= HOST_REFRESH_MIN_INTERVAL_MS) {
             lastHostRefreshAt = now
             HostRefreshRequester.request(this)
+            // 与刷新请求共用节流：两者是「宿主活/死」两个分支，用户的一次打开只需要一个答案。
+            scheduleDirectFetch(now)
         }
+    }
+
+    /**
+     * 给直连兜底一个宽限期 —— 宿主回话了就**什么都不做**。
+     *
+     * 为什么是「等而不是抢」：直连每跑一次都是**真金白银的请求数**（淘宝按频率收网的账，
+     * 见 `CainiaoDirectFetcher`），而宿主自查覆盖的件比它多得多 —— 只有在宿主**确实没接话**
+     * 时才值得动用它。
+     *
+     * 用 `postDelayed` 而不是协程：这一步与生命周期无关（用户可能已经退出模块，那也该更新），
+     * 而协程挂在 Activity 上会随销毁取消。这里只传 application context，不持有 Activity。
+     *
+     * 判据是**宿主刚刚回过话吗**（[CainiaoDirectFetcher.hostAnsweredSince]）而不是「这次有没有
+     * 收到」：回话可能在我们发请求之前就到了（宿主常年以推送进程活着时，1~3 秒就答）。
+     */
+    private fun scheduleDirectFetch(requestedAt: Long) {
+        val app = applicationContext
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (CainiaoDirectFetcher.hostAnsweredSince(requestedAt)) return@postDelayed
+            CainiaoDirectFetcher.start(
+                app,
+                "打开模块 ${CainiaoDirectFetcher.GRACE_MS / 1000} 秒内没有等到宿主回执",
+            )
+        }, CainiaoDirectFetcher.GRACE_MS)
     }
 
     /**
@@ -459,11 +518,16 @@ class ExpressMainActivity : ComponentActivity() {
         /**
          * 两次「打开模块叫醒菜鸟」之间的最小间隔。
          *
-         * 5 分钟：短到「用户从驿站回来重新打开」必然触发，长到「反复切前后台」不会把宿主
-         * 一次次拉起来。这个值只影响「多久拉一次进程」，不影响正确性 —— 唤醒是幂等的，
-         * 没叫醒也只是一次没有后续的空操作（真正干活的是 [HOST_REFRESH_MIN_INTERVAL_MS] 那条）。
+         * 1 分钟：**唤醒销是幂等的**（宿主活着时它是一记空操作，见 [HostWakePin]），所以这个值
+         * 只挡「同一回合内的重入」（从身份码弹窗回来、从驿站页返回），不挡「用户真的想重试」。
+         *
+         * 原来写的是 5 分钟，2026-09-27 真机实测后改小：HyperOS 上第三方应用的直投广播会被
+         * 关联启动限制拦掉，唤醒销因此改成**直投 + 请 system_server 代发**两条路一起走
+         * （见 [HostWakePin] 的分工表），拉一次的实际代价只是两条广播；
+         * 而 5 分钟的间隔会让用户「打开模块 → 没数据 → 再打开一次」这最常见的重试动作
+         * **什么都不做**，看上去就是「刷了跟没刷一样」。
          */
-        const val HOST_WAKE_MIN_INTERVAL_MS = 5 * 60_000L
+        const val HOST_WAKE_MIN_INTERVAL_MS = 60_000L
 
         /**
          * 两次「请宿主重查本地包裹表」之间的最小间隔。
@@ -473,6 +537,14 @@ class ExpressMainActivity : ComponentActivity() {
          * 那一条。一分钟足够挡住同一回合内的重入（从身份码弹窗回来、从驿站页返回）。
          */
         const val HOST_REFRESH_MIN_INTERVAL_MS = 60_000L
+
+        /**
+         * 两次「把自动轮查服务摆到正确状态」之间的最小间隔（见 [syncAutoWatchOnResume]）。
+         *
+         * 一分钟：`onResume` 在任何回到前台的时刻都会跑，而 `startForegroundService`
+         * 会让服务重发那条常驻通知 —— 同一个使用回合里刷几次通知栏没有任何意义。
+         */
+        const val AUTO_WATCH_SYNC_MIN_INTERVAL_MS = 60_000L
     }
 }
 
@@ -485,6 +557,32 @@ private const val TAB_HOME = 0
 private const val TAB_RECORDS = 1
 private const val TAB_SETTINGS = 2
 private const val TAB_ABOUT = 3
+
+/**
+ * 「夜间暂停」可选的两个整点。
+ *
+ * 只给常用的那一小段：起点 20–23、终点 5–10。列全 24 个要滚半天，而「下午 3 点开始暂停」
+ * 这种配置本身就没有意义 —— 那个点快递在正常动，暂停等于白白漏掉半天更新。
+ * 存量值落在这两段之外时（手改 prefs），下拉会显示第一项而不是崩掉（`coerceAtLeast(0)`）。
+ */
+private val QUIET_START_HOURS = (20..23).toList()
+private val QUIET_END_HOURS = (5..10).toList()
+private val QUIET_START_LABELS = QUIET_START_HOURS.map { "%02d:00".format(it) }
+private val QUIET_END_LABELS = QUIET_END_HOURS.map { "%02d:00".format(it) }
+
+/**
+ * 轮查间隔下拉用的「值 → 标签」表。
+ *
+ * 与上面那两个整点下拉的差别：这里**把手改 XML 出来的档位也如实插进来**。
+ * 整点那边落在线外的值会显示成第一项（`coerceAtLeast(0)`）—— 那对「20–23 点」这种
+ * 粗粒度设置无所谓，但间隔是一个**数值**：把 `7 分钟` 显示成 `1 分钟` 会让人以为设置丢了，
+ * 而且他会照着这个错的值去理解为什么请求这么密。所以插进排序里、如实显示。
+ *
+ * 返回值就是下拉的真值表：`items` 取 label、`selectedIndex` 取 `indexOfFirst` ——
+ * 三者同源，不可能错位。
+ */
+private fun watchEntries(options: List<Pair<Int, String>>, current: Int): List<Pair<Int, String>> =
+    (options + (current to "$current 分钟")).distinctBy { it.first }.sortedBy { it.first }
 
 private val TAB_TITLES = listOf("快递", "记录", "设置", "关于")
 private val TAB_ICONS: List<ImageVector> = listOf(
@@ -530,12 +628,53 @@ private fun ExpressApp(
     // 首页的包裹列表。拦截事件由 system_server 广播到本进程，而用户多半是「收到通知 →
     // 点开模块」—— 也就是 Activity 还活着但已离开前台时数据就变了。
     // 所以 [resumeTick] 每次 onResume 自增，这里随之重读；切回首页标签时也重读一次。
+    // 首次读取之前，先把历史记录按**当前**解析逻辑归并落盘（[ExpressRecordStore.reconcile]）。
+    // 解析层修好不会改掉已经落盘的值，而那些值会继续分组、还会按「只填空不覆盖」挡住富化的
+    // 真名（2026-09-27 用户上报的「原本正常的也识别崩了」里就有一条这样的历史记录）。
+    // 无变化时它一个字节都不写，所以挂在组合里重复执行也只是空转。
+    remember { ExpressRecordStore.reconcile(context) }
     var homeRecords by remember { mutableStateOf(ExpressRecordStore.load(context)) }
     // 记录页那份投递审计。提到这一层是因为「下拉刷新」要能就地重读它（见下面的 refresh）。
     var recordEntries by remember { mutableStateOf(ExpressNotificationLog.snapshot(context)) }
     LaunchedEffect(resumeTick) {
         homeRecords = ExpressRecordStore.load(context)
         recordEntries = ExpressNotificationLog.snapshot(context)
+    }
+
+    /**
+     * 存储一变就叫首页重读一遍（[ExpressRelay.ACTION_RECORDS_CHANGED]）。
+     *
+     * ## 为什么必须挂在这一层（2026-09-27 用户报的问题）
+     *
+     * 这条广播原来**只注册在详情页里**（就在下面那个「二级页」分支里，和收刷新指示器的那条
+     * 挨着）。于是用户停在首页时，「宿主自查灌完一批 / 富化补上取件码和动态」这些事对界面
+     * 完全没有影响 —— 功能明明成了，首页还是打开那一刻的旧快照，卡片右列的运单动态、
+     * 取件码一直不变。挂在主界面这一层（所有二级页的提前 `return` **之前**）之后，
+     * 首页、详情页、归档页在的时候它都在收。
+     *
+     * 用 `DisposableEffect(Unit)` 而不是把它挂在某个会随页签切换重建的节点上：注册/注销
+     * 一次广播接收器不必跟着页面重组走 —— 这一层在整个 Activity 可见期间是稳定的。
+     */
+    DisposableEffect(Unit) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                homeRecords = ExpressRecordStore.load(context)
+                // 记录页 / 拦截记录页那份也一起重读（2026-09-27 补）：
+                // 「模块刚发出去的那条」与「刚被吞掉的那条」都写在这一个 prefs 文件里，
+                // 「记录」页却只有在 onResume 或下拉刷新时才重读 —— 用户盯着屏幕等新记录时
+                // 表现得像功能没生效。代价是一次 prefs 读 + 最多 100 条的 JSON 解析，
+                // 而这条信号在发送侧最密也就是 600ms 一次（见 notifyRecordsChanged 的节流）。
+                recordEntries = ExpressNotificationLog.snapshot(context)
+            }
+        }
+        val filter = IntentFilter(ExpressRelay.ACTION_RECORDS_CHANGED)
+        if (Build.VERSION.SDK_INT >= 33) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            context.registerReceiver(receiver, filter)
+        }
+        onDispose { context.unregisterReceiver(receiver) }
     }
 
     /**
@@ -589,6 +728,17 @@ private fun ExpressApp(
     // 二级页（模块日志）。打开时整页替换掉主界面：日志页自带顶栏与返回，
     // 底栏那四个页签在这一层没有意义，留着只会让人以为还能往左右滑。
     var logPageOpen by remember { mutableStateOf(false) }
+
+    // 二级页（一条通知记录的详情）。与日志页同样整页替换 —— 那一页要看原文对照，
+    // 塞在列表里会把「原文 / 识别结果」两段的边界糊掉。空值 = 没打开。
+    var recordDetail by remember { mutableStateOf<ExpressNotificationLog.Entry?>(null) }
+
+    // 「拦截记录」二级页（设置 → 通知拦截 → 拦截记录进来的）。
+    //
+    // 与「记录」那一栏是**同一份存储的两个视图**（靠 Entry.kind 分开）：那边是模块发出去的通知，
+    // 这边是按设置被吞掉的通知。入口放在设置里而不是底栏 —— 它是「核对我的拦截设置生效了吗」
+    // 的辅助视图，不是日常要看的东西。
+    var interceptPageOpen by remember { mutableStateOf(false) }
 
     // 驿站管理（合并 / 改外显名）的规则，以及那个二级页面开没开。
     // 规则改完立刻重读一遍：首页分组是拿它现算的，不重读的话名字改了但卡片没动。
@@ -821,6 +971,10 @@ private fun ExpressApp(
         // 拉取结果落库后（本进程直拉或菜鸟兜底回来的）会发内部广播 —— 收到就重读，
         // 详情页上的轨迹 / 地址 / 商品图原地更新。二选一收位：这里提前收，
         // 或者 requestTraceForDetail 里的超时兜底。
+        //
+        // 这里**只收 TRACE_ARRIVED**：列表的重读由上面那一层那条
+        // [ExpressRelay.ACTION_RECORDS_CHANGED] 负责（它在这个二级页开着时同样活着），
+        // 两条 action 分开正是为了不让「一批数据落库」把这里的指示器提前收掉。
         DisposableEffect(Unit) {
             val receiver = object : BroadcastReceiver() {
                 override fun onReceive(ctx: Context?, intent: Intent?) {
@@ -829,27 +983,6 @@ private fun ExpressApp(
                 }
             }
             val filter = IntentFilter(ExpressRelay.ACTION_TRACE_ARRIVED)
-            if (Build.VERSION.SDK_INT >= 33) {
-                context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                @Suppress("UnspecifiedRegisterReceiverFlag")
-                context.registerReceiver(receiver, filter)
-            }
-            onDispose { context.unregisterReceiver(receiver) }
-        }
-
-        // 宿主自查那一批灌完之后的重读（见 ACTION_RECORDS_CHANGED 的注释）。
-        //
-        // 与上面那条**必须分开注册**：那个的接收体里还有 `detailRefreshing = false`，
-        // 而这条消息到达时详情页可能正等着一单的轨迹 —— 被提前收掉指示器，
-        // 用户看到的是「暂无物流轨迹」，但其实还在拉。
-        DisposableEffect(Unit) {
-            val receiver = object : BroadcastReceiver() {
-                override fun onReceive(ctx: Context?, intent: Intent?) {
-                    homeRecords = ExpressRecordStore.load(context)
-                }
-            }
-            val filter = IntentFilter(ExpressRelay.ACTION_RECORDS_CHANGED)
             if (Build.VERSION.SDK_INT >= 33) {
                 context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
             } else {
@@ -910,6 +1043,35 @@ private fun ExpressApp(
             rules = stationRules,
             onBack = { archiveOpen = false },
             onOpenDetail = { record -> detailRecord = record },
+        )
+        return
+    }
+
+    // 「通知记录」详情二级页。
+    //
+    // 排在归档之后、Scaffold 之前：它只能从「记录」那一栏点进来，与首页那两条
+    // （包裹详情 / 归档）没有交集 —— 放在这一层只是「二级页先于主界面」这个统一的形状。
+    recordDetail?.let { entry ->
+        NotificationDetailPage(entry = entry, onBack = { recordDetail = null })
+        return
+    }
+
+    // 「拦截记录」二级页（设置 → 通知拦截 → 拦截记录）。
+    //
+    // 排在详情判定**之后**（与归档页同一个理由）：从这一页点进某条详情时
+    // `interceptPageOpen` 仍为 true，两个条件同时成立 —— 详情先判定就赢了，
+    // 用户看到的是那一条的详情；返回（`recordDetail = null`）之后又自然落回**本页**，
+    // 而不是被一脚踢回设置页。
+    //
+    // 数据直接从 `recordEntries` 里筛，不另开一份状态：两者本来就是同一份存储的两个视图
+    // （靠 Entry.kind 分开），各自维护一份状态迟早出现「记录页有、拦截页没有」的错位。
+    if (interceptPageOpen) {
+        ExpressInterceptPage(
+            entries = recordEntries.filter {
+                it.kind == ExpressNotificationLog.Kind.INTERCEPTED
+            },
+            onBack = { interceptPageOpen = false },
+            onOpen = { recordDetail = it },
         )
         return
     }
@@ -1077,7 +1239,15 @@ private fun ExpressApp(
                             // 它拿的还是同一份 homeRecords，存储重读后它自己会重组。
                             onOpenArchive = { archiveOpen = true },
                         )
-                        TAB_RECORDS -> RecordPage(recordEntries)
+                        // 「记录」那一栏只看**投递**记录（模块发出去的通知）。拦截记录是另一个视图
+                        // （设置 → 通知拦截 → 拦截记录）—— 两者混在一页里，「已发出 N/M」这个统计
+                        // 会被一堆根本没打算发的条目拉歪。
+                        TAB_RECORDS -> RecordPage(
+                            entries = recordEntries.filter {
+                                it.kind == ExpressNotificationLog.Kind.DELIVERED
+                            },
+                            onOpen = { recordDetail = it },
+                        )
                         TAB_ABOUT -> AboutPage(
                             settings = settings,
                             onOpenLog = { logPageOpen = true },
@@ -1118,6 +1288,15 @@ private fun ExpressApp(
                             blurSupported = blurSupported,
                             stationRules = stationRules,
                             onOpenStations = { stationAdminOpen = true },
+                            // 副标题要显示条数，而拦截随时可能发生（数据是 system_server 推来的）——
+                            // 点开那一刻先重读一遍，再进二级页。重读是同步的 prefs 读取，很便宜。
+                            interceptCount = recordEntries.count {
+                                it.kind == ExpressNotificationLog.Kind.INTERCEPTED
+                            },
+                            onOpenIntercepts = {
+                                recordEntries = ExpressNotificationLog.snapshot(context)
+                                interceptPageOpen = true
+                            },
                         )
                     }
                     Spacer(Modifier.height(padding.calculateBottomPadding()))
@@ -1296,7 +1475,13 @@ private fun SettingsPage(
     blurSupported: Boolean,
     stationRules: ExpressStationRules,
     onOpenStations: () -> Unit,
+    /** 已拦截的通知条数（「通知拦截」卡片里那个入口的副标题）。 */
+    interceptCount: Int,
+    onOpenIntercepts: () -> Unit,
 ) {
+    // 「自动轮查」的开关要立刻把服务摆到位（见那一行的说明），所以这里需要一个 context。
+    val context = LocalContext.current
+
     GroupTitle("界面")
     SettingsCard {
         OverlayDropdownPreference(
@@ -1382,6 +1567,121 @@ private fun SettingsPage(
         )
     }
 
+    GroupTitle("自动轮查")
+    SettingsCard {
+        // 与上面那个模式的分工：那个决定「被触发时怎么拉」（用户点开 / 宿主刷新到达），
+        // 这一组决定**模块要不要自己定时去问**。宿主几小时不刷新时上面那条一次都不会响，
+        // 首页就停在旧数据上 —— 轮查补的正是这一格。
+        //
+        // 代价必须写出来：后台定时只能靠前台服务，而前台服务在通知栏里是撤不掉的。
+        // 这一行摘要平时是 null（开关自己已经说明了一切），开着时才提示那条常驻通知。
+        SwitchPreference(
+            title = "自动轮查",
+            summary = if (settings.autoWatch) "通知栏会有一条常驻通知「自动轮查」" else null,
+            checked = settings.autoWatch,
+            onCheckedChange = { on ->
+                update { it.copy(autoWatch = on) }
+                // 起停立刻生效：等下一次 onResume 或开机才动的话，用户会觉得「开了没反应」。
+                // 这里在前台，拉起前台服务是合规的（见 AutoWatch 的说明）。
+                AutoWatch.sync(context, if (on) "设置页开启" else "设置页关闭")
+            },
+        )
+        if (settings.autoWatch) {
+            SegmentedRow(
+                options = ExpressSettingsKeys.WATCH_SCOPE_OPTIONS,
+                selected = settings.watchScope,
+                onSelect = { scope -> update { it.copy(watchScope = scope) } },
+            )
+            HintText("「在途」只问运输中与派送中的件；「未完成」连到站待取件一起问（请求数翻倍）。")
+            // 间隔可调（2026-09-27 用户要求）。合法区间在 core 的 WatchSchedule 里夹取，
+            // 下拉只给常见档 —— 列全 30 档要滚半天，1/2/3/5/10/20 已经覆盖「想更快/更慢」。
+            val gapEntries = watchEntries(
+                ExpressSettingsKeys.WATCH_GAP_OPTIONS,
+                settings.watchGapMinutes,
+            )
+            OverlayDropdownPreference(
+                title = "件与件间隔",
+                items = gapEntries.map { it.second },
+                selectedIndex = gapEntries.indexOfFirst { it.first == settings.watchGapMinutes }
+                    .coerceAtLeast(0),
+                onSelectedIndexChange = { index ->
+                    val minutes = gapEntries.getOrNull(index)?.first
+                    if (minutes != null) {
+                        update { it.copy(watchGapMinutes = minutes) }
+                        // 把已经排好的那次等待跟着往前挪：服务此刻可能正睡在一个更长的
+                        // 等待里（改小间隔却还要等旧的整段 = 界面表现成「改了没用」）。
+                        AutoWatch.reschedule(context, minutes.toLong() * 60_000L)
+                    }
+                },
+            )
+            val cycleEntries = watchEntries(
+                ExpressSettingsKeys.WATCH_CYCLE_OPTIONS,
+                settings.watchCycleMinutes,
+            )
+            OverlayDropdownPreference(
+                title = "一轮间隔",
+                items = cycleEntries.map { it.second },
+                selectedIndex = cycleEntries.indexOfFirst { it.first == settings.watchCycleMinutes }
+                    .coerceAtLeast(0),
+                onSelectedIndexChange = { index ->
+                    val minutes = cycleEntries.getOrNull(index)?.first
+                    if (minutes != null) {
+                        update { it.copy(watchCycleMinutes = minutes) }
+                        AutoWatch.reschedule(context, minutes.toLong() * 60_000L)
+                    }
+                },
+            )
+            SwitchPreference(
+                title = "轮查通知",
+                summary = "通知栏那条常驻通知（关掉只压成静默，撤不掉）",
+                checked = settings.watchNotification,
+                onCheckedChange = { on -> update { it.copy(watchNotification = on) } },
+            )
+            if (!settings.watchNotification) {
+                // 必须如实说清能做到什么程度：前台服务的通知在 Android 上**撤不掉**，
+                // 关掉这个开关的效果是「不出声 + 不占状态栏图标」，通知栏里仍会有一条。
+                // 写「不再显示通知」就是骗人（而那正是用户下次来报 bug 的由头）。
+                HintText("Android 要求前台服务必须有通知，只能压成最低优先级 —— 不占状态栏、不出声，通知栏里仍有一条。")
+            }
+            SwitchPreference(
+                title = "夜间暂停",
+                summary = "停在 ${settings.quietWindowLabel()}",
+                checked = settings.watchQuiet,
+                onCheckedChange = { on -> update { it.copy(watchQuiet = on) } },
+            )
+            if (settings.watchQuiet) {
+                // 只给常用的那几个整点：列全 24 个要滚半天，而「下午 3 点开始暂停」这种
+                // 配置本来就没有意义（那个点快递在正常动）。
+                OverlayDropdownPreference(
+                    title = "夜间开始",
+                    items = QUIET_START_LABELS,
+                    selectedIndex = QUIET_START_HOURS.indexOf(settings.watchQuietStart).coerceAtLeast(0),
+                    onSelectedIndexChange = { index ->
+                        QUIET_START_HOURS.getOrNull(index)?.let { hour ->
+                            update { it.copy(watchQuietStart = hour) }
+                        }
+                    },
+                )
+                OverlayDropdownPreference(
+                    title = "早上恢复",
+                    items = QUIET_END_LABELS,
+                    selectedIndex = QUIET_END_HOURS.indexOf(settings.watchQuietEnd).coerceAtLeast(0),
+                    onSelectedIndexChange = { index ->
+                        QUIET_END_HOURS.getOrNull(index)?.let { hour ->
+                            update { it.copy(watchQuietEnd = hour) }
+                        }
+                    },
+                )
+            }
+            HintText(
+                // 这句必须由 watchCadenceLabel() 生成：以前它是写死的 3 分钟 / 30 分钟，
+                // 用户在下拉里改完间隔后界面就会「说一套做一套」——比没有说明更糟。
+                "当前节奏：${settings.watchCadenceLabel()}（间隔按 ±随机抖动摊开，避免固定周期）。" +
+                    "只拉已经在首页的件的新轨迹 —— 新包裹只能由菜鸟/淘宝那边推过来。",
+            )
+        }
+    }
+
     GroupTitle("工作模式")
     SettingsCard {
         // 一个三态控件，不再有「总开关 + 模式」两个能互相矛盾的入口。
@@ -1395,6 +1695,52 @@ private fun SettingsPage(
         if (settings.mode == ExpressSettingsKeys.MODE_INTERCEPT) {
             HintText("原通知会被吞掉，请先在放行模式确认通知能收到。")
         }
+    }
+
+    GroupTitle("通知拦截")
+    SettingsCard {
+        // 一组分类开关：勾上的分类**直接吞掉**（原通知不再出现，不发通知也不提醒）。
+        //
+        // 与上面「工作模式」的关系：工作模式决定「正常处理的通知长什么样」（放行原样 / 换成
+        // 模块那条），这里决定「哪几类根本不值得打扰」。两者不是一回事，所以是两个控件；
+        // 但都要求模块在启用状态才会经过判定（工作模式=关闭时 hook 直接放行，什么都不过问）。
+        //
+        // 分类与状态词的对应写在 NotificationCategory 里（core），界面只负责画：
+        // 这里 `for` 的那份清单就是「可拦截的分类」的唯一出处，不在界面上另挑一遍。
+        NotificationCategory.toggleable.forEach { category ->
+            SwitchPreference(
+                title = "拦截${category.displayName}",
+                summary = category.summary,
+                checked = category in settings.interceptedCategories,
+                onCheckedChange = { on ->
+                    update { snapshot ->
+                        snapshot.copy(
+                            interceptedCategories = if (on) {
+                                snapshot.interceptedCategories + category
+                            } else {
+                                snapshot.interceptedCategories - category
+                            },
+                        )
+                    }
+                },
+            )
+        }
+        // 「勾了却没反应」的唯一成因：工作模式是「关闭」时 hook 在做任何判定之前就放行了
+        // （见 SystemServerHook.inspect 的 `if (!settings.isEnabled) return`）。
+        // 这一行**只在这个自相矛盾的状态下出现**，用户改完模式自己就消失了 ——
+        // 与那张卡片原先被撤掉的那句常驻说明不是一回事（用户明确要求过不在这里堆说明）。
+        if (settings.mode == ExpressSettingsKeys.MODE_OFF &&
+            settings.interceptedCategories.isNotEmpty()
+        ) {
+            HintText("工作模式是「关闭」，这些拦截不会生效 —— 先在上面选一个模式。")
+        }
+        // 2026-09-27：原来这里是一句 HintText（「勾上的分类不再出现，也不进模块清单…」）。
+        // 用户要求撤掉，改成一个入口 —— 「拦掉了什么」本来就该能查，压在说明里不如给一页。
+        ArrowPreference(
+            title = "拦截记录",
+            summary = if (interceptCount == 0) "暂无记录" else "已拦截 $interceptCount 条",
+            onClick = onOpenIntercepts,
+        )
     }
 
     GroupTitle("来源")
@@ -1470,9 +1816,18 @@ private fun SettingsPage(
  * 统计从卡片挪进了分组抬头：原来那张摘要卡上还挂着「清空投递记录」，清空入口撤掉之后
  * （放置办法待定）它就只剩一行统计 —— 为一行「已发出 12 / 12」单独占一张卡不值当，
  * 抬头那行恰好是它的位置。
+ *
+ * 2026-09-27：**整卡可点**，点开是这一条的详情页（[NotificationDetailPage]）——
+ * 列表上两行字是识别后的结果，判错时看不出原文长什么样，只有点进去才能对照。
+ *
+ * @param onOpen 点开某一条。记录页自己不开二级页（那一层由 [ExpressApp] 管状态），
+ *   这里只负责把「点了哪一条」报上去。
  */
 @Composable
-private fun RecordPage(entries: List<ExpressNotificationLog.Entry>) {
+private fun RecordPage(
+    entries: List<ExpressNotificationLog.Entry>,
+    onOpen: (ExpressNotificationLog.Entry) -> Unit,
+) {
     if (entries.isEmpty()) {
         GroupTitle("通知投递记录")
         RecordCard(
@@ -1507,6 +1862,7 @@ private fun RecordPage(entries: List<ExpressNotificationLog.Entry>) {
                 }
             },
             trailing = { RecordTime(clockLabel(entry.at)) },
+            onClick = { onOpen(entry) },
         )
     }
 }

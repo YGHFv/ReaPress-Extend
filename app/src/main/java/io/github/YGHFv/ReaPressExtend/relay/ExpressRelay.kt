@@ -50,6 +50,28 @@ object ExpressRelay {
     const val ACTION_ENRICH = "io.github.YGHFv.ReaPressExtend.ENRICH_EXPRESS"
 
     /**
+     * 投递动作：system_server 按「通知拦截」设置**吞掉**了原通知。
+     *
+     * ## 为什么它也需要一条消息
+     *
+     * 拦截的语义是「连原通知带模块那条一起不出现」——用户要的就是别打扰。但**吞掉之后模块侧
+     * 一点痕迹都没有**：既不落记录也不发通知，唯一判据是 LSPosed 日志里的 `EXPRESS DROPPED`。
+     * 于是「我到底拦掉了什么、拦得对不对」只能去翻系统日志（2026-09-27 用户要求：拦截记录
+     * 要能在模块里看）。
+     *
+     * ## 与 [ACTION_DELIVER] 分开的理由
+     *
+     * 接收侧的处置**完全不同**：deliver 要落库 + 发通知；这条只落一条审计记录
+     * （`ExpressNotificationLog.recordIntercepted`），**不发任何通知**。
+     * 与前两条同样的取舍 —— 用 action 而不是 extra 布尔量区分，漏判时落进 else 被忽略
+     * 而不是误发一条用户明确表示不要的通知。
+     *
+     * 载荷：与 [ACTION_DELIVER] 同构（走的都是 `buildIntent`），额外带
+     * [EXTRA_CATEGORY] 与 [EXTRA_NOTIFICATION_INTENT_URI]。
+     */
+    const val ACTION_INTERCEPTED = "io.github.YGHFv.ReaPressExtend.INTERCEPTED_EXPRESS"
+
+    /**
      * 反向请求：模块 App 进程 → 宿主进程，「帮我拉这个单号的全轨迹」。
      *
      * 2026-09-26 起轨迹**不再在宿主首页刷新时批量自动拉**（1.5s 五连发后就吃到淘宝
@@ -64,7 +86,7 @@ object ExpressRelay {
     const val ACTION_TRACE_ARRIVED = "io.github.YGHFv.ReaPressExtend.TRACE_ARRIVED"
 
     /**
-     * 批量包裹数据刚落完库，首页该重读一遍了（模块进程内部广播）。
+     * 存储里的包裹记录变了，界面该重读一遍了（模块进程内部广播）。
      *
      * ## 为什么不能复用 [ACTION_TRACE_ARRIVED]
      *
@@ -81,10 +103,19 @@ object ExpressRelay {
      * 读到的旧快照上 —— 功能明明成了，用户看到的却是「刷了跟没刷一样」，
      * 这比真没刷还难查。
      *
-     * 触发点只有一个：[ACTION_HOST_QUERY_REPORT] 到达时（那时宿主那一批已经全部投递并落库 ——
-     * 自查是同步的，调用返回后才发的播报）。**不跟着 [ACTION_ENRICH] 逐条发**：
-     * 首页刷新一次十几条，逐条发就是把列表重读十几遍（那正是 [ACTION_TRACE_ARRIVED]
-     * 只在真带轨迹数据时才发的理由）。
+     * ## 触发点（2026-09-27 扩了一次，之前只有一个）
+     *
+     * 原本只有 [ACTION_HOST_QUERY_REPORT] 到达时发一条（那时宿主那一批已经全部投递并落库 ——
+     * 自查是同步的，调用返回后才发的播报）。真机看下来这个覆盖面不够：**接收侧当时只挂在
+     * 详情页**（首页没有接收器），而且富化只补了「取件码 / 运单动态」这类不带轨迹的字段时
+     * 一条信号都不发 —— 于是首页停在旧快照上，卡片右列的新动态、新取件码一直不刷新。
+     *
+     * 现在四个来源都发：投递落库（[ACTION_DELIVER]）、富化真的改动了数据（[ACTION_ENRICH]）、
+     * 自查播报（[ACTION_HOST_QUERY_REPORT]）、拦截审计（[ACTION_INTERCEPTED] —— 它写的是
+     * 「记录」/「拦截记录」两份视图共用的那一个 prefs 文件，不是包裹表，所以界面要重读的
+     * 是记录列表而不只是首页）。富化那条是**高频**来源（自查一次连发十几条），
+     * 所以发送侧对它做了节流，见 `ExpressRelayReceiver.notifyRecordsChanged`。
+     * 接收侧则必须注册在**主界面那一层**（二级页整页替换时它得还活着），见 `ExpressMainActivity`。
      */
     const val ACTION_RECORDS_CHANGED = "io.github.YGHFv.ReaPressExtend.RECORDS_CHANGED"
 
@@ -130,14 +161,13 @@ object ExpressRelay {
      * `Application#onCreate` 捕获到的 context 上，**只在进程头一次起来时跑一次**。
      * 而小米上菜鸟常年以推送进程（`:channel`）的形式活着 —— 主进程没死，唤醒销是一记
      * 空操作，`onCreate` 不会再触发，于是「打开模块」什么也不会发生，用户看到的是
-     * 「刷了跟没刷一样」。真机日志里 `host wake（打开模块）: 唤醒销已发出` 后面一片空白
-     * 就是这个形状。
+     * 「刷了跟没刷一样」。真机日志里 `host wake（打开模块）: …` 后面一片空白就是这个形状。
      *
      * ## 它和唤醒销的分工（两条互补，缺一不可）
      *
      * | 宿主进程 | 唤醒销（清单接收者，显式组件） | 这条（动态接收者） |
      * |---|---|---|
-     * | 不在 | **能拉起**（投递清单接收者会创建进程） | 没人接，被静默丢弃 |
+     * | 不在 | **能拉起**（投递清单接收者会创建进程；被 ROM 按发送方拦掉的情形见 [HostWakePin] 的两条路径） | 没人接，被静默丢弃 |
      * | 已存活 | 空操作 | **能叫它立刻查一次** |
      *
      * 动态注册的接收者只在进程存活时存在，所以它**永远叫不醒一个死进程** —— 这也是
@@ -147,6 +177,56 @@ object ExpressRelay {
      * 发给宿主进程里注册的 receiver，发送方必须持有 [PERMISSION_TRACE_REQUEST]。
      */
     const val ACTION_REFRESH_REQUEST = "io.github.YGHFv.ReaPressExtend.REFRESH_REQUEST"
+
+    /**
+     * 反向请求：模块进程 → **system_server**（不是宿主），「借你的身份替我把唤醒销投给菜鸟」。
+     *
+     * ## 为什么需要第三条路（2026-09-27 真机实证）
+     *
+     * 唤醒销本身是「广播到菜鸟的清单接收者」，AOSP 行为里投递就得把目标进程建起来。
+     * 但 ROM 可以按**发送方**拦掉它 —— HyperOS 上实测：
+     *
+     * - 模块自己 `sendBroadcast` → 宿主 12 秒后仍无进程（`ps -A` 计数 0）；
+     * - 同一条 intent 交给 AlarmManager 由系统投递 → 闹钟确实触发了
+     *   （`dumpsys alarm` 里 `*walarm*:com.cainiao.wireless.notification_dismiss`），
+     *   宿主照样没起来 —— 因为 **PendingIntent 的广播仍算它的创建者发的**
+     *   （AOSP `PendingIntentRecord.sendInner` 把创建者的 uid 当发送方传下去），
+     *   换投递者没用，得换**发起方**；
+     * - 以 system uid 投同一条 intent → 8 秒内宿主起来了。
+     *
+     * 所以让模块把这件事**委托给 system_server**：我们本来就有一半代码常驻在那里
+     * （[io.github.YGHFv.ReaPressExtend.hook.SystemServerHook]），它的 Context 直接能发广播，
+     * 且发送方是 system uid —— ROM 那套「第三方应用想拉起别人」的判据够不着它。
+     *
+     * ## 为什么是广播而不是 binder
+     *
+     * 模块进程与 system_server 之间没有可用的 binder 通道（`XposedService` 只递到模块进程，
+     * 见 [ACTION_ENRICH] 那边的说明）。这条广播是**隐式**的 —— system_server 不是一个包，
+     * 没法用 `setPackage` 寻址；安全性靠接收侧的权限闸（[PERMISSION_TRACE_REQUEST]，
+     * signature 级，只有模块自己签得出），别的应用发同一条 action 会被系统直接丢掉。
+     *
+     * 载荷：[EXTRA_WAKE_REASON]（只进日志，用来分清这一记是取身份码还是刷新快递）。
+     */
+    const val ACTION_WAKE_REQUEST = "io.github.YGHFv.ReaPressExtend.WAKE_REQUEST"
+
+    /**
+     * system_server → 模块进程：[ACTION_WAKE_REQUEST] 的回执，以及**通道就绪播报**。
+     *
+     * ## 为什么必须有它
+     *
+     * 这条链路有三跳：模块发请求 → system_server 代发销 → 宿主被拉起自查。缺了回执，
+     * 只有最后一跳可观测（`identity bridge ready` / `host self query: rows=`），
+     * 而「通道根本没注册上」和「销发了但 ROM 还是拦」在日志上长得一模一样 —— 处置完全不同
+     * （前者是 hook 侧的问题，后者是 ROM 策略问题）。这与
+     * [EXTRA_IDENTITY_BRIDGE_STATUS] 存在的理由是同一个：**静默是最难查的故障形态**。
+     *
+     * 两种来路共用这一个 action，接收侧都只记一行日志：
+     * - 通道注册成功时的一次性播报（进程生命周期内一次，见 `SystemWakeRelay`）；
+     * - 每次代发的回执（已代发 / 为什么没发成）。
+     *
+     * 载荷：[EXTRA_WAKE_REPORT]（一句人话，只进日志，不含任何用户数据）。
+     */
+    const val ACTION_WAKE_REPORT = "io.github.YGHFv.ReaPressExtend.WAKE_REPORT"
 
     /**
      * 宿主进程 → 模块进程：**自查结果的一句播报**（查到了几行 / 三次都没查成）。
@@ -265,8 +345,66 @@ object ExpressRelay {
     /** 收件手机号尾号（通知里的「手机尾号1234」）。 */
     const val EXTRA_PHONE_TAIL = "phoneTail"
 
+    /**
+     * 包裹尾号（通知里的「取尾号1234包裹」）。
+     *
+     * 与 [EXTRA_PHONE_TAIL] 是两个键、两件事，别混：那个是「凭手机号取件时要说出口的号」，
+     * 这个是「用来把通知认领到某件包裹上的运单号尾段」（见 `ExpressRecord.parcelTail`）。
+     */
+    const val EXTRA_PARCEL_TAIL = "parcelTail"
+
+    /**
+     * 原取件码 —— 尾号匹配把通知里的码换上之后，换下来的那个。
+     *
+     * 尾号只有 3-6 位，同驿站同时有两件尾号相同并非不可能，所以原码要留着给用户核对
+     * （包裹详情页两个码都显示）。只有真换掉了非空旧码时才有值。
+     */
+    const val EXTRA_PREVIOUS_PICKUP_CODE = "previousPickupCode"
+
     /** 记录来源，取值是 [io.github.YGHFv.ReaPressExtend.core.ExpressOrigin] 的名字。 */
     const val EXTRA_ORIGIN = "origin"
+
+    /**
+     * 原通知的**点击跳转**（`Notification.contentIntent`，Parcelable extra）。
+     *
+     * 用户要的是「记录里点开能看到原通知，并且能执行原通知本来那个跳转」。原文那部分
+     * [EXTRA_TITLE] / [EXTRA_TEXT] 早就送过来了（那就是原文），只有这个令牌需要新开一个键。
+     *
+     * ⚠️ 接收侧**必须用 `runCatching` 包着读**：这个 extra 只有在通知侧才存在，
+     * 富化（`ACTION_ENRICH`）那条路没有它；而个别异常构造的通知上 `contentIntent` 也可能是
+     * 一个解不回来的 Parcelable —— 读失败必须只让「跳转」这一个能力消失，不能连整条
+     * 记录一起丢掉（`getExtras()` 抛异常时整条广播就废了）。
+     *
+     * 它**不进存储**：`PendingIntent` 没有可落盘的表示，接收侧只放内存
+     * （`NotificationIntentCache`），重启即失效 —— 跨重启那份看 [EXTRA_NOTIFICATION_INTENT_URI]。
+     */
+    const val EXTRA_NOTIFICATION_INTENT = "notificationIntent"
+
+    /**
+     * 原通知跳转的**可落盘快照**：`PendingIntent` 内部 `Intent` 的
+     * `Intent.toUri(Intent.URI_INTENT_SCHEME)` 字符串（由 [io.github.YGHFv.ReaPressExtend.hook.NotificationIntentReader]
+     * 在 system_server 侧拆出来）。
+     *
+     * ## 为什么有它（2026-09-27 用户问：为什么别的通知记录软件过很久还能打开）
+     *
+     * `PendingIntent` 本体确实不能落盘，但**它装的那个 Intent 可以** —— 这就是系统自己
+     * 把 Intent 塞进 URI 的那套编码。存下这串，模块进程重启之后仍能 `Intent.parseUri`
+     * 重建一个普通 Intent 去 `startActivity`。
+     *
+     * 保真度是有损的（基础类型 extras 能还原，`Parcelable` / `FLAG_GRANT_*` 会丢），
+     * 所以接收侧的顺序是**内存令牌优先、快照兜底**（见 `NotificationIntentLauncher`）。
+     *
+     * 是 `String` 而不是 Parcelable：字符串能**落盘**，Parcelable 出了这次广播就没了。
+     */
+    const val EXTRA_NOTIFICATION_INTENT_URI = "notificationIntentUri"
+
+    /**
+     * [ACTION_INTERCEPTED] 的载荷：这条通知被归到哪一类（`NotificationCategory` 的枚举名）。
+     *
+     * 用名字不用序号 —— 分类的枚举顺序是设置页的显示顺序，将来插一个新分类就会让旧记录错位。
+     * 接收侧认不出时丢掉这个字段即可（记录照样留，只是少一行「为什么」）。
+     */
+    const val EXTRA_CATEGORY = "interceptedCategory"
 
     /** [ACTION_TRACE_REQUEST] 的载荷：要拉全轨迹的运单号。 */
     const val EXTRA_TRACE_TRACKING = "traceTracking"
@@ -337,6 +475,21 @@ object ExpressRelay {
      * 这件事在模块侧留下可读的痕迹。
      */
     const val EXTRA_HOST_QUERY_REPORT = "hostQueryReport"
+
+    /**
+     * [ACTION_WAKE_REQUEST] 的载荷：这一记唤醒是干什么用的（只进日志）。
+     *
+     * 与 [io.github.YGHFv.ReaPressExtend.relay.HostWakePin.wake] 的 `reason` 同一个字符串，
+     * 一路透传到回执里 —— 排查时要在日志里分清「取身份码的那记」和「打开模块的那记」。
+     */
+    const val EXTRA_WAKE_REASON = "wakeReason"
+
+    /**
+     * [ACTION_WAKE_REPORT] 的载荷：system_server 那句结论（已代发 / 通道就绪 / 失败原因）。
+     *
+     * 语义与 [EXTRA_HOST_QUERY_REPORT] 完全一致：只描述动作本身，**不带任何用户数据**。
+     */
+    const val EXTRA_WAKE_REPORT = "wakeReport"
 
     /**
      * [ACTION_TRACE_REQUEST] 的发送方凭证（signature 级权限，模块 APK 声明 + 自持）。

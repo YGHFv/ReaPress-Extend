@@ -17,6 +17,7 @@
 
 package io.github.YGHFv.ReaPressExtend.hook
 
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
@@ -50,19 +51,60 @@ internal object ExpressRelaySender {
     /** 取不到 context 时只记一次日志，避免刷屏。 */
     @Volatile private var contextFailureLogged = false
 
-    /** system_server 侧：拦到通知之后投递。 */
-    fun send(record: ExpressRecord, thisObject: Any? = null) {
+    /**
+     * system_server 侧：拦到通知之后投递。
+     *
+     * @return true = 广播已经交给系统。**它只说明「这一跳发出去了」，不说明模块侧处理成功** ——
+     *   后面还有异步的一跳（模块进程落库 + 发通知），这里看不到结果。
+     *
+     *   返回值唯一的用途在 [SystemServerHook.deliver]：**拦截模式靠它决定要不要吞掉原通知**。
+     *   取不到 context、或发广播抛异常时返回 false —— 那种情况下后面不可能再有人发通知，
+     *   还吞掉原通知就是**静默丢通知**（用户什么都看不到）。
+     */
+    fun send(
+        record: ExpressRecord,
+        thisObject: Any? = null,
+        contentIntent: PendingIntent? = null,
+        intentUri: String? = null,
+    ): Boolean {
         // 运行期从 NMS 实例取 context 并缓存 —— 这是 system_server 里唯一可靠的途径。
         SystemContextHolder.upgrade(thisObject)
+        val context = SystemContextHolder.acquire() ?: run {
+            logContextFailure()
+            return false
+        }
+        return deliver(context, record, ExpressRelay.ACTION_DELIVER, contentIntent, intentUri)
+    }
+
+    /**
+     * system_server 侧：这条通知按「通知拦截」设置被**吞掉**了（[ExpressRelay.ACTION_INTERCEPTED]）。
+     *
+     * 与 [send] 走同一套 Intent 构造：接收侧只需要落一条审计记录，但记录里要有原文、
+     * 有分类、有跳转 —— 这些载荷与投递那条完全一样，不值得再写第二份 `putExtra`。
+     *
+     * **它必须与「吞掉」这个动作分开成功/失败**：广播送不到时，拦截照样生效（用户要的结果
+     * 就是别出现），只是模块里看不到这条记录 —— 那个缺口由 `EXPRESS DROPPED` 那行日志兜着。
+     */
+    fun sendIntercepted(
+        record: ExpressRecord,
+        thisObject: Any? = null,
+        category: String,
+        contentIntent: PendingIntent? = null,
+        intentUri: String? = null,
+    ) {
+        SystemContextHolder.upgrade(thisObject)
         val context = SystemContextHolder.acquire() ?: return logContextFailure()
-        deliver(context, record, ExpressRelay.ACTION_DELIVER)
+        deliver(context, record, ExpressRelay.ACTION_INTERCEPTED, contentIntent, intentUri) {
+            putExtra(ExpressRelay.EXTRA_CATEGORY, category)
+        }
     }
 
     /** 宿主 App 进程侧：富化出包裹之后投递。 */
     fun sendEnrichment(record: ExpressRecord, context: Context?) {
         val resolved = context ?: HostContextHolder.acquire()
         if (resolved == null) return logContextFailure()
-        deliver(resolved, record, ExpressRelay.ACTION_ENRICH)
+        // 富化没有「原通知」，也就没有跳转令牌 —— 只有 deliver 那条路会带。
+        deliver(resolved, record, ExpressRelay.ACTION_ENRICH, contentIntent = null, intentUri = null)
     }
 
     /**
@@ -91,6 +133,29 @@ internal object ExpressRelaySender {
             context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
             XposedBridge.logAlways("host self query report sent: $text")
         }.onFailure { XposedBridge.logError("host self query report failed", it) }
+    }
+
+    /**
+     * system_server 侧：把「代发唤醒销」的结果送回模块进程
+     * （[ExpressRelay.ACTION_WAKE_REPORT]，执行者是 [SystemWakeRelay]）。
+     *
+     * 与 [sendHostQueryReport] 是同一个理由的两份实例：**system_server 里的结论在模块侧
+     * 不落字就等于没发生**（logcat 在 HyperOS 上读不出来、LSPosed 的日志文件 adb 碰不到）。
+     * 而这一跳失败的形态恰恰是「静默」—— 通道没注册上时没人接模块的请求，两边都不写日志，
+     * 于是「通道没立起来」和「销发了但被 ROM 拦」分不开。所以注册成功要播报一次，
+     * 每次代发要给回执。
+     *
+     * **只送结论，不送数据**；失败只记日志。
+     */
+    fun sendWakeReport(context: Context, text: String) {
+        runCatching {
+            val intent = Intent(ExpressRelay.ACTION_WAKE_REPORT)
+                .setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
+                .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                .putExtra(ExpressRelay.EXTRA_WAKE_REPORT, text)
+            context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+            XposedBridge.logAlways("wake report sent: $text")
+        }.onFailure { XposedBridge.logError("wake report failed", it) }
     }
 
     /** cookie 同步的最小间隔。cookie 会轮换，但不值得追着每次投递都发 —— 半小时足够新。 */
@@ -160,9 +225,32 @@ internal object ExpressRelaySender {
         }
     }
 
-    private fun deliver(context: Context, record: ExpressRecord, action: String) {
-        runCatching {
+    /**
+     * 统一的投递出口。
+     *
+     * @param contentIntent 原通知的跳转令牌（只有通知侧有）。传的是 Parcelable，接收侧拿到
+     *   就能直接 `send()` —— 它的创建者是宿主，AMS 会按宿主的身份放行。
+     * @param intentUri 同一跳转的**可落盘快照**（见 [ExpressRelay.EXTRA_NOTIFICATION_INTENT_URI]）。
+     *   两个都带：令牌保真但出不了这次广播，快照有损但能存进记录、跨进程重启仍可用。
+     * @param extra 动作专属的额外字段（如拦截那条的分类）。
+     * @return true = `sendBroadcastAsUser` 没有抛异常（已交给系统）。**不代表对方收到了** ——
+     *   模块进程没起来、被冻结、或者接收器被停用，系统都会静默丢弃，这一层看不见。
+     *   唯一的例外用途见 [send] 的说明。
+     */
+    private fun deliver(
+        context: Context,
+        record: ExpressRecord,
+        action: String,
+        contentIntent: PendingIntent?,
+        intentUri: String?,
+        extra: (Intent.() -> Unit)? = null,
+    ): Boolean {
+        return runCatching {
             val intent = buildIntent(record, action)
+            contentIntent?.let { intent.putExtra(ExpressRelay.EXTRA_NOTIFICATION_INTENT, it) }
+            intentUri?.takeIf { it.isNotBlank() }
+                ?.let { intent.putExtra(ExpressRelay.EXTRA_NOTIFICATION_INTENT_URI, it) }
+            extra?.invoke(intent)
             // 显式指定组件：模块 App 的接收器。隐式广播在 Android 8+ 受限，且我们本来就知道
             // 目标是谁 —— 显式投递既可靠又不会被别的应用截获。
             intent.setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
@@ -175,9 +263,11 @@ internal object ExpressRelaySender {
                 "relayed to module: action=${action.substringAfterLast('.')} " +
                     "pkg=${record.sourcePackage} key=${record.dedupeKey} status=${record.status}",
             )
-        }.onFailure {
+            true
+        }.getOrElse {
             // 投递失败只记日志，绝不让异常冒到宿主/系统的调用栈上。
             XposedBridge.logError("relay failed", it)
+            false
         }
     }
 
@@ -217,6 +307,8 @@ internal object ExpressRelaySender {
                 record.trace.takeIf { it.isNotEmpty() }?.let { ExpressTraceCodec.encode(it) },
             )
             putExtra(ExpressRelay.EXTRA_PHONE_TAIL, record.phoneTail)
+            putExtra(ExpressRelay.EXTRA_PARCEL_TAIL, record.parcelTail)
+            putExtra(ExpressRelay.EXTRA_PREVIOUS_PICKUP_CODE, record.previousPickupCode)
             putExtra(ExpressRelay.EXTRA_ORIGIN, record.origin.name)
         }
 }

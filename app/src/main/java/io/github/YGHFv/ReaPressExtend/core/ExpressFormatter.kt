@@ -74,7 +74,9 @@ object ExpressFormatter {
      */
     fun summaryLine(record: ExpressRecord): String? {
         val pickup = record.pickupCode?.takeIf { it.isNotBlank() }
-        val station = record.station?.takeIf { it.isNotBlank() }
+        // 过一道 [ExpressStationName.placeName]：它不改写法（品牌前缀留着，用户要认得出来），
+        // 但会说不出「哪一处」的串丢掉 —— 历史记录里存下的「代收点存放已超过24小时…」就是这种。
+        val station = ExpressStationName.placeName(record.station)
         if (pickup != null || station != null) {
             return listOfNotNull(pickup?.let { "取件码 $it" }, station).joinToString(" · ")
         }
@@ -105,7 +107,8 @@ object ExpressFormatter {
      */
     fun body(record: ExpressRecord): String {
         val pickup = record.pickupCode?.takeIf { it.isNotBlank() }
-        val station = record.station?.takeIf { it.isNotBlank() }
+        // 同 [summaryLine]：写法照原样，但说不出地点的串不印。
+        val station = ExpressStationName.placeName(record.station)
         val lines = mutableListOf<String>()
         summaryLine(record)?.let { lines += it }
         // 摘要行只可能是两种组合之一：有取件码时是「取件码 + 驿站」，没有时是「运单动态 + 运单号」。

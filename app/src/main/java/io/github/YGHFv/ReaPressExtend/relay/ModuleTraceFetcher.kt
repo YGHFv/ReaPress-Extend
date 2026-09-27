@@ -40,16 +40,30 @@ import java.util.Collections
  * - **点击时获取**（默认）：[onDemand] —— 详情页点开 / 下拉时拉当前单号。
  *   cookie 缓存在 → 模块进程静默直拉（**菜鸟不在后台也行**，这正是收拢到模块的原因）；
  *   没有缓存 → 发 `ACTION_TRACE_REQUEST` 给菜鸟进程兜底（活着时它自己拉 + 顺带同步 cookie）。
- * - **自动更新**：[maybeAutoFetch] —— 模块收到宿主富化时，对到站 / 派送中的件主动批量拉。
- *   内部闸门和间隔保证「批量」也是 2.5s 一发、风控退避全局生效。
+ * - **自动更新**：[maybeAutoFetch] —— 模块收到宿主富化时，对到站 / 派送中 / 运输中的件
+ *   主动批量拉。内部闸门和间隔保证「批量」也是 2.5s 一发、风控退避全局生效。
+ * - **自动轮查**：[watchFetch] —— 与宿主毫无关系的一条路：`AutoWatchService` 在后台按
+ *   3 分钟一件（±1 分钟抖动）、一轮结束等 30 分钟的节奏自己拉。前两条都需要外部触发
+ *   （用户点、宿主刷新），宿主几小时不刷新时它们一个都不会响 —— 轮查补的就是这一格。
  */
 object ModuleTraceFetcher {
 
-    /** 自动更新只拉这些状态的件：用户在等答案的。与旧 hook 侧批量拉的范围一致。 */
+    /**
+     * 自动 / 保底拉取覆盖的状态。
+     *
+     * **「运输中」2026-09-27 才纳进来**：原先只拉到站 / 待取 / 派送中（判据是「用户马上要
+     * 动手去找的件」），于是「在等的那件」反倒成了唯一**永远不会自己更新**的 —— 用户打开
+     * 模块，到站件的卡片会自己补上动态和取件码，运输中那张却永远停在旧句子上，除非他逐个
+     * 点开详情（[onDemand] 不看状态，所以点开就有）。用户报的就是这一档。
+     *
+     * 节奏不变：保底仍是 3 分钟一件（[BACKSTOP_MIN_INTERVAL_MS]），只是可选范围变完整 ——
+     * 把在途件排除在外并不会让请求变少，只会让那份预算永远花不到它们身上。
+     */
     private val AUTO_STATUSES = setOf(
         ExpressStatus.ARRIVED_STATION,
         ExpressStatus.READY_FOR_PICKUP,
         ExpressStatus.DELIVERING,
+        ExpressStatus.IN_TRANSIT,
     )
 
     /**
@@ -134,7 +148,8 @@ object ModuleTraceFetcher {
 
     /**
      * 保底拉取（**点击时获取**模式下的静默补充）：菜鸟运行时富化不断到来，每 3 分钟
-     * 捎带拉一件还没拉过的到站 / 派送件 —— 详情页的数据多半在用户点开前就已就位。
+     * 捎带拉一件还没拉过的件（范围见 [AUTO_STATUSES]，含在途）—— 详情页的数据
+     * 多半在用户点开前就已就位。
      *
      * 「自动更新」模式不走这里（[maybeAutoFetch] 已经覆盖）；两者都受同一套引擎闸门
      * （成功表 / 冷却 / 风控退避）约束，所以就算叠加也不会重复请求。
@@ -155,6 +170,33 @@ object ModuleTraceFetcher {
         CainiaoTraceFetcher.requestFetch(
             cookieProvider = { TraceCookieCache.get() },
             tracking = tracking,
+            deliver = { enriched -> deliverLocally(context, enriched) },
+        )
+    }
+
+    /**
+     * 自动轮查的一次拉取（[AutoWatchService] 调用）。
+     *
+     * 与 [onDemand] 的区别只有一处：**允许重拉成功过的单号**（`recheck = true`）。
+     * 成功表是为「用户反复进出详情页不重复请求」建的，而轮查存在的全部意义就是
+     * 「隔一段时间再问一次」—— 被那张表挡住，轮查会安静地什么都不做（第二轮开始全被跳过），
+     * 而日志上看不出来。风控这边由轮查自己的节奏兜（3 分钟±1 分钟一件、一轮 30 分钟），
+     * 与「点开详情」那条路的节奏完全不同，所以两条必须用不同的闸门语义。
+     *
+     * 范围过滤（哪些状态值得问）在调用方 —— 那属于排程规则（`core/WatchSchedule`），
+     * 这里只负责「问一次」。
+     */
+    fun watchFetch(context: Context, tracking: String) {
+        TraceCookieCache.attach(context)
+        if (TraceCookieCache.get() == null) {
+            noteSkip("轮查跳过：模块手里没有登录态（等一次宿主回执，或先在关于页确认菜鸟里登录过淘宝）")
+            return
+        }
+        ensureRiskPersisted(context)
+        CainiaoTraceFetcher.requestFetch(
+            cookieProvider = { TraceCookieCache.get() },
+            tracking = tracking,
+            recheck = true,
             deliver = { enriched -> deliverLocally(context, enriched) },
         )
     }
@@ -181,14 +223,30 @@ object ModuleTraceFetcher {
      *
      * 落库走 [ExpressRecordStore.enrich]：按运单号配对、「只填空」合并 —— 与广播通道
      * 完全同一套规则，只是少了一次进程间跳转。
+     *
+     * ## 两条广播都要发（2026-09-27）
+     *
+     * [ExpressRelay.ACTION_TRACE_ARRIVED] 是给**详情页**的（收掉刷新指示器 + 重读），
+     * [ExpressRelay.ACTION_RECORDS_CHANGED] 是给**首页**的（重读列表）——
+     * 拉取多半发生在后台，而用户此刻可能停在首页：只发前者的话，首页那张卡片上的
+     * 地址 / 商品图要等下一次 onResume 才更新。两条的接收语义不同（见各自的注释），
+     * 不能合并成一条。
+     *
+     * 这里不节流：拉取本身被引擎的闸门挡着（成功表 / 冷却 / 风控退避），一次一件。
+     *
+     * `internal` 是给直连兜底（`CainiaoDirectFetcher`）用的：它拿到运单号之后的落库与广播
+     * 必须走**同一份实现** —— 抄一份出来迟早漏发那条 `RECORDS_CHANGED`，而那种 bug 的表现是
+     * 「数据其实到了，首页就是不动」。
      */
-    private fun deliverLocally(context: Context, record: ExpressRecord) {
+    internal fun deliverLocally(context: Context, record: ExpressRecord) {
         val applied = ExpressRecordStore.enrich(context, record)
         if (!applied) return
-        // 拉取多半发生在后台（详情页可能在别处等），内部广播让 Activity 自己重读。
         runCatching {
             context.sendBroadcast(
                 Intent(ExpressRelay.ACTION_TRACE_ARRIVED).setPackage(context.packageName),
+            )
+            context.sendBroadcast(
+                Intent(ExpressRelay.ACTION_RECORDS_CHANGED).setPackage(context.packageName),
             )
         }
     }

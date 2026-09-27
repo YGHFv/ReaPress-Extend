@@ -47,6 +47,20 @@ data class ExpressRule(
     val confidenceThreshold: Int = DEFAULT_THRESHOLD,
     /** 是否处理短信（com.android.mms 的通知）。 */
     val handleSms: Boolean = true,
+    /**
+     * 用户勾了「直接吞掉」的分类（设置 → 通知拦截）。
+     *
+     * 语义与 [ExpressClassifier.SILENT_STATUSES] **不同**，别混：
+     * - 那个是模块自己的默认规矩：不值得记，但**原通知照常放行**；
+     * - 这里是用户的显式选择：命中的分类**原通知直接吞掉**，不发通知、不提醒
+     *   （但**会**在模块里留一条拦截审计，供用户事后核对 —— 2026-09-27 加）。
+     *
+     * 判据里还有一条兜底：文本里**带了取件码的不吞**（用户要清的是「不含取件码的动态」，
+     * 凭据不该因为一个分类开关被清掉）。见 [ExpressClassifier]。
+     *
+     * 默认空集 = 什么都不吞，与加这个字段之前的行为完全一致。
+     */
+    val interceptedCategories: Set<NotificationCategory> = emptySet(),
 ) {
     /** 实际生效的关键词集合。 */
     val effectiveKeywords: Set<String> get() = keywords + extraKeywords
@@ -98,4 +112,14 @@ data class ExpressVerdict(
      * 混用一个字段的话，日志里看到「排除词：已揽件」会让人以为用户在设置页里配过它。
      */
     val ignoredStatus: ExpressStatus? = null,
+    /**
+     * 因用户勾了「拦截这一类」而被吞掉时的那个分类（设置 → 通知拦截）。
+     *
+     * 非空表示一条更强的结论：**这条通知要原样消失，不发通知也不提醒**
+     * （只在模块侧留一条拦截审计，见 [io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationLog.Kind]）。
+     * 与 [ignoredStatus] 的区别就在这 —— 那个的后果是「原通知照常出现，只是模块不管」。
+     *
+     * 接收侧（`SystemServerHook`）必须在投递之前先看它，否则会先按 [isExpress] 投递出去。
+     */
+    val interceptedCategory: NotificationCategory? = null,
 )

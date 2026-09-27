@@ -80,6 +80,12 @@ object ExpressStationName {
      * 只认**整个名字恰好就是这个词**：`南门小区代收点` 带了地名，那是有效地点，不能误伤。
      */
     private val PLACEHOLDERS = setOf(
+        // `驿站` / `菜鸟驿站` 剥完品牌前缀之后剩下的就是这个 —— 它和 `代收点` 一样是
+        // 「哪一类地方」而不是「哪一处」。真机里它只以两种方式出现：句子里那句裸的
+        // `…已到驿站…`（2026-09-27 探针通知），以及 [NARRATIVE_FRAGMENTS] 截断后的残留。
+        // 注意**不影响** `菜鸟驿站` 本身：`stripBrandPrefix` 拒绝把名字剥成一个品牌词，
+        // 所以 `菜鸟驿站` 原样返回、不落进这里。
+        "驿站",
         "代收点",
         "快递代收点",
         "快递点",
@@ -87,6 +93,39 @@ object ExpressStationName {
         "自提柜",
         "智能快递柜",
         "智能柜",
+    )
+
+    /**
+     * 出现即说明「名字到这里就完了」的片段 —— 它们是句子的谓语或凭据，不是店名的组成部分。
+     *
+     * 抓驿站名时只能顺着关键词往后啃一段字符，啃到店名后是运气，啃到句子后是常态。
+     * 2026-09-27 真机：`代收点存放已超过24小时 【取件码-6-2-2003】` 被整段当成驿站名存了下来，
+     * 首页多出一个同名分组。解析层（[ExpressParser.STATION_PATTERNS]）现在已经能在这些词处
+     * 停下，但**历史记录里存下的那些改不掉** —— 分组、显示名都过 [normalize]，所以在这里
+     * 再截一次才是最省事的那道兜底。
+     *
+     * 取「截断」而不是「整条作废」：`临河阳光花园代收点存放中` 的前半段仍是有效地点，丢掉可惜。
+     * 截完如果是 [PLACEHOLDERS] 里的类型词，自然就落进「不知道在哪」，不需要另写判空。
+     *
+     * 刻意**不收**「小时」「分钟」：`24小时便利店代收点` 是真会出现的店名，收进来会误伤。
+     */
+    private val NARRATIVE_FRAGMENTS = listOf(
+        "存放", "超过", "超时", "逾期", "未取",
+        // 「取件凭据」的各种写法。2026-09-27 真机那条短信
+        // `凭1-1-2001到阳光花园菜鸟驿站取尾号1234包裹` 被旧解析器存成
+        // `驿站取尾号1234包裹`（从关键词往后啃，把凭据那半句一起吃了），
+        // 首页于是多出一个叫这串字的分组。
+        //
+        // `取尾号` 必须**单独列出来**，不能只靠 `尾号`：那会切在 `尾` 上、留下 `驿站取`，
+        // 而 `驿站取` 剥掉品牌前缀之后只剩一个 `取` 字 —— 一个说不出任何地点的残渣。
+        // 同理也不收**裸的 `取`**：`取水楼驿站` 这种真会存在的名字会被整条切掉。
+        "取件码", "取货码", "提取码", "取尾号", "尾号",
+        "验证码", "您", "请",
+    )
+
+    /** 截断后可能剩下半个括号/顿号，一并刮掉：`A小区驿站（存放点）` → `A小区驿站`。 */
+    private val TRAILING_JUNK = charArrayOf(
+        '（', '(', '【', '[', '「', '·', '、', '，', '。', '-', '~', '～',
     )
 
     /**
@@ -98,7 +137,11 @@ object ExpressStationName {
     fun normalize(raw: String?): String {
         // 直接调 String?.orEmpty()，不要写成 `raw?.orEmpty()`：后者是 safe-call，
         // 编译器会去 String 上找 orEmpty（那里没有），是个一眼看不出的坑。
-        val original = raw.orEmpty().filterNot { it.isWhitespace() }
+        val compact = raw.orEmpty().filterNot { it.isWhitespace() }
+        if (compact.isEmpty()) return ""
+        // 「关键词 + 半句话」在这里被截回名字本身（判据见 [NARRATIVE_FRAGMENTS]）。
+        // 放在占位词判断**之前**：截完可能正好剩下「代收点」，两处都要判。
+        val original = truncateAtNarrative(compact)
         if (original.isEmpty()) return ""
         // 整个名字就是个「地方类型词」→ 等于没说在哪。返回空串，由调用方归到「未知取件地点」。
         // 放在剥品牌**之前**：`菜鸟驿站代收点` 剥完也还是占位词，两处都要判。
@@ -119,12 +162,64 @@ object ExpressStationName {
     }
 
     /**
+     * 在第一个 [NARRATIVE_FRAGMENTS] 处截断，并刮掉因此露在外面的标点。
+     *
+     * 片段出现在**开头**时返回空串 —— 那说明整串都是句子的其余部分，一点地名信息都没有
+     * （`存放已超过24小时`）。不能返回原文：那会变成一个凭空冒出来的驿站名。
+     */
+    private fun truncateAtNarrative(name: String): String {
+        var cut = name.length
+        for (fragment in NARRATIVE_FRAGMENTS) {
+            val index = name.indexOf(fragment)
+            if (index < 0) continue
+            if (index == 0) return ""
+            if (index < cut) cut = index
+        }
+        return if (cut == name.length) name else name.substring(0, cut).trimEnd(*TRAILING_JUNK)
+    }
+
+    /**
      * 这个串里有没有「地点信息」—— 等价于 [normalize] 之后还剩不剩东西。
      *
      * 给「合并两个来源的驿站名」用：通知侧的 `代收点` 没有地点信息，就该把位置让给
      * 宿主富化给的真名，而不是靠「非空」把它占住（见 [ExpressRecord.mergeEnrichment]）。
      */
     fun hasLocation(raw: String?): Boolean = normalize(raw).isNotEmpty()
+
+    /**
+     * 这个串是不是「关键词 + 半句话」的抓取产物 —— 等价于 [truncateAtNarrative] 真的截掉了东西。
+     *
+     * 给**读路径的自我修复**用（[ExpressRecordRepair]）：历史记录里存的是旧解析器写下的值，
+     * 光靠 [normalize] 只能在**显示**时把它遮住，记录里那串烂字还在，而且会继续占着
+     * [ExpressRecord.mergeEnrichment] 的「只填空不覆盖」名额。要判断「这条该不该用现在的
+     * 解析逻辑重扫一遍」，缺的就是这个谓词。
+     *
+     * 为什么用「截掉了东西」而不是「归一化后变了」：[normalize] 剥品牌前缀、剥括号也算变，
+     * 那些是**正常包装**（`菜鸟驿站(临河店)`），不该触发重扫。只有句子的尾巴被切下来，
+     * 才说明原来那次抽取是错的。
+     */
+    fun isNarrativeArtifact(raw: String?): Boolean {
+        val compact = raw.orEmpty().filterNot { it.isWhitespace() }
+        if (compact.isEmpty()) return false
+        return truncateAtNarrative(compact) != compact
+    }
+
+    /**
+     * 这串字给出的取件地点，**原样返回**（不剥品牌、不剥括号）；说不出「哪一处」时返回 null。
+     *
+     * 与 [normalize] 的分工：那个算的是**身份**（同一处的两种写法必须相等），为了相等它可以
+     * 改写；这个给的是**显示**—— 替换通知的正文、驿站管理里那几行「原始写法」，用户要一眼
+     * 认出是哪家店，把 `菜鸟驿站` 剥掉反而是丢信息。
+     *
+     * 共用的仍是同一套「这算不算一个地点」的判据（截掉句子 + 类型词不算），所以**历史记录里
+     * 已经存下的脏名字在这里也会被丢掉** —— 解析层修好了只管新数据，旧记录改不掉，
+     * 显示侧不能再漏一遍。
+     */
+    fun placeName(raw: String?): String? {
+        val compact = raw.orEmpty().filterNot { it.isWhitespace() }
+        if (compact.isEmpty()) return null
+        return truncateAtNarrative(compact).takeIf { hasLocation(it) }
+    }
 
     /**
      * 把一批名字聚成类，返回「名字 → 该类的代表名」（代表名也在返回值里，指向自己）。

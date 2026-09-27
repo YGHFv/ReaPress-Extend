@@ -176,6 +176,10 @@ private fun PackageSection(record: ExpressRecord, rules: ExpressStationRules) {
         // 与首页卡片同一条来源：记录自己的码优先，缺了用该站的默认码（用户在驿站管理里填的）。
         // 两处各读一遍 `record.pickupCode` 的话，就会出现「首页有码、详情页没有」的错位。
         ExpressHomeGrouper.pickupCodeOf(record, rules)?.let { InfoRow("取件码", it) }
+        // 尾号匹配换下来的原取件码（见 `ExpressRecord.previousPickupCode`）。尾号只有 4 位，
+        // 认错件是有可能的 —— 两个码都摆出来，用户在驿站念之前一眼就能发现对不上。
+        // 紧跟在「取件码」下面：它俩是一对，隔开就说不清哪个是哪个。
+        record.previousPickupCode?.takeIf { it.isNotBlank() }?.let { InfoRow("原取件码", it) }
         record.phoneTail?.takeIf { it.isNotBlank() }?.let { InfoRow("手机尾号", it) }
         // 来源也要过一遍归一化：宿主对非淘包裹给的 `pkgSourceDesc` 是「普通收件」这类
         // **收件类型词**，不是平台名（见 [ExpressPlatform]）。这一行显示「来源：普通收件」

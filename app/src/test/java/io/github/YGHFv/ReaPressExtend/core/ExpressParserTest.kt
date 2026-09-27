@@ -68,6 +68,30 @@ class ExpressParserTest {
         assertNull(ExpressParser.parseTrackingNumber("您的包裹正在派送中"))
     }
 
+    @Test
+    fun `紧贴中文的运单号也要抽得到`() {
+        // 2026-09-27 真机：`\b` 在 Android 上是 Unicode 词边界，`单号` 与数字之间不算边界，
+        // 于是这条通知的运单号一条都没抽到（详情见 ExpressParser 文件头那张实测表）。
+        assertEquals(
+            "7903000000000",
+            ExpressParser.parseTrackingNumber("单号7903000000000已到驿站 取件码 3-2-2008 请及时取件"),
+        )
+        assertEquals(
+            "SF1234567890123",
+            ExpressParser.parseTrackingNumber("您的快递已发出运单号SF1234567890123请留意查收"),
+        )
+    }
+
+    @Test
+    fun `带国家码的发件号码不当运单号`() {
+        // 短信通知的标题就是发送号码。`+8613800138000` 剥掉 `+` 之后正好落进「12-15 位纯数字」
+        // 这条规则里，真机上被记成了一单「运单号 8613800138000」的包裹。
+        assertNull(ExpressParser.parseTrackingNumber("+8613800138000"))
+        assertNull(ExpressParser.parseTrackingNumber("008613800138000 您的快递到了"))
+        // 真正以 86 开头、但不符合手机号形状的长号仍然照收
+        assertEquals("8612345678901", ExpressParser.parseTrackingNumber("运单号 8612345678901 已发出"))
+    }
+
     // ---- 取件码 ----
 
     @Test
@@ -83,6 +107,19 @@ class ExpressParserTest {
     @Test
     fun `菜鸟驿站货架格式无前缀也认得出`() {
         assertEquals("8-2-3021", ExpressParser.parsePickupCode("包裹已入站 8-2-3021 请取件"))
+    }
+
+    @Test
+    fun `紧贴中文的取件码也要抽得到`() {
+        // 同 `紧贴中文的运单号也要抽得到`：真机原文里取件码两侧都是汉字，
+        // `\b` 配不上，记录连强标识都没有（`upsert dropped`）。
+        assertEquals("1-1-2001", ExpressParser.parsePickupCode("凭1-1-2001到阳光花园菜鸟驿站取尾号1234包裹"))
+        assertEquals("17-5-2644", ExpressParser.parsePickupCode("凭17-5-2644到店取件"))
+    }
+
+    @Test
+    fun `取件码紧跟在词后面带短横`() {
+        assertEquals("6-2-2003", ExpressParser.parsePickupCode("存放已超过24小时【取件码-6-2-2003】，别忘了哦"))
     }
 
     @Test
@@ -103,6 +140,81 @@ class ExpressParserTest {
     @Test
     fun `丰巢柜名`() {
         assertEquals("丰巢", ExpressParser.parseStation("包裹已放入丰巢，请凭取件码取件"))
+    }
+
+    @Test
+    fun `关键词后面跟着句子时只取到关键词`() {
+        // 2026-09-27 真机原文（淘宝，超时未取提醒；取件码数字已替换）。原来的
+        // `[^，。！\n]{0,20}` 会一路啃到取件码中间 —— 抽出来的是
+        // `代收点存放已超过24小时 【取件码-8-2-3`（正好撞上 20 字上限），
+        // 首页于是凭空多出一个叫这串字的驿站分组，用户报的就是这个。
+        val text = "您还有包裹等待取件\n您购买的商品在代收点存放已超过24小时\u00a0【取件码-8-2-3021】，别忘了哦>>"
+        assertEquals("代收点", ExpressParser.parseStation(text))
+        // 取件码本身不受影响，照旧要抽得出来
+        assertEquals("8-2-3021", ExpressParser.parsePickupCode(text))
+        // 剩下的 `代收点` 是类型词不是地名 → 归一化后为空 → 归到「未知取件地点」，
+        // 而不是自成一组，也不会挡住宿主富化的真名（见 ExpressStationNameTest）。
+        assertEquals("", ExpressStationName.normalize(ExpressParser.parseStation(text)))
+    }
+
+    @Test
+    fun `括号门店名不被后面的句子顶掉`() {
+        // 括号门店后面直接接句子时，门店名必须完整留在括号里，不能被那半句话顶掉。
+        assertEquals(
+            "菜鸟驿站(杭州文一西路店)",
+            ExpressParser.parseStation("您的包裹已到菜鸟驿站(杭州文一西路店)存放已超过24小时，请尽快取件"),
+        )
+    }
+
+    @Test
+    fun `关键词前面的地名要一起收下`() {
+        // 2026-09-27 真机短信原文（尾号/取件码数字已替换）。旧实现只从关键词往后啃，
+        // 抽出的是 `驿站取尾号1234包裹` —— 首页凭空多出一个叫这串字的驿站分组，
+        // 而真正的店名 `阳光花园菜鸟驿站` 一个字都没留下。用户报的「快递站点识别不了」。
+        val text = "凭1-1-2001到阳光花园菜鸟驿站取尾号1234包裹"
+        assertEquals("阳光花园菜鸟驿站", ExpressParser.parseStation(text))
+        // 上一句里 `到` 是停止词，所以 `凭1-1-2001到` 不会被吃进来
+        assertEquals("阳光花园驿站", ExpressParser.parseStation("您的快递在阳光花园驿站存放已超过24小时"))
+    }
+
+    @Test
+    fun `关键词前是叙述词时不多吃`() {
+        // `已到` / `放入` 这类动词短语把「向前啃」挡在店名之外 —— 这是向前啃唯一的风险点，
+        // 逐条钉住。注意 `菜鸟驿站` 前是 `到`，`丰巢` 前是 `放入`。
+        assertEquals("菜鸟驿站", ExpressParser.parseStation("您的包裹已到菜鸟驿站，请及时取件"))
+        assertEquals("丰巢", ExpressParser.parseStation("包裹已放入丰巢，请凭取件码取件"))
+        assertEquals("代收点", ExpressParser.parseStation("您购买的商品在代收点存放已超过24小时"))
+        // `菜鸟驿站` 自己就带着品牌前缀，不能再往前吃
+        assertEquals("菜鸟驿站(杭州文一西路店)", ExpressParser.parseStation("菜鸟驿站(杭州文一西路店)提醒您取件"))
+    }
+
+    @Test
+    fun `向前啃不会吃掉楼栋号`() {
+        // 数字与 `号楼` 都是名字的一部分（`小区3号楼驿站`），不能因为「是数字」就停。
+        assertEquals("小区3号楼菜鸟驿站", ExpressParser.parseStation("您的包裹已放入小区3号楼菜鸟驿站"))
+    }
+
+    // ---- 包裹尾号 ----
+
+    @Test
+    fun `取尾号里的数字是包裹尾号`() {
+        assertEquals("1234", ExpressParser.parseParcelTail("凭1-1-2001到阳光花园菜鸟驿站取尾号1234包裹"))
+        assertEquals("0123", ExpressParser.parseParcelTail("请取尾号：0123 的包裹"))
+    }
+
+    @Test
+    fun `不带取字的尾号不认成包裹尾号`() {
+        // 「运单号尾号0123」「手机尾号0123」都长这样，认了会去匹配一件无关的包裹
+        // —— 手机尾号那条尤其糟：它根本不是包裹的标识。
+        assertNull(ExpressParser.parseParcelTail("您的包裹运单号尾号0123，请及时取件"))
+        assertNull(ExpressParser.parseParcelTail("您的手机尾号0123的包裹到了"))
+    }
+
+    @Test
+    fun `包裹尾号与手机尾号互不抢`() {
+        val text = "您的包裹已放入快递柜，手机尾号1234，取尾号5678包裹"
+        assertEquals("1234", ExpressParser.parsePhoneTail(text))
+        assertEquals("5678", ExpressParser.parseParcelTail(text))
     }
 
     // ---- 手机尾号 ----
@@ -153,6 +265,16 @@ class ExpressParserTest {
     @Test
     fun `取件码即待取件`() {
         assertEquals(ExpressStatus.READY_FOR_PICKUP, ExpressParser.parseStatus("取件码 8-2-3021"))
+    }
+
+    @Test
+    fun `取尾号也是待取件`() {
+        // 驿站/快递柜最常见的到站话术，整句里一个「取件码」都没有。不收它这条短信
+        // 只能判成 UNKNOWN —— 真机上它于是掉进首页「其他」档，而它明明已经躺在驿站里了。
+        assertEquals(
+            ExpressStatus.READY_FOR_PICKUP,
+            ExpressParser.parseStatus("凭1-1-2001到阳光花园菜鸟驿站取尾号1234包裹"),
+        )
     }
 
     @Test

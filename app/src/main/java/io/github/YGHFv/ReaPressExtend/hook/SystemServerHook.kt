@@ -18,6 +18,7 @@
 package io.github.YGHFv.ReaPressExtend.hook
 
 import android.app.Notification
+import android.app.PendingIntent
 import io.github.YGHFv.ReaPressExtend.BuildConfig
 import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsKeys
 import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsSnapshot
@@ -26,6 +27,7 @@ import io.github.YGHFv.ReaPressExtend.core.ExpressParser
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
 import io.github.YGHFv.ReaPressExtend.core.ExpressTextExtractor
 import io.github.YGHFv.ReaPressExtend.core.ExpressVerdict
+import io.github.YGHFv.ReaPressExtend.core.NotificationCategory
 import io.github.YGHFv.ReaPressExtend.relay.ExpressRelay
 import io.github.YGHFv.ReaPressExtend.relay.WatchdogReporter
 import io.github.YGHFv.ReaPressExtend.xposed.XC_MethodHook
@@ -260,6 +262,9 @@ internal object SystemServerHook {
             XposedBridge.logAlways("boot report deferred: no system context yet")
             return
         }
+        // 顺带把「代发唤醒销」的通道立起来（它就是在这里拿到 system_server 自己的 Context 的）。
+        // 放在这条重试链上是有意的：注册需要 context，而这条链本来就是「等 context 可用」的重试。
+        SystemWakeRelay.ensureRegistered(context)
         WatchdogReporter.reportBoot(context, bootReportInstalled, Watchdog.describe())
     }
 
@@ -339,8 +344,28 @@ internal object SystemServerHook {
                     "kw=${verdict.matchedKeywords.joinToString(",")} " +
                     "title=${title.take(40)}",
             )
-            if (!observeOnly) {
-                deliver(param, pkg, title, text, verdict, settings)
+            // 用户勾了「拦截这一类」（设置 → 通知拦截）：直接吞掉，**连模块自己那条也不发**。
+            //
+            // 排在最前面，不能走 deliver：那条路会先落库、发一条模块通知，只是最后把原通知
+            // 吞掉 —— 而用户点这个开关要的正是「这类事别再出现」，换个名字再发一条等于没做。
+            // 判据全在 core（`ExpressVerdict.interceptedCategory`），这里只负责执行。
+            //
+            // observeOnly（诊断构建）下不吞：那个模式的存在意义就是「只看不动」。
+            val dropped = verdict.interceptedCategory
+            if (dropped != null) {
+                if (!observeOnly) {
+                    param.setResult(false)
+                    // 吞掉之后模块侧本来**一点痕迹都没有**（既不落记录也不发通知，只能去翻
+                    // LSPosed 日志），于是「拦掉了什么、拦得对不对」在 App 里无从核对。
+                    // 2026-09-27 起补一条拦截审计 —— 它与投递记录共用一份存储，靠 kind 分开。
+                    reportIntercepted(param, pkg, title, text, verdict, dropped, notification)
+                }
+                XposedBridge.logAlways(
+                    "EXPRESS DROPPED category=${dropped.name} pkg=$pkg " +
+                        "text=${text.take(50)}",
+                )
+            } else if (!observeOnly) {
+                deliver(param, pkg, title, text, verdict, settings, contentIntentOf(notification))
             }
         } else {
             logMiss(pkg, verdict, text)
@@ -375,6 +400,51 @@ internal object SystemServerHook {
             "EXPRESS MISS pkg=$pkg conf=${verdict.confidence}$ignored text=${text.take(50)}",
         )
     }
+
+    /**
+     * 把「这条被吞了」这件事送回模块进程，让它在记录里留一条（[ExpressRelay.ACTION_INTERCEPTED]）。
+     *
+     * 只在**真的吞掉**时调用（`observeOnly` 下不吞也就不记）：诊断构建的语义是「只看不动」，
+     * 把一条没被吞掉的通知记成「拦截记录」会让那份记录失去意义。
+     *
+     * 载荷与 [deliver] 同构（原文、分类、跳转令牌与它的快照）—— 用户点开这条记录时要能
+     * 看到「原文长什么样」并「跳回原 App」，与投递记录是同样的诉求。
+     */
+    private fun reportIntercepted(
+        param: XC_MethodHook.MethodHookParam,
+        pkg: String,
+        title: String,
+        text: String,
+        verdict: ExpressVerdict,
+        category: NotificationCategory,
+        notification: Notification,
+    ) {
+        runCatching {
+            val contentIntent = contentIntentOf(notification)
+            val record = ExpressParser.parse(pkg, title, text, verdict, System.currentTimeMillis())
+            ExpressRelaySender.sendIntercepted(
+                record = record,
+                thisObject = param.thisObject,
+                category = category.name,
+                contentIntent = contentIntent,
+                intentUri = contentIntent?.let { NotificationIntentReader.snapshot(it) },
+            )
+        }.onFailure {
+            // 记不下来只是「模块里少一条记录」，拦截本身已经生效了 —— 不能让它影响 NMS。
+            XposedBridge.logError("intercepted report failed", it)
+        }
+    }
+
+    /**
+     * 原通知的点击跳转。
+     *
+     * 单独包一层 `runCatching`：这条路上的每一行都在 system_server 的关键路径上，
+     * 而 `contentIntent` 在极端构造的通知上可能抛异常（字段为 null 之外的异常形态）。
+     * 它给的只是「记录页里能把原界面打开」这一项附加能力，**失败了也不该影响拦截本身** ——
+     * 更不该把异常冒到 NMS 的调用栈上。
+     */
+    private fun contentIntentOf(notification: Notification): PendingIntent? =
+        runCatching { notification.contentIntent }.getOrNull()
 
     /**
      * 是否是关心的来源包。
@@ -414,13 +484,17 @@ internal object SystemServerHook {
      * 执行原方法、直接把这个值当返回值递出去 —— 这正是「拦截」需要的语义。
      * 只改 result 字段的话原方法照常执行，拦截不会生效。
      *
-     * ## 投递与拦截的先后
+     * ## 投递与拦截的先后（2026-09-27 修订）
      *
-     * 先投递再拦截：广播是异步的，投递失败（模块 App 收不到）时用户将什么都看不到 ——
-     * 这是「静默丢通知」风险。所以实际部署建议先用「放行并附加」模式跑几天
-     * （见 UI 上的提示），确认投递链路稳定后再切「拦截并替换」。
-     * [com.github.YGHFv.ReaPressExtend.notification.ExpressNotificationLog] 会两边都留痕，
-     * 便于事后核对。
+     * 先投递再拦截，而且**拦截要看投递的结果**：广播是异步的，投递失败（模块 App 收不到）时
+     * 用户将什么都看不到 —— 这是「静默丢通知」风险。所以：
+     *
+     * - 连广播都没交出去（[ExpressRelaySender.send] 返回 false：system_server 里取不到
+     *   Context / 发送抛异常）→ **不吞**，原通知照常出现。这一跳后面不可能再有人发通知，
+     *   吞掉就是净损失，宁可多一条也不可丢一条；
+     * - 交出去了但模块侧没发成（进程没起来、被冻结、没给通知权限）→ 这一层看不见，
+     *   仍然按拦截处理。缺口由 `ExpressNotificationLog` 那侧的「未发出 · 原因」兜着，
+     *   所以实际部署仍建议先用「放行并附加」跑几天（见 UI 上的提示）。
      */
     private fun deliver(
         param: XC_MethodHook.MethodHookParam,
@@ -429,18 +503,42 @@ internal object SystemServerHook {
         text: String,
         verdict: ExpressVerdict,
         settings: ExpressSettingsSnapshot,
+        contentIntent: PendingIntent?,
     ) {
         val record = ExpressParser.parse(pkg, title, text, verdict, System.currentTimeMillis())
         // thisObject 是 NotificationManagerService 实例 —— 从它身上反射取 mContext，
         // 这是 system_server 里拿到可用 Context 的唯一可靠途径（详见 SystemContextHolder）。
-        ExpressRelaySender.send(record, param.thisObject)
+        //
+        // 跳转给两份：令牌本体（保真但只活在这一跳里）+ 可落盘快照（有损但存进记录、
+        // 跨模块进程重启仍可用）。用户那句「为什么别的通知记录软件过很久还能打开」的答案就是后者。
+        val handedOff = ExpressRelaySender.send(
+            record = record,
+            thisObject = param.thisObject,
+            contentIntent = contentIntent,
+            intentUri = contentIntent?.let { NotificationIntentReader.snapshot(it) },
+        )
+        // 兜底再试一次「代发唤醒销」通道的注册：上面那次 send 已经把 NMS 的 context 缓存下来了，
+        // 走到这里必然能注册。开机那条重试链若全都落在 context 还没就绪的时刻（或本 ROM 的
+        // NMS 字段名不同），这里是最后一个能补上的时机 —— 而它失败的表现是**静默的**
+        // （模块那边只是一直没收到 `host wake bridge ready`），所以不能省。
+        // 幂等 + 一个 volatile 读，对通知投递这条路没有可测的开销。
+        SystemWakeRelay.ensureRegistered(SystemContextHolder.acquire())
 
-        if (settings.isInterceptMode) {
-            param.setResult(false)
-            XposedBridge.logAlways("EXPRESS INTERCEPTED key=${record.dedupeKey} (original suppressed)")
-        } else {
+        // 放行模式：原通知不动，模块那条额外发。这里什么都不用做（NMS 会照常入队）。
+        if (!settings.isInterceptMode) {
             XposedBridge.logAlways("EXPRESS PASSTHROUGH key=${record.dedupeKey} (original kept)")
+            return
         }
+        if (!handedOff) {
+            // 见方法注释：投递这一跳都没出去，还吞掉原通知就是静默丢通知。放行。
+            XposedBridge.logError(
+                "EXPRESS INTERCEPT SKIPPED key=${record.dedupeKey} " +
+                    "(relay handoff failed — original kept, user sees the original notification)",
+            )
+            return
+        }
+        param.setResult(false)
+        XposedBridge.logAlways("EXPRESS INTERCEPTED key=${record.dedupeKey} (original suppressed)")
     }
 
     /**

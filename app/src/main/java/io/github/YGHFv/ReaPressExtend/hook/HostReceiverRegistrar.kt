@@ -25,17 +25,19 @@ import io.github.YGHFv.ReaPressExtend.relay.ExpressRelay
 import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
 
 /**
- * 在宿主进程里注册「模块 → 宿主」的反向请求接收器。
+ * 注册「模块 → 被注入进程」的反向请求接收器。
  *
- * 抽出来的唯一理由是**注册参数有两处版本相关的坑**，而被注入的宿主不止一个（菜鸟 / 淘宝）：
+ * 抽出来的唯一理由是**注册参数有两处版本相关的坑**，而被注入的进程不止一个
+ * （菜鸟 / 淘宝 / **system_server**，后者见 [SystemWakeRelay]）：
  *
  * 1. Android 13（API 33）起 `registerReceiver` 必须显式声明导出性，否则直接抛
  *    `SecurityException`；
  * 2. 必须要求发送方持有 [ExpressRelay.PERMISSION_TRACE_REQUEST]（signature 级，只有模块
- *    APK 签得出）—— 没有这道闸，设备上任何应用都能索要用户的登录态。
+ *    APK 签得出）—— 没有这道闸，设备上任何应用都能索要用户的登录态；而在 system_server
+ *    里缺了它，等于**把系统身份外借给任意应用**去拉起别的应用。
  *
- * 这两条抄一份到第二个宿主里，迟早会改一处漏一处：漏了第 1 条是当场崩，漏了第 2 条是
- * **静默地把登录态开放给任意应用**。所以宁可变成一个只有十几行的类。
+ * 这两条抄一份到第二、第三个进程里，迟早会改一处漏一处：漏了第 1 条是当场崩，漏了第 2 条是
+ * **静默地把能力开放给任意应用**。所以宁可变成一个只有几十行的类。
  *
  * 注册失败只记日志、返回 false —— 反向索要失效不等于宿主不能用，
  * 主动同步那条路（[ExpressRelaySender.sendCookieSync]）仍然工作。

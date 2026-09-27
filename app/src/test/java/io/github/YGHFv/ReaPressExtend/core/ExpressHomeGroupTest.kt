@@ -559,6 +559,25 @@ class ExpressHomeGroupTest {
     }
 
     @Test
+    fun `原始写法里没有句子的后半截`() {
+        // 2026-09-27 真机存下的脏名字：淘宝「超时未取」提醒里，驿站关键词后面跟的是句子。
+        // 解析层修好了只管新数据，**历史记录改不掉** —— 显示侧（原始写法、通知正文）
+        // 也得把它当成「不知道在哪」，不能自己再露一次脸。
+        val records = listOf(
+            record(
+                pickup = "8-2-3021",
+                station = "代收点存放已超过24小时\u00a0【取件码-8-2-3",
+                status = ExpressStatus.READY_FOR_PICKUP,
+            ),
+        )
+        val station = ExpressHomeGrouper.stations(records).single()
+
+        assertEquals(ExpressHomeGrouper.UNKNOWN_STATION, station.key)
+        assertEquals(ExpressHomeGrouper.UNKNOWN_STATION, station.displayName)
+        assertTrue(station.rawNames.isEmpty())
+    }
+
+    @Test
     fun `stations 标出被手工改过的驿站`() {
         val records = listOf(
             record(pickup = "1", station = "临河阳光花园店", status = ExpressStatus.READY_FOR_PICKUP),

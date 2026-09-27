@@ -44,7 +44,7 @@ object MtopSign {
     /**
      * 从 `_m_h5_tk` 的**完整 cookie 值**里取出参与签名的 token。
      *
-     * 服务端下发的是 `token_时间戳`（如 `00000000000000000000000000000000_1790410278831`），
+     * 服务端下发的是 `token_时间戳`（形如 `<32 位十六进制>_<13 位毫秒>`），
      * 签名只用 `_` 前面那 32 位。
      */
     fun tokenOf(rawCookieValue: String): String = rawCookieValue.substringBefore('_')

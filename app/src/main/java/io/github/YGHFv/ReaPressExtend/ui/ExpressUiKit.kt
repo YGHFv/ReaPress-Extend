@@ -210,6 +210,10 @@ internal fun SegmentedRow(
  * 与 [SettingsCard] 的分工：那个是「若干设置行拼成的组」，这个是「一条独立的东西」——
  * 自带 16dp 内边距，标题行右侧放时间。**两者不要互相替代**：设置行有自己的行高，
  * 塞进这个骨架会被压扁。
+ *
+ * @param onClick 整卡可点（记录页点进详情）。传 null 就用**没有点击反馈**的那个重载 ——
+ *   不传 onClick 却挂上点击会得到一个按下去有涟漪、松手什么也不发生的卡片，
+ *   那比不能点更让人困惑。
  */
 @Composable
 internal fun RecordCard(
@@ -218,13 +222,9 @@ internal fun RecordCard(
     description: String? = null,
     trailing: (@Composable () -> Unit)? = null,
     actions: (@Composable RowScope.() -> Unit)? = null,
+    onClick: (() -> Unit)? = null,
 ) {
-    Card(
-        modifier = Modifier
-            .padding(horizontal = CARD_MARGIN)
-            .padding(bottom = CARD_MARGIN),
-        insideMargin = PaddingValues(16.dp),
-    ) {
+    val content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit = {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 title,
@@ -251,6 +251,14 @@ internal fun RecordCard(
             CardDivider()
             Row(verticalAlignment = Alignment.CenterVertically, content = actions)
         }
+    }
+    val modifier = Modifier
+        .padding(horizontal = CARD_MARGIN)
+        .padding(bottom = CARD_MARGIN)
+    if (onClick != null) {
+        Card(modifier = modifier, insideMargin = PaddingValues(16.dp), onClick = onClick, content = content)
+    } else {
+        Card(modifier = modifier, insideMargin = PaddingValues(16.dp), content = content)
     }
 }
 

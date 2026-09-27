@@ -66,10 +66,39 @@ data class ExpressRecord(
      */
     val phoneTail: String? = null,
     /**
-     * 运单动态 —— 宿主物流记录里最新的一条详情，如「已发往【上海转运中心】」。
+     * 通知里那句「**取尾号1234**」的尾号（3-6 位数字）。
      *
-     * 宿主 key 是 `lastLogisticDetail`（真机字段 dump 证据见 `CainiaoPackageHook`）。
-     * 只有宿主富化给得出，通知文案里没有。
+     * ## 为什么值得单独一格
+     *
+     * 短信 / 菜鸟的驿站通知只说「取尾号 1234 的包裹」，而宿主给的是完整运单号 ——
+     * 中间没有任何公共字段能把两者对上。这个尾号是**通知侧唯一能用来认领包裹**的东西：
+     * 「同一驿站 + 运单号后四位 = 本尾号」的那件就是它（匹配见 `ExpressRecordStore.tailMatches`）。
+     *
+     * 与 [phoneTail] 是两回事，**不要合并**：那个是「凭手机号取件时要说出口的号」，
+     * 这个是「用来认领包裹的运单号尾段」。同一条通知里两者可能同时出现。
+     */
+    val parcelTail: String? = null,
+    /**
+     * **被尾号匹配换掉的那个**取件码（原取件码）。
+     *
+     * 尾号匹配（见 `ExpressRecordStore.tailMatches`）会用通知里的码覆盖本记录的 [pickupCode]，
+     * 因为通知是取件凭据的权威来源（宿主对一部分包裹根本不下发 `authCode`）。但覆盖是有风险的：
+     * 尾号只有 3-6 位，同驿站同时有两件尾号相同（同一货架格先后放过两件）并非不可能。
+     * 所以把换下来的那个原样留着，包裹详情页会同时显示两个码 —— 对不上时用户一眼就能看出来。
+     *
+     * 只在**真的换掉了一个非空旧码**时才写；本记录原本没有码，这里就是 null。
+     */
+    val previousPickupCode: String? = null,
+    /**
+     * 运单动态 —— 最新的一条物流详情，如「已发往【上海转运中心】」。
+     *
+     * 两个来源，都是**原样收下**、模块不加工（加工就等于自己编物流信息）：
+     * - 宿主物流记录的 `lastLogisticDetail`（真机字段 dump 证据见 `CainiaoPackageHook`）。
+     *   它只在**用户打开菜鸟**时才会被富化写进来；
+     * - 轨迹拉取回来的末条节点（[latestTraceDetail]，写入侧见 `CainiaoTraceFetcher`）——
+     *   补的正是「模块自己拉到了新轨迹、卡片上那句动态却纹丝不动」那一格。
+     *
+     * 通知文案里没有这个字段。
      */
     val logisticsDetail: String? = null,
     /**
@@ -265,7 +294,9 @@ data class ExpressRecord(
             // 驿站名比别的字段多一条规则：**没有地点信息的写法要让位**。
             // 淘宝通知只写「已送达代收点」，解析出来是个占位词 —— 它非空，按纯粹的「只填空」
             // 会把宿主给的真名（`阳光花园驿站`）挡在外面，于是合并之后首页仍然只显示「代收点」，
-            // 用户白装了这个模块。占位词在解析层已经被丢掉一部分（见 [ExpressStationName]），
+            // 用户白装了这个模块。同一族的还有「关键词后面跟着句子」那种
+            // （`代收点存放已超过24小时…`，2026-09-27 真机）—— 两者都由
+            // [ExpressStationName.hasLocation] 一句话判掉。占位词在解析层已经被丢掉一部分，
             // 但**历史记录里已经存下的那些改不掉**，所以这里再兜一层。
             station = station?.takeIf { ExpressStationName.hasLocation(it) } ?: other.station,
             pickupCode = pickupCode ?: other.pickupCode,
@@ -305,6 +336,9 @@ data class ExpressRecord(
             // 手机尾号的来源只有通知一处，富化值恒为 null，这条写在这里只是让「只填空」的
             // 规则在这张字段表上不留缺口。
             phoneTail = phoneTail ?: other.phoneTail,
+            // 尾号与「原取件码」同属通知侧/机器侧的单向信息，走同一套「只填空」。
+            parcelTail = parcelTail ?: other.parcelTail,
+            previousPickupCode = previousPickupCode ?: other.previousPickupCode,
             // 用户的「已取件」确认不能被合并冲掉 —— 合并的两边都是通知/富化数据，
             // 它们从来不带这个字段，所以「只填空」在此处等价于「原样保留」。
             pickedUpAt = pickedUpAt ?: other.pickedUpAt,

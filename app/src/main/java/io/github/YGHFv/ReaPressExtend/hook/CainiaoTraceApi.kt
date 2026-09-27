@@ -51,7 +51,13 @@ import java.net.URLEncoder
  */
 internal object CainiaoTraceApi {
 
-    /** MTOP 的 H5 通道入口。所有接口共用同一个 host 与同一套 appKey / 签名规则。 */
+    /**
+     * MTOP 的 H5 通道入口（轨迹这条路的默认 host）。
+     *
+     * ⚠️ **host 不止一个**：淘宝的 H5 接口按业务分在 `acs.m.taobao.com` 与 `h5api.m.taobao.com`
+     * 两个域名下（订单列表就在后者），签名与 appKey 一样，但 token 是**按域名下发**的
+     * （见 [cachedTokens]）。所以 [callH5] 的 host 是可传的。
+     */
     private const val HOST = "https://acs.m.taobao.com/h5/"
 
     /** 全轨迹接口。 */
@@ -60,8 +66,12 @@ internal object CainiaoTraceApi {
 
     private const val APP_KEY = MtopSign.TAOBAO_H5_APP_KEY
 
-    /** 与菜鸟 H5 页面同族的 Android 浏览器 UA（实测可用），也是 [preferredUa] 缺席时的兜底。 */
-    private const val UA_DEFAULT =
+    /**
+     * 与菜鸟 H5 页面同族的 Android 浏览器 UA（实测可用），也是 [preferredUa] 缺席时的兜底。
+     *
+     * `internal` 是因为 `TaobaoOrderApi` 的 SSR 页请求也要它 —— 两份 UA 常量迟早会漂。
+     */
+    internal const val UA_DEFAULT =
         "Mozilla/5.0 (Linux; Android 12; M2102K1C) AppleWebKit/537.36 (KHTML, like Gecko) " +
             "Chrome/105.0.0.0 Mobile Safari/537.36 EdgA/105.0.1343.48"
 
@@ -124,16 +134,25 @@ internal object CainiaoTraceApi {
         val backoff = (RISK_BACKOFF_MS shl backoffLevel).coerceAtMost(RISK_BACKOFF_MAX_MS)
         if (backoff < RISK_BACKOFF_MAX_MS) backoffLevel++
         riskBlockedUntil = System.currentTimeMillis() + backoff
-        cachedToken = null
+        cachedTokens.clear()
         runCatching { onRiskMarked?.invoke(riskBlockedUntil) }
     }
 
     /**
-     * 预热拿到的 token 缓存。`_m_h5_tk` 的有效期是天级的，一次预热能用一整天 ——
-     * 每次 fetch 都预热等于**请求数翻倍**（预热那发也会被风控计数），是纯浪费。
-     * 风控 / 解析失败时清掉，下次重新预热。
+     * 预热拿到的 token 缓存，**按 host 分开**。
+     *
+     * `_m_h5_tk` 的有效期是天级的，一次预热能用一整天 —— 每次 fetch 都预热等于
+     * **请求数翻倍**（预热那发也会被风控计数），是纯浪费。
+     *
+     * key 是 host 而不是 api：同一域名下换接口不该重新预热（`_m_h5_tk` 是按 appKey 签发的，
+     * 与具体接口无关）。但**换 host 时按 host 分开存**是保守做法 —— 我们不确知
+     * `acs.m.taobao.com` 预热来的那份在 `h5api.m.taobao.com` 上认不认（两者同属 `.taobao.com`
+     * cookie 域，大概率认），而不认的表现是 `FAIL_SYS_TOKEN_EMPTY`，与「没有 token」同形，
+     * 最容易查错方向。分开存最多多一次预热，错了却能让两个域各自持有自己那份。
+     *
+     * 风控命中时整体清掉（见 [markRiskBlocked]）—— 被处罚的是这份登录态，不是某一条 URL。
      */
-    @Volatile private var cachedToken: Token? = null
+    private val cachedTokens = java.util.concurrent.ConcurrentHashMap<String, Token>()
 
     /** 预热时服务端下发的两个 token。 */
     private data class Token(val raw: String, val enc: String?)
@@ -189,26 +208,42 @@ internal object CainiaoTraceApi {
      * 是那条接口只在 APP 通道可用。身份码现在改为请菜鸟用它自己的会话取
      * （`CainiaoIdentityBridge`），别再往这里接。
      *
-     * 共用同一份 `cachedToken` 是对的：`_m_h5_tk` 是按 **appKey + 域名** 下发的，
-     * 与具体接口无关；换个接口就重新预热等于把请求数翻倍，而请求数正是风控的触发条件。
+     * token 缓存按 **host** 共用是对的：`_m_h5_tk` 是按「appKey + 域名」下发的，与具体接口无关；
+     * 换个接口就重新预热等于把请求数翻倍，而请求数正是风控的触发条件。反过来说，**换 host
+     * 必须能换出一份新的**（见 [cachedTokens]），所以 host 是参数而不是常量。
      *
+     * @param host 接口所在域名（含 `/h5/` 后缀）。默认是轨迹所在的 `acs.m.taobao.com`；
+     *   订单列表在另一个域名，见 `TaobaoOrderApi`。
      * @return 响应体；cookie 缺失、预热失败、或网络异常时返回 null（原因写进 [lastError]）。
      *   风控命中时会顺手进指数退避（[markRiskBlocked]），调用方不必自己判。
      */
-    fun callH5(api: String, version: String, data: String, cookie: String?): String? {
+    fun callH5(
+        api: String,
+        version: String,
+        data: String,
+        cookie: String?,
+        host: String = HOST,
+    ): String? {
         if (cookie.isNullOrBlank()) {
             // 用户没在菜鸟里登录过淘宝系账号 —— 这不是错误，只是这条路走不通。
             XposedBridge.logAlways("cainiao h5: 没有可用 cookie，跳过 $api")
             return fail("没有可用的淘宝登录态（请在菜鸟里登录后重试）")
         }
 
-        val base = "$HOST$api/$version/"
+        val base = "$host$api/$version/"
         // token 的三级来源：**cookie 里现成的**（菜鸟 WebView 跑过 H5 页面时写进 Cookies 库的，
         // 随 cookie 一起同步过来）→ 内存缓存（上次预热拿的）→ 预热。每次请求都预热等于
         // 请求数翻倍（预热那发也会被风控计数），能省则省。
         // cookie 里拿的不进缓存：它会随菜鸟的使用自己更新，缓存反而可能钉死一份过期的。
-        val token = tokenFromCookie(cookie) ?: cachedToken
-            ?: warmUp(base, cookie)?.also { cachedToken = it }
+        // 缓存与预热都按 **host** 归口（理由见 [cachedTokens]）。
+        //
+        // ⚠️ cookie 里那份 `_m_h5_tk` **只在默认 host 上直接用**：它是菜鸟 WebView 写给
+        // 「它自己最近访问过的域」的，而同步过来的 cookie 串不带 host_key，我们分不出它属于谁。
+        // 默认 host（轨迹）已经真机验证过它可用；换 host 时宁可多预热一次，也不拿一份
+        // 不知道属于谁的 token 去撞 —— 撞上的表现是 TOKEN_EMPTY，与「压根没 token」同形。
+        val token = (if (host == HOST) tokenFromCookie(cookie) else null)
+            ?: cachedTokens[host]
+            ?: warmUp(base, cookie)?.also { cachedTokens[host] = it }
             ?: run {
                 XposedBridge.logAlways("cainiao h5: 预热没拿到 token，跳过 $api")
                 return fail(lastError ?: "预热没拿到 token（网络不通或被风控拦下）")

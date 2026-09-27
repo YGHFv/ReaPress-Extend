@@ -107,6 +107,20 @@ class ExpressFormatterTest {
     }
 
     @Test
+    fun `说不出地点的驿站名不进通知正文`() {
+        // 2026-09-27 真机：淘宝的超时提醒里抽出的「驿站名」其实是句子的后半截
+        // （`代收点存放已超过24小时 【取件码-6-2-6`）。解析层现在不会再抽出它，
+        // 但历史记录里存下来了 —— 替换通知的正文不能把这串字印给用户看。
+        val r = record(
+            status = ExpressStatus.READY_FOR_PICKUP,
+            pickup = "8-2-3021",
+            station = "代收点存放已超过24小时\u00a0【取件码-8-2-3",
+        )
+        assertEquals("取件码 8-2-3021", ExpressFormatter.summaryLine(r))
+        assertEquals("取件码 8-2-3021", ExpressFormatter.body(r))
+    }
+
+    @Test
     fun `路上那些件的摘要退到运单动态加运单号`() {
         val r = record(courier = Courier.JITU, status = ExpressStatus.IN_TRANSIT, tracking = "JT123")
             .copy(logisticsDetail = "已发往【上海转运中心】")

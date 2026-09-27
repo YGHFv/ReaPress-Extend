@@ -12,6 +12,12 @@
     <!-- 模块常驻后台接收 system_server 投来的拦截事件，靠前台服务保活。 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!--
+      自动轮查用 specialUse 而不是 dataSync：Android 15 起 dataSync 类前台服务被限制
+      每 24 小时最多跑 6 小时，而轮查的语义是「一直开着」（用户自己开的秒表）。
+      specialUse 没有时长上限，代价是必须声明下面那条 property 说明用途。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!--
@@ -102,5 +108,32 @@
             android:name=".relay.ExpressRelayReceiver"
             android:enabled="true"
             android:exported="true" />
+
+        <!--
+          自动轮查：后台按 3 分钟±1 分钟一件、一轮 30 分钟的节奏拉在途件轨迹（默认关闭）。
+          为什么必须是前台服务而不是 WorkManager / 闹钟，见 AutoWatchService 的类注释。
+
+          exported=false：只有本应用（界面开关、开机广播）能起它。前台服务的通知栏那一行
+          就是这个服务在跑的全部痕迹，别再加别的入口。
+        -->
+        <service
+            android:name=".relay.AutoWatchService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="按用户设定的时间与频率查询其本人已授权的快递物流轨迹" />
+        </service>
+
+        <!-- 开机把自动轮查接回去（用户开了它却不进模块时，这条是唯一的重启路径）。 -->
+        <receiver
+            android:name=".relay.BootCompletedReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>
