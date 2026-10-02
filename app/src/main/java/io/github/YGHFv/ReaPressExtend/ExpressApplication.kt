@@ -20,8 +20,10 @@ package io.github.YGHFv.ReaPressExtend
 import android.app.Application
 import io.github.YGHFv.ReaPressExtend.backup.BackupScheduler
 import io.github.YGHFv.ReaPressExtend.config.ExpressSettings
+import io.github.YGHFv.ReaPressExtend.core.RelayCredential
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
 import io.github.YGHFv.ReaPressExtend.logging.ModuleLogBuffer
+import io.github.YGHFv.ReaPressExtend.relay.RelayCredentialStore
 import io.github.libxposed.service.XposedService
 import io.github.libxposed.service.XposedServiceHelper
 
@@ -31,6 +33,9 @@ class ExpressApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         ModuleLogBuffer.attach(this)
+        if (RelayCredentialStore.ensure(this) == null) {
+            ModuleAndroidLog.error(LOG_TAG, "relay credential initialization failed")
+        }
         registerXposedService()
         rescheduleBackup()
     }
@@ -46,6 +51,16 @@ class ExpressApplication : Application() {
             XposedServiceHelper.registerListener(object : XposedServiceHelper.OnServiceListener {
                 override fun onServiceBind(service: XposedService) {
                     ExpressSettings.attachService(service)
+                    runCatching {
+                        check(
+                            RelayCredentialStore.publish(
+                                this@ExpressApplication,
+                                service.getRemotePreferences(RelayCredential.REMOTE_GROUP),
+                            ),
+                        )
+                    }.onFailure {
+                        ModuleAndroidLog.error(LOG_TAG, "relay credential publication failed", it)
+                    }
                     ModuleAndroidLog.legacy(
                         LOG_TAG,
                         "xposed service bound: api=${service.apiVersion} " +

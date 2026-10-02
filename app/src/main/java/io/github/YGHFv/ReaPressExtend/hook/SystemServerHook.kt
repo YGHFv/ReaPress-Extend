@@ -239,10 +239,12 @@ internal object SystemServerHook {
             )
             val dropped = verdict.interceptedCategory
             if (dropped != null) {
-                if (!observeOnly) {
-                    param.setResult(false)
-                    reportIntercepted(param, pkg, title, text, verdict, dropped, notification)
+                if (observeOnly) return
+                if (!reportIntercepted(param, pkg, title, text, verdict, dropped, notification)) {
+                    XposedBridge.logError("EXPRESS INTERCEPT SKIPPED category=${dropped.name} (relay unavailable)")
+                    return
                 }
+                param.setResult(false)
                 XposedBridge.logAlways(
                     "EXPRESS DROPPED category=${dropped.name} pkg=$pkg " +
                         "text=${text.take(50)}",
@@ -279,7 +281,7 @@ internal object SystemServerHook {
         verdict: ExpressVerdict,
         category: NotificationCategory,
         notification: Notification,
-    ) {
+    ): Boolean =
         runCatching {
             val contentIntent = contentIntentOf(notification)
             val record = ExpressParser.parse(pkg, title, text, verdict, System.currentTimeMillis())
@@ -293,8 +295,7 @@ internal object SystemServerHook {
             )
         }.onFailure {
             XposedBridge.logError("intercepted report failed", it)
-        }
-    }
+        }.getOrDefault(false)
 
     private fun contentIntentOf(notification: Notification): PendingIntent? =
         runCatching { notification.contentIntent }.getOrNull()

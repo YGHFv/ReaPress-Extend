@@ -50,7 +50,7 @@ internal object ExpressRelaySender {
         return deliver(context, record, ExpressRelay.ACTION_DELIVER, contentIntent, intentUri, intentToken)
     }
 
-    /** 通知按「通知拦截」被吞掉时的投递；广播失败时拦截照样生效，缺口由 `EXPRESS DROPPED` 日志兜着。 */
+    /** 分类拦截的审计投递；未能提交到认证通道时返回 false，让调用方保留原通知。 */
     fun sendIntercepted(
         record: ExpressRecord,
         thisObject: Any? = null,
@@ -58,19 +58,25 @@ internal object ExpressRelaySender {
         contentIntent: PendingIntent? = null,
         intentUri: String? = null,
         intentToken: String? = null,
-    ) {
+    ): Boolean {
         SystemContextHolder.upgrade(thisObject)
-        val context = SystemContextHolder.acquire() ?: return logContextFailure()
-        deliver(context, record, ExpressRelay.ACTION_INTERCEPTED, contentIntent, intentUri, intentToken) {
+        val context = SystemContextHolder.acquire() ?: run {
+            logContextFailure()
+            return false
+        }
+        return deliver(context, record, ExpressRelay.ACTION_INTERCEPTED, contentIntent, intentUri, intentToken) {
             putExtra(ExpressRelay.EXTRA_CATEGORY, category)
         }
     }
 
     /** 宿主 App 进程侧富化投递。 */
-    fun sendEnrichment(record: ExpressRecord, context: Context?) {
+    fun sendEnrichment(record: ExpressRecord, context: Context?): Boolean {
         val resolved = context ?: HostContextHolder.acquire()
-        if (resolved == null) return logContextFailure()
-        deliver(
+        if (resolved == null) {
+            logContextFailure()
+            return false
+        }
+        return deliver(
             resolved,
             record,
             ExpressRelay.ACTION_ENRICH,
@@ -87,7 +93,7 @@ internal object ExpressRelaySender {
                 .setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
                 .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
                 .putExtra(ExpressRelay.EXTRA_HOST_QUERY_REPORT, text)
-            context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+            if (!AuthenticatedRelaySender.send(context, intent)) return
             XposedBridge.logAlways("host self query report sent: $text")
         }.onFailure { XposedBridge.logError("host self query report failed", it) }
     }
@@ -99,7 +105,7 @@ internal object ExpressRelaySender {
                 .setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
                 .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
                 .putExtra(ExpressRelay.EXTRA_HOST_PROBE, text)
-            context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+            if (!AuthenticatedRelaySender.send(context, intent)) return
             XposedBridge.logAlways("host probe report sent: $text")
         }.onFailure { XposedBridge.logError("host probe report failed", it) }
     }
@@ -111,7 +117,7 @@ internal object ExpressRelaySender {
                 .setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
                 .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
                 .putExtra(ExpressRelay.EXTRA_WAKE_REPORT, text)
-            context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+            if (!AuthenticatedRelaySender.send(context, intent)) return
             XposedBridge.logAlways("wake report sent: $text")
         }.onFailure { XposedBridge.logError("wake report failed", it) }
     }
@@ -124,7 +130,7 @@ internal object ExpressRelaySender {
                 .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
                 .putExtra(ExpressRelay.EXTRA_INTENT_ENTRY_ID, entryId)
             token?.let { intent.putExtra(ExpressRelay.EXTRA_NOTIFICATION_INTENT, it) }
-            context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+            if (!AuthenticatedRelaySender.send(context, intent)) return
             XposedBridge.logAlways("intent token returned: found=${token != null}")
         }.onFailure { XposedBridge.logError("intent token return failed", it) }
     }
@@ -138,7 +144,6 @@ internal object ExpressRelaySender {
     fun sendCookieSync(context: Context, force: Boolean = false) {
         val now = System.currentTimeMillis()
         if (!force && now - lastCookieSyncAt < COOKIE_SYNC_INTERVAL_MS) return
-        lastCookieSyncAt = now
         runCatching {
             val cookie = HostCredentialSource.cookie(context)
             val intent = Intent(ExpressRelay.ACTION_COOKIE_SYNC)
@@ -151,14 +156,16 @@ internal object ExpressRelaySender {
                     HostCredentialSource.lastReason
                         .ifBlank { "宿主侧没有可用登录态（读取方没记下原因）" },
                 )
-                context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+                if (!AuthenticatedRelaySender.send(context, intent)) return
+                lastCookieSyncAt = now
                 XposedBridge.logAlways("cookie sync: 宿主侧没有可用登录态，已发回执")
                 return
             }
             intent.putExtra(ExpressRelay.EXTRA_COOKIE, cookie)
                 // UA 随 cookie 一起送：让 MTOP 请求的 UA 与 cookie 画像一致。
                 .putExtra(ExpressRelay.EXTRA_COOKIE_UA, webviewUa(context))
-            context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+            if (!AuthenticatedRelaySender.send(context, intent)) return
+            lastCookieSyncAt = now
             XposedBridge.log("cookie synced to module (${cookie.length} chars, force=$force)")
         }.onFailure { XposedBridge.logError("cookie sync failed", it) }
     }
@@ -174,7 +181,7 @@ internal object ExpressRelaySender {
         }
     }
 
-    /** 统一投递出口。true 只代表 sendBroadcastAsUser 没抛异常，不代表对方收到了（系统会静默丢弃）。 */
+    /** 统一投递出口。true 只代表认证广播已提交，不代表最终送达（系统仍可能静默丢弃）。 */
     private fun deliver(
         context: Context,
         record: ExpressRecord,
@@ -193,7 +200,7 @@ internal object ExpressRelaySender {
                 ?.let { intent.putExtra(ExpressRelay.EXTRA_INTENT_TOKEN, it) }
             extra?.invoke(intent)
             intent.setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
-            context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+            if (!AuthenticatedRelaySender.send(context, intent)) return false
 
             XposedBridge.log(
                 "relayed to module: action=${action.substringAfterLast('.')} " +

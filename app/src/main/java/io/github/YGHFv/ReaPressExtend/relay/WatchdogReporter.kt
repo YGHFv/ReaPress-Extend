@@ -20,6 +20,7 @@ package io.github.YGHFv.ReaPressExtend.relay
 import android.content.Context
 import android.content.Intent
 import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsKeys
+import io.github.YGHFv.ReaPressExtend.hook.AuthenticatedRelaySender
 import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
 
 /**
@@ -59,7 +60,7 @@ internal object WatchdogReporter {
                 putExtra(EXTRA_REASON, reason)
                 putExtra(EXTRA_DESCRIBE, describe)
             }
-            context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+            if (!AuthenticatedRelaySender.send(context, intent)) return
             // logAlways：这行是「状态有没有推出去」的唯一证据，不能被简洁日志吞掉。
             XposedBridge.logAlways("watchdog state pushed to module app: installed=$installed $describe")
         }.onFailure {

@@ -21,9 +21,10 @@ import io.github.YGHFv.ReaPressExtend.core.CainiaoTraceInfo
 import io.github.YGHFv.ReaPressExtend.core.Courier
 import io.github.YGHFv.ReaPressExtend.core.ExpressOrigin
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
+import io.github.YGHFv.ReaPressExtend.core.FetchRequestLedger
+import io.github.YGHFv.ReaPressExtend.core.FetchRequestQueue
 import io.github.YGHFv.ReaPressExtend.core.latestTraceDetail
 import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
-import java.util.Collections
 import java.util.concurrent.Executors
 
 /**
@@ -47,73 +48,52 @@ internal object CainiaoTraceFetcher {
         Thread(runnable, "reapress-cainiao-trace").apply { isDaemon = true }
     }
 
-    /** 拉成功过的运单号，永不再拉。容量到顶就整体清空——重拉几次的代价远小于无限增长。 */
-    private val succeeded = Collections.synchronizedSet(HashSet<String>())
-
-    private val failedAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
-
-    private val inFlight = Collections.synchronizedSet(HashSet<String>())
+    private val requests = FetchRequestLedger(RETRY_COOLDOWN_MS, MAX_SUCCEEDED)
 
     private var lastRequestAt = 0L
 
     @Volatile private var fetched = 0
 
+    private val queue = FetchRequestQueue<CainiaoTraceInfo>(
+        executor = executor,
+        ledger = requests,
+        clock = System::currentTimeMillis,
+        pace = ::pace,
+        isBlocked = { CainiaoTraceApi.riskBlocked() },
+        onError = { XposedBridge.logError("cainiao trace 失败（已忽略）", it) },
+    )
+
     /**
      * 拉单个运单号的全轨迹（闸门 → 串行执行 → [deliver] 投递结果）。
      * recheck=true 允许重拉成功过的单号（自动轮查用）：轮查的意义就是隔段时间再问一次，
      * 被成功表挡住等于什么都没干；放宽成功表会让「点开详情」也每次重拉、风控压力翻倍，
-     * 所以做成显式开关。被任何闸门挡下都静默返回：调用方另有超时降级，反向通知会把
-     * 「UI 等 hook 回应」变成双向协议。
+     * 所以做成显式开关。onComplete 供订单发现接回状态：本次投递回调正常返回或已有成功记录
+     * 时为 true；失败或未执行为 false。它不代表广播最终送达或数据已持久化。
      */
     fun requestFetch(
         cookieProvider: () -> String?,
         tracking: String,
         recheck: Boolean = false,
+        onComplete: (Boolean) -> Unit = {},
         deliver: (ExpressRecord) -> Unit,
     ) {
-        // 退避期内的所有判断放在占坑之前：否则一次退避期里的连点会把整批单号记成失败，
-        // 退避一结束又全被冷却挡住。
-        if (CainiaoTraceApi.riskBlocked()) return
-        val now = System.currentTimeMillis()
-        if (!inFlight.add(tracking)) return
-        if (!recheck && tracking in succeeded) {
-            inFlight.remove(tracking)
-            return
-        }
-        failedAt[tracking]?.let { last ->
-            if (now - last < RETRY_COOLDOWN_MS) {
-                inFlight.remove(tracking)
-                return
-            }
-        }
-
-        // 异步线程持有 Activity 会泄漏，统一换成 application。
-        executor.execute {
-            var ok = false
-            runCatching {
-                pace()
-                val info = CainiaoTraceApi.fetch(cookieProvider(), tracking)
-                if (info == null) return@execute
-                ok = true
-                fetched++
+        queue.request(
+            key = tracking,
+            recheck = recheck,
+            fetch = { CainiaoTraceApi.fetch(cookieProvider(), tracking) },
+            deliver = { info ->
                 deliver(apply(stubRecord(tracking), info))
-                XposedBridge.logAlways(
-                    "cainiao trace ok: tn=${tracking.take(8)}… pts=${info.points.size} " +
-                        "st=${info.status ?: "-"} addr=${info.stationAddress} " +
-                        "img=${info.goodsImage != null}",
-                )
-            }.onFailure {
-                XposedBridge.logError("cainiao trace 失败（已忽略）", it)
-            }
-            inFlight.remove(tracking)
-            if (ok) {
-                if (succeeded.size >= MAX_SUCCEEDED) succeeded.clear()
-                succeeded.add(tracking)
-                failedAt.remove(tracking)
-            } else {
-                failedAt[tracking] = System.currentTimeMillis()
-            }
-        }
+                fetched++
+                runCatching {
+                    XposedBridge.logAlways(
+                        "cainiao trace ok: tn=${tracking.take(8)}… pts=${info.points.size} " +
+                            "st=${info.status ?: "-"} addr=${info.stationAddress} " +
+                            "img=${info.goodsImage != null}",
+                    )
+                }
+            },
+            onComplete = onComplete,
+        )
     }
 
     private fun pace() {
@@ -151,7 +131,9 @@ internal object CainiaoTraceFetcher {
         timestamp = System.currentTimeMillis(),
     )
 
-    fun describe(): String =
-        "fetched=$fetched ok=${succeeded.size} cooling=${failedAt.size} " +
+    fun describe(): String {
+        val state = requests.snapshot()
+        return "fetched=$fetched ok=${state.succeeded} cooling=${state.cooling} inFlight=${state.inFlight} " +
             "riskBlocked=${CainiaoTraceApi.riskBlocked()}"
+    }
 }

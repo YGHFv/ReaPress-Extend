@@ -66,8 +66,9 @@ internal object ExpressBackup {
      * @param password 非空 = 加密导出
      */
     fun export(context: Context, at: Long, password: String? = null): String {
-        val prefs = LinkedHashMap<String, Map<String, Any?>>()
-        PREFS_NAMES.forEach { name -> prefs[name] = snapshotOf(context, name) }
+        val prefs = ExpressRecordStore.withTransaction {
+            PREFS_NAMES.associateWith { name -> snapshotOf(context, name) }
+        }
         val plain = BackupBundle.encode(
             BackupBundle.Payload(
                 version = BackupBundle.FORMAT_VERSION,
@@ -132,6 +133,12 @@ internal object ExpressBackup {
             return RestoreOutcome(ok = false, message = "备份文件无法识别：${e.message ?: e::class.java.simpleName}")
         }
 
+        val outcome = ExpressRecordStore.withTransaction { restorePayload(context, payload, at) }
+        if (outcome.snapshotName != null) ExpressChangeNotifier.notify(context)
+        return outcome
+    }
+
+    private fun restorePayload(context: Context, payload: BackupBundle.Payload, at: Long): RestoreOutcome {
         // 先落快照，再动数据 —— 顺序不能反；快照写不出来就不去覆盖用户数据。
         val snapshot = try {
             snapshotBeforeRestore(context, at)
@@ -157,8 +164,6 @@ internal object ExpressBackup {
                 failedPrefs++
             }
         }
-        ExpressChangeNotifier.notify(context)
-
         val message = buildString {
             if (failedPrefs > 0) {
                 append("恢复未完全成功：$restoredPrefs 份已写入，$failedPrefs 份写入失败")

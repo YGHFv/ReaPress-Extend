@@ -67,6 +67,8 @@ dependencies {
     compileOnly("io.github.libxposed:api:102.0.0")
 
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.mockito:mockito-core:5.18.0")
+    testImplementation("io.github.libxposed:api:102.0.0")
     // 单测里的 android.jar 是桩，org.json 在桩里只有签名没有实现（调用会抛 "not mocked"）。
     // 引入真实实现，序列化/反序列化这类纯逻辑才测得了。
     testImplementation("org.json:json:20240303")

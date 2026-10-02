@@ -18,12 +18,13 @@
 package io.github.YGHFv.ReaPressExtend.relay
 
 import android.content.Context
+import io.github.YGHFv.ReaPressExtend.core.FetchRequestLedger
+import io.github.YGHFv.ReaPressExtend.core.OrderDiscovery
 import io.github.YGHFv.ReaPressExtend.hook.CainiaoTraceApi
 import io.github.YGHFv.ReaPressExtend.hook.CainiaoTraceFetcher
 import io.github.YGHFv.ReaPressExtend.hook.TaobaoOrderApi
 import io.github.YGHFv.ReaPressExtend.logging.ModuleLogBuffer
 import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
-import java.util.Collections
 import java.util.concurrent.Executors
 
 /**
@@ -49,11 +50,21 @@ object CainiaoDirectFetcher {
 
     private const val MIN_INTERVAL_MS = 2_500L
 
+    private const val RETRY_COOLDOWN_MS = 10 * 60_000L
+
     private val executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "reapress-cainiao-direct").apply { isDaemon = true }
     }
 
-    private val askedOrders = Collections.synchronizedSet(HashSet<String>())
+    private val orderRequests = FetchRequestLedger(RETRY_COOLDOWN_MS)
+
+    private val discovery = OrderDiscovery(
+        ledger = orderRequests,
+        clock = System::currentTimeMillis,
+        pace = ::pace,
+        isBlocked = { CainiaoTraceApi.riskBlocked() },
+        onError = { XposedBridge.logError("direct fetch 订单物流查询失败（已忽略）", it) },
+    )
 
     @Volatile private var lastStartAt = 0L
 
@@ -108,38 +119,39 @@ object CainiaoDirectFetcher {
     }
 
     private fun fetch(app: Context, cookie: String) {
+        if (CainiaoTraceApi.riskBlocked()) {
+            note("跳过（风控退避中）")
+            return
+        }
         val orders = TaobaoOrderApi.listOrders(cookie)
         if (orders.isEmpty()) {
             note("订单列表为空或不可用（cookie 失效 / 接口变了 / 被风控）")
             return
         }
-        val targets = orders.filter { it.isInTransit && askedOrders.add(it.orderId) }
-            .take(MAX_ORDERS)
-        if (targets.isEmpty()) {
-            note("订单 ${orders.size} 条，没有新的在途订单")
-            return
+        XposedBridge.logAlways("direct fetch: 订单 ${orders.size} 条 → 本次最多问 $MAX_ORDERS 个的物流")
+        val outcome = discovery.discover(
+            orders = orders,
+            limit = MAX_ORDERS,
+            fetchParcel = { order -> TaobaoOrderApi.ssrParcel(cookie, order.orderId) },
+            onParcel = { _, parcel, completed ->
+                CainiaoTraceFetcher.requestFetch(
+                    cookieProvider = { TraceCookieCache.get() },
+                    tracking = parcel.mailNo,
+                    onComplete = completed,
+                    deliver = { record -> ModuleTraceFetcher.deliverLocally(app, record) },
+                )
+            },
+        )
+        when {
+            outcome.blocked -> note("中途撞到风控，本次停止（已问 ${outcome.attempted} 个）")
+            outcome.selected == 0 -> note("订单 ${orders.size} 条，没有可查询的在途订单（已完成、进行中或冷却中）")
+            else -> note("问到 ${outcome.found} 个运单号（共试 ${outcome.attempted} 个订单）")
         }
-
-        XposedBridge.logAlways("direct fetch: 订单 ${orders.size} 条 → 问 ${targets.size} 个的物流")
-        var found = 0
-        for ((index, order) in targets.withIndex()) {
-            if (index > 0) pace()
-            if (CainiaoTraceApi.riskBlocked()) {
-                note("中途撞到风控，本次停止（已问 $index 个）")
-                return
-            }
-            val parcel = TaobaoOrderApi.ssrParcel(cookie, order.orderId) ?: continue
-            found++
-            CainiaoTraceFetcher.requestFetch(
-                cookieProvider = { TraceCookieCache.get() },
-                tracking = parcel.mailNo,
-                deliver = { record -> ModuleTraceFetcher.deliverLocally(app, record) },
-            )
-        }
-        note("问到 $found 个运单号（共试 ${targets.size} 个订单）")
     }
 
-    private fun pace() = runCatching { Thread.sleep(MIN_INTERVAL_MS) }
+    private fun pace() {
+        Thread.sleep(MIN_INTERVAL_MS)
+    }
 
     private fun note(outcome: String) {
         lastOutcome = outcome
@@ -160,6 +172,9 @@ object CainiaoDirectFetcher {
         return "$lastOutcome · $whenText"
     }
 
-    fun describe(): String = "asked=${askedOrders.size} last=$lastOutcome " +
-        "riskBlocked=${CainiaoTraceApi.riskBlocked()}"
+    fun describe(): String {
+        val state = orderRequests.snapshot()
+        return "asked=${state.succeeded} inFlight=${state.inFlight} cooling=${state.cooling} last=$lastOutcome " +
+            "riskBlocked=${CainiaoTraceApi.riskBlocked()}"
+    }
 }

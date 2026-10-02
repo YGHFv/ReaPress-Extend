@@ -327,7 +327,7 @@ internal object CainiaoIdentityBridge {
                 .putExtra(ExpressRelay.EXTRA_IDENTITY_EXPIRE_AT, captured.expireAt)
                 .putExtra(ExpressRelay.EXTRA_IDENTITY_OFFLINE, captured.offline)
                 .putExtra(ExpressRelay.EXTRA_IDENTITY_PROVENANCE, provenance)
-            context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+            if (!AuthenticatedRelaySender.send(context, intent)) return
             // 只记长度与来源，绝不记内容（身份码 = 取件凭据）。
             XposedBridge.log("identity synced to module (${captured.code.length} 位, from=$provenance)")
         }.onFailure { XposedBridge.logError("identity bridge: 回传身份码失败", it) }
@@ -338,7 +338,7 @@ internal object CainiaoIdentityBridge {
             val intent = Intent(ExpressRelay.ACTION_IDENTITY_SYNC)
                 .setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
                 .putExtra(ExpressRelay.EXTRA_IDENTITY_ERROR, reason)
-            context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+            if (!AuthenticatedRelaySender.send(context, intent)) return
             XposedBridge.logAlways("identity bridge: 取不到，已发回执（$reason）")
         }.onFailure { XposedBridge.logError("identity bridge: 回传失败原因时出错", it) }
     }
@@ -349,7 +349,7 @@ internal object CainiaoIdentityBridge {
             val intent = Intent(ExpressRelay.ACTION_IDENTITY_SYNC)
                 .setClassName(ExpressRelay.MODULE_PACKAGE, ExpressRelay.RECEIVER_CLASS)
                 .putExtra(ExpressRelay.EXTRA_IDENTITY_BRIDGE_STATUS, status)
-            context.sendBroadcastAsUser(intent, android.os.Process.myUserHandle())
+            if (!AuthenticatedRelaySender.send(context, intent)) return
             XposedBridge.logAlways("identity bridge: 已告知模块「$status」")
         }.onFailure { XposedBridge.logError("identity bridge: 回传状态时出错", it) }
     }

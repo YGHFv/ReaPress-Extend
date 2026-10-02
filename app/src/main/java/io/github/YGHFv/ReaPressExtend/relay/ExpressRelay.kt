@@ -28,6 +28,8 @@ object ExpressRelay {
 
     const val RECEIVER_CLASS = "io.github.YGHFv.ReaPressExtend.relay.ExpressRelayReceiver"
 
+    const val EXTRA_RELAY_CREDENTIAL = "io.github.YGHFv.ReaPressExtend.extra.RELAY_CREDENTIAL"
+
     /** system_server 拦到一条快递通知。 */
     const val ACTION_DELIVER = "io.github.YGHFv.ReaPressExtend.DELIVER_EXPRESS"
 

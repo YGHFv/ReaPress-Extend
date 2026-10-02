@@ -42,6 +42,13 @@ import io.github.YGHFv.ReaPressExtend.notification.IntentTokenFetcher
 class ExpressRelayReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
+        if (!RelayIngress.accept(context, intent)) return
+        runCatching { handleAuthenticated(context, intent) }.onFailure {
+            ModuleAndroidLog.error(LOG_TAG, "authenticated relay processing failed", it)
+        }
+    }
+
+    private fun handleAuthenticated(context: Context, intent: Intent) {
         val app = context.applicationContext
         ModuleLogBuffer.attach(app)
         TraceCookieCache.attach(app)

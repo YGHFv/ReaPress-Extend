@@ -64,7 +64,10 @@ object ExpressRecordStore {
     // 用 elapsedRealtime：改系统时间不该跳过节流窗口。
     private val tailMissLogTimes = HashMap<String, Long>()
 
+    internal fun <Value> withTransaction(block: () -> Value): Value = synchronized(this, block)
+
     /** 既没运单号也没取件码的不算包裹（2026-09-26 真机「📦 揽件通知」）；挡在存储层，relay 契约是加键可以、改键名即破坏兼容。 */
+    @Synchronized
     fun upsert(context: Context, record: ExpressRecord): Boolean = runCatching {
         if (!record.hasIdentity) {
             ModuleAndroidLog.legacy(
@@ -245,6 +248,7 @@ object ExpressRecordStore {
         val anchorIndex: Int = NO_MATCH,
     )
 
+    @Synchronized
     fun load(context: Context): List<ExpressRecord> =
         runCatching {
             parse(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_RECORDS, null))
@@ -256,6 +260,7 @@ object ExpressRecordStore {
         }.getOrDefault(emptyList())
 
     /** 修 → 认领 → 有变化才写回，把「读时自愈」变成一次性；界面首次装载列表前调一次（无变化不写字节）。 */
+    @Synchronized
     fun reconcile(context: Context): Boolean = runCatching {
         val stored = load(context)
         val merged = applyTailMatches(stored).records
@@ -269,6 +274,7 @@ object ExpressRecordStore {
     }.getOrDefault(false)
 
     /** 用 [enrichment] 补已有记录缺失字段（只填空不覆盖）；配不上就新建一条 —— 宿主已知的包裹不该因通知没拦到而从首页消失。 */
+    @Synchronized
     fun enrich(context: Context, enrichment: ExpressRecord): Boolean = runCatching {
         if (!enrichment.hasIdentity) {
             ModuleAndroidLog.legacy(
@@ -374,6 +380,7 @@ object ExpressRecordStore {
     }
 
     /** 标记 / 取消标记「已取件」：只动 pickedUpAt 不动 status（用户确认取件 ≠ 快递公司确认签收）。 */
+    @Synchronized
     fun setPickedUp(context: Context, key: String, at: Long?): Boolean = runCatching {
         val next = applyPickedUp(load(context), key, at) ?: return@runCatching false
         save(context, next)
@@ -394,6 +401,7 @@ object ExpressRecordStore {
     }
 
     /** 清空全部记录（无自动化路径，勿当死代码删）。用 commit：点完清空可能马上杀进程，apply 会把删除丢掉。 */
+    @Synchronized
     fun clear(context: Context) {
         runCatching {
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_RECORDS).commit()

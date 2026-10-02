@@ -307,7 +307,11 @@ internal object CainiaoPackageHook {
                         CainiaoTraceFetcher.requestFetch(
                             cookieProvider = { HostCredentialSource.cookie(context) },
                             tracking = tracking,
-                            deliver = { ExpressRelaySender.sendEnrichment(it, context) },
+                            deliver = {
+                                check(ExpressRelaySender.sendEnrichment(it, context)) {
+                                    "authenticated enrichment was not submitted"
+                                }
+                            },
                         )
                     }.onFailure { XposedBridge.logError("cainiao trace request dispatch failed", it) }
                 }
@@ -566,13 +570,14 @@ internal object CainiaoPackageHook {
             return false
         }
 
-        ExpressRelaySender.sendEnrichment(record, context)
+        val submitted = ExpressRelaySender.sendEnrichment(record, context)
+        if (!submitted) delivered.remove(fingerprint)
         // 轨迹收拢到模块进程，cookie 由这里同步过去（30 分钟节流）；请求 receiver 在此兜底立起来。
         ExpressRelaySender.sendCookieSync(context)
         ensureTraceReceiver(context)
         // 身份码索取通道同理，只有主进程才注册。
         if (mainProcess) CainiaoIdentityBridge.ensureReceiver(context)
-        return true
+        return submitted
     }
 
     /** 行是 fastjson 的 JSONObject，toString 即 JSON 文本；模块不引 fastjson，走 toString + org.json。 */
