@@ -70,7 +70,7 @@ internal object ExpressRelaySender {
     }
 
     /** 宿主 App 进程侧富化投递。 */
-    fun sendEnrichment(record: ExpressRecord, context: Context?): Boolean {
+    fun sendEnrichment(record: ExpressRecord, context: Context?, packageSnapshot: Boolean = false): Boolean {
         val resolved = context ?: HostContextHolder.acquire()
         if (resolved == null) {
             logContextFailure()
@@ -83,6 +83,7 @@ internal object ExpressRelaySender {
             contentIntent = null,
             intentUri = null,
             intentToken = null,
+            extra = { if (packageSnapshot) putExtra(ExpressRelay.EXTRA_PACKAGE_SNAPSHOT, true) },
         )
     }
 
@@ -223,6 +224,7 @@ internal object ExpressRelaySender {
             putExtra(ExpressRelay.EXTRA_TRACKING, record.trackingNumber)
             putExtra(ExpressRelay.EXTRA_COURIER, record.courier.name)
             putExtra(ExpressRelay.EXTRA_PICKUP_CODE, record.pickupCode)
+            putExtra(ExpressRelay.EXTRA_PICKUP_OBSERVED_AT, record.pickupCodeObservedAt)
             putExtra(ExpressRelay.EXTRA_STATION, record.station)
             putExtra(ExpressRelay.EXTRA_STATUS, record.status.name)
             putExtra(ExpressRelay.EXTRA_CONFIDENCE, record.confidence)

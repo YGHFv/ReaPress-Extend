@@ -246,6 +246,22 @@ class AuthenticatedRelaySenderTest {
     }
 
     @Test
+    fun packageSnapshotFlagIsAuthenticatedEvenWhenPickupCodeIsMissing() {
+        Fixture().use { fixture ->
+            mockStatic(Process::class.java).use { process ->
+                process.`when`<Int> { Process.myUid() }.thenReturn(10_123)
+                withConstructedIntents { constructed ->
+                    val record = ExpressRecord(sourcePackage = ExpressRelay.HOST_PACKAGE, rawText = "synthetic", trackingNumber = "TEST12345678")
+                    assertTrue(ExpressRelaySender.sendEnrichment(record, fixture.context, packageSnapshot = true))
+                    verify(constructed.single()).putExtra(ExpressRelay.EXTRA_PACKAGE_SNAPSHOT, true)
+                    verify(constructed.single()).putExtra(ExpressRelay.EXTRA_RELAY_CREDENTIAL, fixture.credential)
+                    verify(fixture.context).sendBroadcast(constructed.single())
+                }
+            }
+        }
+    }
+
+    @Test
     fun `包裹采集鉴权失败撤回去重占位而成功发送后保留去重`() {
         Fixture().use { fixture ->
             mockStatic(Process::class.java).use { process ->

@@ -4,7 +4,7 @@
 
 第 1–8 节保留修复前的审计结论与基线代码定位，不代表当前修复状态；后续改动、测试结果及未完成事项见第 9 节。
 
-最新修复复核日期：2026-10-03；第六批结果见第 9 节末尾。
+最新修复复核日期：2026-10-03；第七批开发状态见第 9 节末尾。
 
 ## 1. 结论与检查边界
 
@@ -488,3 +488,54 @@ adb devices
 - 已安装 APK 的 SHA-256：`24628A7742C1ABBBD1C993A162F84DBA0A86D103173D2D1E3C437DA4D4E13734`。本机安装日志：`log/install-batch6.log`；安装前后包信息和哈希也只保留在 Git 忽略的 `log/`。
 - 本次提交汇集第三至第六批源码、资源、正式测试、README 与审计报告；各批“未提交/推送”的表述是当时状态。APK、签名材料、本机 `local.properties` 和日志不进入源码仓库。
 - 更新系统与宿主 hook 仍需重启设备，并在框架连接正常时打开模块；安装未主动操作登录态、触发恢复/迁移或做完整 UI 验收。
+
+### 第七批：菜鸟取件码后台联网同步（待真机验收）
+
+接续基线：提交 `f70e9dbf2f81ca3dd856d9b0d3181a831c372705`，此前 789 项测试通过。本批按用户要求使用提供的 MT MCP 分析菜鸟 APK，再实现受限适配；未重新安装、提交或推送，未主动请求真实账号接口。
+
+#### MT 分析依据
+
+- MT MCP 0.2.0，复用工作区 `mgiapprk`，只读分析 `cainiao-8.11.923.apk`，包名 `com.cainiao.wireless`、versionCode 475，与 ADB 查询安装版本相符。分析调用为 APK search/read/xref/outline，不修改或重打包菜鸟，不读取用户数据库、Cookie 或真实取件码；工具响应与 Smali 仅保留在被 Git 忽略的 `log/mt-*`。
+- `homepage.presenter.c#att()` → `components.init.a#afe()` → `cdss.c#b(Topic[])` → `core.facade.b#Xh()`，这是首页及 `JsHybridDoradoModule#refreshDoradoTopic` 的真实联网路径，而旧模块仅调用 `HybridDoradoApi#query`。
+- `cdss.core.f#sendData` 在 `cdss.d.bNe=false` 时明确返回“Send data on background is not support”；因此直接反射首页 refresh 方法并不能保证后台有效。本实现不改该全局前台标志，不调用 `enterForeground`，不启动 Activity。
+- 包裹主题由 `CDSSConstantHelper#Fo/Fp` 返回 `package_list_v4` / `1.3`；实际请求采用当前 TopicModel 中的版本与本地游标，不硬写服务端游标。`protocol.a#g(List,true)` 构造 sequence 请求，`f(List,true)` 构造 data 请求，`dorado...mtop.c#vZ` 做宿主新版协议转换。
+- `MtopCainiaoNewDoradoClientRequestServiceRequestRequest` 对应 API `mtop.cainiao.pcs.app.user.package.sync` / `1.0`，需要宿主会话。通过 `CNMtopBusinessUtils.obtainCNMtopBusiness` 保留宿主 MTOP 实例、签名与 WUA，独立动态代理接收结果；不用 H5 仿签，也不替换 `DataSyncFinishListener`（该注册表每个 topic 只有一个槽位）。
+- `MtopBusiness` 默认 `showLoginUI=true`，新请求显式设为 false；`setNeedAuth(..., false)` 反而会把 `needAuth` 置 true，因此不调用它，而是对 `isNeedAuth()!=false` 的实例直接拒绝。当前任务不弹授权页、不触发用户交互式登录；登录过期返回失败。
+- 返回格式由 `SequenceResponse` / `DataResponse` 和 `DownwardSync` 核对：`content.response_type` 为 1/2，`response_content` 包含 `user_id/data`；数据页经宿主 `DownwardSync#bQ` 原有处理器写入，再检查 TopicModel 本地游标已更新。源码证据：`log/mt-home-refresh.smali`、`log/mt-send-data.smali`、`log/mt-new-request.smali`、`log/mt-mtop-util.smali`、`log/mt-downward.smali`、`log/mt-data-response.smali`。
+
+#### 实现与保护
+
+- `PackageSyncSession` 限制一次 sequence 查询、最多 3 页增量，检查账户、schema、游标推进和落库结果。请求前再次检查账户和退避；构造分离的 TopicModel，不手改宿主锁、初始化标志或真实游标；库/模型不就绪最多等待 8 秒，不强制初始化/重建。
+- `CainiaoPackageSyncClient` 使用宿主 ABI 反射调用；开始网络请求调度到主线程，后台工作线程有 12 秒等待预算，超时取消，迟到主线程任务不再启动请求。只接收首次终态回调；风险/失败回调不盲重试，响应最大 4 Mi 字符；账户、主题或 schema 不符不应用。
+- `CainiaoPackageSync` 在入队前原子占位，仅菜鸟主进程的受 signature 权限保护入口可触发；适配限制 8.11.923。模块/宿主分别持久化 5 分钟尝试冷却，失败 10 分钟，风险至少 1 小时；宿主完成 ID 缓存只重放结果，不重复联网。冷启动重复广播沿用同一个 ID（0/3/8 秒），模块 75 秒未收到匹配回执则显示超时。
+- 模块退避包含已落盘轨迹风控；取件码风险回执反向更新轨迹风控，采用更晚时间，并与恢复共用记录事务锁。同步提交失败不假装落盘成功，保留进程内保护且显示提示；进程被杀后磁盘失败的保护仍不能保证，未宣称跨进程事务。
+- 宿主完成后重新读取包裹表，最多 500 行；行结构畸形/超量拒绝宣布完整完成。用线程局部标志避免此次主动读取又被旧 query hook 重复发送；快照标志覆盖含码/无码行，接收端不再逐行启动轨迹请求。普通通知/轨迹路径不变。
+- 确认的取件码附独立 `pickupCodeObservedAt`，以同步开始时刻作为保守新鲜度边界；完整运单号匹配才替换非空旧码，旧码记入 `previousPickupCode`。新鲜度落盘且兼容旧数据；旧快照、旧通知和旧尾号认领不能把码改回去，后到但确实更晚的通知可更新并推进新鲜度。`showAuthCode=false` 或空码不透出/不擦除已有记录。
+- 新 action/extra 加入 Relay 字段白名单：同步回执必须带合法 UUID 和有限状态名，身份验证仍先于业务读取；状态回执只接受当前活动 ID，普通缓存回执不再冒充联网成功。
+
+#### 明确未完成的验收
+
+- **不是已经证实真机可用的发布结论**：本轮未访问实际用户包裹同步 API、未重新安装或重启菜鸟。MT 所见的 APK ABI 不能证明当前热修复、服务端风控、后台环境、分页上限及 ROM 行为都可用。需要下一步有限次数的设备验证。
+- `synced` 的严格含义是“本次服务端目标游标已与宿主库一致，回传已提交”；Android 广播没有模块逐行落盘 ACK，不能保证页面已接齐全部记录。迟到数据即使状态已超时仍可能补入，模块下次查询可再次获得最新快照。
+- `DownwardSync` 自身可能通知宿主监听器并调度后续工作；3 页限制约束本适配器发起的请求，不能声称限制了宿主所有后台网络。不会主动把 sequence 响应交给全局同步引擎，避免打开全主题自动同步。
+- 本次只支持已登录且已有同步 schema 的菜鸟进程，不保证从未打开/初始化过菜鸟也能首次建立数据库。服务器未提供取件码时不生成；同一运单号多账号碰撞、宿主切换账户与下行应用之间的极短竞态、同步过程中宿主被杀等仍需真机观察。
+- 冷却/状态文件 `reapress_package_sync` 不进入模块备份白名单。首次安装新模块后必须让菜鸟加载新 hook；未修改系统侧 hook，不需要为了本功能重启系统，但仅重开模块不足以更新已存活的菜鸟进程。
+
+验证命令：
+
+```powershell
+.\gradlew.bat :app:testDebugUnitTest --tests '*PackageSyncSessionTest' --tests '*PickupCodeRefreshTest' --tests '*CainiaoPackageSyncClientTest' --tests '*CainiaoPackageSyncGateTest' --tests '*HostRefreshRequesterTest' --tests '*PackageSyncContractTest' --tests '*RelayPayloadPolicyTest' --tests '*ExpressRelayContractTest' --tests '*ExpressRecordConcurrencyTest' --tests '*RelayIngressTest' --tests '*AuthenticatedRelaySenderTest' --console=plain
+.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease :app:lintDebug --console=plain
+```
+
+- 最终定向 **112 项通过**（本批新增 65 + 原有 47）；新增覆盖游标分页 8、取件码新鲜度与存储 14、真实反射调用/合成宿主 ABI 19、宿主入队/退避 8、模块请求/回执 12、源码边界契约 3、认证快照标志 1。日志：`log/fix-batch7-targeted.log`，计数：`log/fix-batch7-targeted-count.txt`。
+- 最终全量 **854 项通过，75 个测试类，失败/错误/跳过均为 0**（第六批 789 + 本批 65）；统计：`log/fix-batch7-full-test-count.csv`、`log/fix-batch7-full-test-summary.txt`。
+- **Debug / Release / Lint 均通过**，日志：`log/fix-batch7-validation.log`。Lint 为 **0 错误、43 警告、0 提示**；比第六批增加 4 项同步偏好提交的 `UseKtx` 建议，保留同步提交结果检查，不为告警数量改成异步或增加 baseline。
+- APK 已构建至原路径，Release 仍未签名；本批尚未安装到设备，也未触发真实网络请求。`git diff --check` 通过；MT 原始 Smali、分析调用及测试日志不进入仓库，README 已注明“待真机验收”。
+
+### 第七批安装与提交记录（2026-10-03）
+
+- 按用户要求，将已通过 854 项单测和 Debug/Release/Lint 验证的 Debug APK 覆盖安装到当前设备。`apksigner verify` 通过，`adb install -r` 返回 `Success`；未卸载或清除数据。
+- 包版本仍为 `0.1.0` / versionCode 1，最后更新时间为 `2026-10-03 21:46:03`，首次安装时间仍为 `2026-09-26 04:58:53`。APK SHA-256：`CC97E77F51D51227CE914F28DF251792D413229ADCB1B3AF8592DDC98831AF50`。
+- 安装日志及前后包信息保留在 Git 忽略的 `log/install-batch7*.log`；APK、MT 原始分析和本机配置不纳入源码提交。此前“未安装/未提交”的文字保留为开发阶段状态。
+- 本次未自动重启菜鸟或启动模块，未主动发起真实账号同步；安装不等于功能验收。设备上仍需让菜鸟主进程重新加载 hook，再从模块首页检查后台同步结果。

@@ -58,7 +58,9 @@ internal fun HomePage(
     onOpenArchive: (() -> Unit)? = null,
     /** 归档窗口（毫秒）：设置选「签收后归档」传 0，「签收7天后归档」传 [ExpressHomeGrouper.ARCHIVE_RETENTION_MS]。 */
     archiveRetentionMs: Long = ExpressHomeGrouper.ARCHIVE_RETENTION_MS,
+    packageSyncStatus: String? = null,
 ) {
+    packageSyncStatus?.let { HintText(it) }
     if (records.isEmpty()) {
         EmptyHome()
         return

@@ -58,6 +58,8 @@ data class ExpressRecord(
     val matchedKeywords: List<String> = emptyList(),
     val confidence: Int = 0,
     val timestamp: Long = 0L,
+    /** Code freshness established by a confirmed snapshot (or a later replacing notification); zero for legacy input. */
+    val pickupCodeObservedAt: Long = 0L,
 ) {
     val isPickedUp: Boolean get() = pickedUpAt != null
 
@@ -96,7 +98,7 @@ data class ExpressRecord(
         return rawText == other.rawText
     }
 
-    /** 富化合并：只填空不覆盖。例外两处：运单号（截断尾号→全号）、状态只推进（[ExpressStatus.isAdvanceFrom]）。 */
+    /** 富化以补空为主；确认为较新的菜鸟联网快照可更换同一完整运单号的取件码并保留旧码。 */
     fun mergeEnrichment(other: ExpressRecord): ExpressRecord {
         val otherTracking = other.trackingNumber?.takeIf { it.isNotBlank() }
         val mergedTracking = when {
@@ -114,13 +116,19 @@ data class ExpressRecord(
             else -> status
         }
 
+        val replaceCode = other.sourcePackage == "com.cainiao.wireless" && other.origin == ExpressOrigin.ENRICHMENT &&
+            !trackingNumber.isNullOrBlank() && trackingNumber == other.trackingNumber &&
+            !other.pickupCode.isNullOrBlank() && other.pickupCodeObservedAt > pickupCodeObservedAt &&
+            other.pickupCodeObservedAt > 0L &&
+            (origin != ExpressOrigin.NOTIFICATION || timestamp <= other.pickupCodeObservedAt)
         val merged = copy(
             trackingNumber = mergedTracking,
             orderSn = orderSn ?: other.orderSn,
             courier = if (courier == Courier.UNKNOWN) other.courier else courier,
             // 驿站名没有地点信息的写法要让位，否则宿主真名被「已送达代收点」挡住。
             station = station?.takeIf { ExpressStationName.hasLocation(it) } ?: other.station,
-            pickupCode = pickupCode ?: other.pickupCode,
+            pickupCode = if (replaceCode) other.pickupCode else pickupCode ?: other.pickupCode,
+            pickupCodeObservedAt = if (replaceCode) other.pickupCodeObservedAt else pickupCodeObservedAt,
             platform = platform ?: other.platform,
             goodsName = goodsName ?: other.goodsName,
             arrivalAt = arrivalAt ?: other.arrivalAt,
@@ -139,7 +147,8 @@ data class ExpressRecord(
             trace = if (other.trace.size >= trace.size) other.trace else trace,
             phoneTail = phoneTail ?: other.phoneTail,
             parcelTail = parcelTail ?: other.parcelTail,
-            previousPickupCode = previousPickupCode ?: other.previousPickupCode,
+            previousPickupCode = if (replaceCode && pickupCode != other.pickupCode && !pickupCode.isNullOrBlank()) pickupCode
+                else previousPickupCode ?: other.previousPickupCode,
             pickedUpAt = pickedUpAt ?: other.pickedUpAt,
             title = title ?: other.title,
             // status 必须在这份 copy 里：底下的 merged == this 是全字段相等判定，放外面会吞掉状态纠正。

@@ -59,6 +59,7 @@ class ExpressRelayReceiver : BroadcastReceiver() {
             ExpressRelay.ACTION_INTERCEPTED -> handleIntercepted(app, intent)
             ExpressRelay.ACTION_COOKIE_SYNC -> handleCookieSync(app, intent)
             ExpressRelay.ACTION_IDENTITY_SYNC -> IdentityCodeFetcher.submitFromHost(intent)
+            ExpressRelay.ACTION_PACKAGE_SYNC_REPORT -> HostRefreshRequester.onReport(app, intent)
             ExpressRelay.ACTION_HOST_QUERY_REPORT ->
                 intent.getStringExtra(ExpressRelay.EXTRA_HOST_QUERY_REPORT)
                     ?.takeIf { it.isNotBlank() }
@@ -151,10 +152,15 @@ class ExpressRelayReceiver : BroadcastReceiver() {
                 "station=${enrichment.station} applied=$applied",
         )
         // 自动更新模式对到站/派送中的件主动拉全轨迹；点击时获取模式留一条极低速保底。
-        if (ExpressSettings.read(app).isTraceAutoFetch) {
-            ModuleTraceFetcher.maybeAutoFetch(app, enrichment)
-        } else {
-            ModuleTraceFetcher.maybeBackstopFetch(app, enrichment)
+        val packageSnapshot = enrichment.sourcePackage == ExpressRelay.HOST_PACKAGE &&
+            intent.getBooleanExtra(ExpressRelay.EXTRA_PACKAGE_SNAPSHOT, false)
+        // A package-list sync must not fan out into another network request for each row, including rows without codes.
+        if (!packageSnapshot) {
+            if (ExpressSettings.read(app).isTraceAutoFetch) {
+                ModuleTraceFetcher.maybeAutoFetch(app, enrichment)
+            } else {
+                ModuleTraceFetcher.maybeBackstopFetch(app, enrichment)
+            }
         }
         val hasTraceData = enrichment.trace.isNotEmpty() || enrichment.stationAddress != null
         if (applied && hasTraceData) {
@@ -222,6 +228,8 @@ class ExpressRelayReceiver : BroadcastReceiver() {
                 Courier.valueOf(intent.getStringExtra(ExpressRelay.EXTRA_COURIER).orEmpty())
             }.getOrDefault(Courier.UNKNOWN),
             pickupCode = intent.getStringExtra(ExpressRelay.EXTRA_PICKUP_CODE)?.takeIf { it.isNotBlank() },
+            pickupCodeObservedAt = if (intent.action == ExpressRelay.ACTION_ENRICH && sourcePackage == ExpressRelay.HOST_PACKAGE)
+                intent.getLongExtra(ExpressRelay.EXTRA_PICKUP_OBSERVED_AT, 0L).coerceIn(0L, System.currentTimeMillis()) else 0L,
             station = intent.getStringExtra(ExpressRelay.EXTRA_STATION)?.takeIf { it.isNotBlank() },
             status = runCatching {
                 ExpressStatus.valueOf(intent.getStringExtra(ExpressRelay.EXTRA_STATUS).orEmpty())

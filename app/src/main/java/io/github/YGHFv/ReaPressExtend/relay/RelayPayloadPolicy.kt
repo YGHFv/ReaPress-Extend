@@ -17,6 +17,7 @@ internal object RelayPayloadPolicy {
         ExpressRelay.EXTRA_TRACKING to Field(Kind.STRING, 256),
         ExpressRelay.EXTRA_COURIER to Field(Kind.STRING, 128),
         ExpressRelay.EXTRA_PICKUP_CODE to Field(Kind.STRING, 256),
+        ExpressRelay.EXTRA_PICKUP_OBSERVED_AT to Field(Kind.LONG),
         ExpressRelay.EXTRA_STATION to Field(Kind.STRING),
         ExpressRelay.EXTRA_STATUS to Field(Kind.STRING, 128),
         ExpressRelay.EXTRA_CONFIDENCE to Field(Kind.INTEGER),
@@ -45,10 +46,15 @@ internal object RelayPayloadPolicy {
     )
 
     private val schemas = mapOf(
+        ExpressRelay.ACTION_PACKAGE_SYNC_REPORT to mapOf(
+            ExpressRelay.EXTRA_PACKAGE_SYNC_ID to Field(Kind.STRING, 36),
+            ExpressRelay.EXTRA_PACKAGE_SYNC_STATUS to Field(Kind.STRING, 40),
+            ExpressRelay.EXTRA_PACKAGE_SYNC_RETRY_AT to Field(Kind.LONG),
+        ),
         ExpressRelay.ACTION_DELIVER to recordFields + notificationFields,
         ExpressRelay.ACTION_INTERCEPTED to recordFields + notificationFields +
             (ExpressRelay.EXTRA_CATEGORY to Field(Kind.STRING, 128)),
-        ExpressRelay.ACTION_ENRICH to recordFields,
+        ExpressRelay.ACTION_ENRICH to recordFields + (ExpressRelay.EXTRA_PACKAGE_SNAPSHOT to Field(Kind.BOOLEAN)),
         ExpressRelay.ACTION_COOKIE_SYNC to mapOf(
             ExpressRelay.EXTRA_COOKIE to Field(Kind.STRING, 65_536),
             ExpressRelay.EXTRA_COOKIE_UA to Field(Kind.STRING),
@@ -110,6 +116,12 @@ internal object RelayPayloadPolicy {
         }
         fun hasText(name: String): Boolean = (payload[name] as? String)?.isNotBlank() == true
         return when (action) {
+            ExpressRelay.ACTION_PACKAGE_SYNC_REPORT ->
+                (payload[ExpressRelay.EXTRA_PACKAGE_SYNC_ID] as? String)?.matches(
+                    Regex("[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}")) == true &&
+                payload[ExpressRelay.EXTRA_PACKAGE_SYNC_STATUS] in setOf("busy", "synced", "unsupported", "login_required",
+                    "not_ready", "risk", "blocked", "cooling", "failed", "schema_changed", "session_changed",
+                    "invalid_response", "apply_unconfirmed", "timeout", "request_failed")
             ExpressRelay.ACTION_DELIVER, ExpressRelay.ACTION_ENRICH, ExpressRelay.ACTION_INTERCEPTED ->
                 hasText(ExpressRelay.EXTRA_SOURCE_PACKAGE) && hasText(ExpressRelay.EXTRA_TEXT)
             ExpressRelay.ACTION_COOKIE_SYNC ->

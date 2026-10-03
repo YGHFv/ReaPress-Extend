@@ -132,6 +132,7 @@ class AutoWatchService : Service() {
             // 本轮已问过的单号要跳过：一轮的语义是「每个在途件问一遍」，重启后接着问剩下的。
             // 免 root 下新件只在一轮真正开始（done 空）时顺带发现一次——逐件发现会把请求数翻几倍。
             val done = WatchState.roundDone(this)
+            if (done.isEmpty()) HostRefreshRequester.request(this)
             if (done.isEmpty() && settings.noRootListener) {
                 CainiaoDirectFetcher.start(this, "轮查发现")
             }

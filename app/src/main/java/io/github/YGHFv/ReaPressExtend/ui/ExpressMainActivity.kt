@@ -194,7 +194,7 @@ class ExpressMainActivity : ComponentActivity() {
      * 先发销再发请求，宿主刚被拉起时请求可能正好落到刚注册好的接收器上。
      * 第三条是直连兜底（[scheduleDirectFetch]），整条路不经菜鸟进程，只覆盖淘宝/天猫件。
      * 不是「保证刷新」：判据看模块日志的 `host self query: rows=N` 与 `enrichment received`；
-     * 也不解决「服务端有、本地没有」 —— 这里只解决「库里有、没人读」。
+     * 取件码另由 HostRefreshRequester 的确认回执表示联网结果；缓存回执不等于新码已同步。
      */
     private fun refreshHostOnResume() {
         val now = System.currentTimeMillis()
@@ -438,14 +438,15 @@ private fun ExpressApp(
     // 分组、挡住富化真名；无变化时一个字节都不写。
     remember { ExpressRecordStore.reconcile(context) }
     var homeRecords by remember { mutableStateOf(ExpressRecordStore.load(context)) }
+    var packageSyncStatus by remember { mutableStateOf(HostRefreshRequester.describe()) }
     var recordEntries by remember { mutableStateOf(ExpressNotificationLog.snapshot(context)) }
     LaunchedEffect(resumeTick) {
         // 每次回到前台都走这里：磁盘 IO 必须丢到 IO 线程，主线程上读 200 条 JSON 会卡掉恢复动画的首几帧。
         val loaded = withContext(Dispatchers.IO) { ExpressRecordStore.load(context) }
         homeRecords = loaded
+        packageSyncStatus = HostRefreshRequester.describe()
         recordEntries = withContext(Dispatchers.IO) { ExpressNotificationLog.snapshot(context) }
-        // 自动补一次轨迹：onResume 那串只解决「宿主库里有、没人读」，宿主那张表不会因叫醒而变新，
-        // 必须真发一次请求。放在这里是为了用刚读到的列表；引擎自己会节流（foregroundRefresh）。
+        // 轨迹与宿主取件码同步是独立数据源；用刚读到的列表补查，按各自节流控制。
         withContext(Dispatchers.IO) {
             runCatching { ModuleTraceFetcher.foregroundRefresh(context, loaded, "打开模块") }
         }
@@ -463,6 +464,7 @@ private fun ExpressApp(
                     val records = withContext(Dispatchers.IO) { ExpressRecordStore.load(context) }
                     val entries = withContext(Dispatchers.IO) { ExpressNotificationLog.snapshot(context) }
                     homeRecords = records
+                    packageSyncStatus = HostRefreshRequester.describe()
                     recordEntries = entries
                 }
             }
@@ -515,7 +517,7 @@ private fun ExpressApp(
             homeRecords = withContext(Dispatchers.IO) { ExpressRecordStore.load(context) }
         }) { homeRefreshing = it }
         // 用户主动下拉是明确指令，走 force（只跳启动节流，风控退避照旧）。三条腿各管一格：
-        // 拉起宿主 + 请它重查本地表、宿主叫不动时直连淘宝、轨迹 force 刷新。
+        // 拉起宿主 + 请求受限联网同步、直连淘宝发现、轨迹 force 刷新。
         val snapshot = homeRecords
         scope.launch(Dispatchers.IO) {
             runCatching { ModuleTraceFetcher.foregroundRefresh(context, snapshot, "首页下拉刷新", force = true) }
@@ -968,6 +970,7 @@ private fun ExpressApp(
                         // 关掉开关传 null：双击手势挂不挂由这一个参数决定，没有第二处判断可以跑偏。
                         TAB_HOME -> HomePage(
                             records = homeRecords,
+                            packageSyncStatus = packageSyncStatus,
                             rules = stationRules,
                             onTogglePickup = if (doubleTapPickup) togglePickup else null,
                             onOpenDetail = { record ->

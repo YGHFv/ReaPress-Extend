@@ -40,7 +40,7 @@ import org.json.JSONObject
 
 /**
  * 快递记录持久化。不变量：同一 [ExpressRecord.dedupeKey] 状态只推进不回退（同级取时间较新者），
- * 富化只填空不覆盖；[setPickedUp] 只动 pickedUpAt 不动 status，整站取完由 [ExpressHomeGrouper] 判断。
+ * 富化以补空为主，确认较新的菜鸟联网快照可更新取件码；[setPickedUp] 只动 pickedUpAt 不动 status。
  */
 object ExpressRecordStore {
 
@@ -129,8 +129,18 @@ object ExpressRecordStore {
         }
     }
 
-    private fun mergeVersions(existing: ExpressRecord, incoming: ExpressRecord): ExpressRecord =
-        incoming.mergeEnrichment(existing.mergeEnrichment(incoming))
+    private fun mergeVersions(existing: ExpressRecord, incoming: ExpressRecord): ExpressRecord {
+        val merged = incoming.mergeEnrichment(existing.mergeEnrichment(incoming))
+        if (existing.pickupCodeObservedAt <= 0L || existing.pickupCode.isNullOrBlank()) return merged
+        // Status timestamps and credential timestamps are independent; a late status event can be older than the code.
+        return if (incoming.pickupCode.isNullOrBlank() || incoming.timestamp <= existing.pickupCodeObservedAt) {
+            merged.copy(pickupCode = existing.pickupCode, pickupCodeObservedAt = existing.pickupCodeObservedAt,
+                previousPickupCode = existing.previousPickupCode)
+        } else {
+            merged.copy(pickupCode = incoming.pickupCode, pickupCodeObservedAt = incoming.timestamp,
+                previousPickupCode = existing.pickupCode.takeIf { it != incoming.pickupCode } ?: existing.previousPickupCode)
+        }
+    }
 
     /**
      * 尾号匹配（2026-09-27 用户要求）：通知取件码按「运单号尾段」认领到宿主包裹上。
@@ -189,11 +199,13 @@ object ExpressRecordStore {
             !record.parcelTail.isNullOrBlank()
 
     private fun claimTail(target: ExpressRecord, claimant: ExpressRecord): ExpressRecord {
+        if (target.pickupCodeObservedAt > 0L && claimant.timestamp <= target.pickupCodeObservedAt) return target
         val claimedCode = claimant.pickupCode.orEmpty()
         val previous = target.pickupCode?.takeIf { it.isNotBlank() && it != claimedCode }
             ?: target.previousPickupCode
         val matched = target.copy(
             pickupCode = claimedCode,
+            pickupCodeObservedAt = if (target.pickupCodeObservedAt > 0L) claimant.timestamp else 0L,
             previousPickupCode = previous,
             // 驿站只填空：宿主那条通常更全（带楼栋号）。
             station = target.station?.takeIf { ExpressStationName.hasLocation(it) }
@@ -274,7 +286,7 @@ object ExpressRecordStore {
         true
     }.getOrDefault(false)
 
-    /** 用 [enrichment] 补已有记录缺失字段（只填空不覆盖）；配不上就新建一条 —— 宿主已知的包裹不该因通知没拦到而从首页消失。 */
+    /** 用 [enrichment] 补记录，并按独立取件码时间更新确认的新码；配不上则新建。 */
     @Synchronized
     fun enrich(context: Context, enrichment: ExpressRecord): Boolean = runCatching {
         if (!enrichment.hasIdentity) {
@@ -431,6 +443,7 @@ object ExpressRecordStore {
                     put("osn", record.orderSn ?: JSONObject.NULL)
                     put("courier", record.courier.name)
                     put("pickup", record.pickupCode ?: JSONObject.NULL)
+                    put("pickupObservedAt", record.pickupCodeObservedAt)
                     put("station", record.station ?: JSONObject.NULL)
                     put("status", record.status.name)
                     put("title", record.title ?: JSONObject.NULL)
@@ -473,6 +486,7 @@ object ExpressRecordStore {
                     orderSn = obj.optStringOrNull("osn"),
                     courier = enumOr(obj.optString("courier"), Courier.UNKNOWN),
                     pickupCode = obj.optStringOrNull("pickup"),
+                    pickupCodeObservedAt = obj.optLong("pickupObservedAt", 0L).coerceAtLeast(0L),
                     station = obj.optStringOrNull("station"),
                     status = enumOr(obj.optString("status"), ExpressStatus.UNKNOWN),
                     title = obj.optStringOrNull("title"),

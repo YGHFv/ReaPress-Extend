@@ -293,6 +293,36 @@ internal object CainiaoPackageHook {
         return (result as? List<*>)?.size ?: 0
     }
 
+    /** Called only after this account's network cursor is confirmed applied. Ordinary cache reads cannot replace codes. */
+    internal fun collectSyncedSnapshot(classLoader: ClassLoader, observedAt: Long, accountUnchanged: () -> Boolean): Boolean {
+        val apiClass = XposedHelpers.findClass(DORADO_API, classLoader)
+        val modelClass = XposedHelpers.findClass(DORADO_QUERY_MODEL, classLoader)
+        val model = modelClass.getDeclaredConstructor().newInstance().also {
+            XposedHelpers.setObjectField(it, FIELD_TOPIC, SELF_QUERY_TOPIC)
+        }
+        val result = try {
+            collectingSynced.set(true)
+            apiClass.getMethod("query", modelClass).invoke(apiClass.getDeclaredConstructor().newInstance(), model)
+                as? List<*> ?: return false
+        } finally { collectingSynced.remove() }
+        if (!accountUnchanged() || result.size > 500) return false
+        val context = HostContextHolder.acquire() ?: return false
+        var submitted = true
+        val records = result.mapNotNull { row ->
+            val json = runCatching { JSONObject(row.toString()) }.getOrNull() ?: return false
+            if (!looksLikePackageRow(json)) return false
+            buildRecord(json)
+        }
+        for (record in records) {
+            if (!accountUnchanged()) return false
+            val fresh = record.copy(pickupCodeObservedAt = observedAt.takeIf { !record.pickupCode.isNullOrBlank() } ?: 0L)
+            if (!ExpressRelaySender.sendEnrichment(fresh, context, packageSnapshot = true)) submitted = false
+        }
+        return submitted
+    }
+
+    private val collectingSynced = ThreadLocal<Boolean>()
+
     /** 模块发来的三个请求共用这一个接收器：拉轨迹、索要登录态、请宿主重查本地包裹表。 */
     private val traceRequestReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -328,7 +358,12 @@ internal object CainiaoPackageHook {
                     } else if (loader == null) {
                         XposedBridge.logError("cainiao refresh request: 还没有 ClassLoader，忽略")
                     } else {
-                        submitSelfQuery(loader, "模块刷新请求")
+                        submitSelfQuery(loader, "模块刷新请求（缓存）")
+                        val id = intent.getStringExtra(ExpressRelay.EXTRA_PACKAGE_SYNC_ID)
+                        if (id != null) runCatching {
+                            CainiaoPackageSync.request(context, loader, id,
+                                intent.getLongExtra(ExpressRelay.EXTRA_PACKAGE_SYNC_RISK_UNTIL, 0L))
+                        }
                     }
                 }
                 else -> Unit
@@ -357,6 +392,7 @@ internal object CainiaoPackageHook {
 
     /** 一次 hybrid 查询落地。只在第一行做形状判定：整表序列化比「看一行」贵两个数量级。 */
     private fun consumeQuery(param: XC_MethodHook.MethodHookParam) {
+        if (collectingSynced.get() == true) return
         val rows = param.result as? List<*> ?: return
         if (rows.isEmpty()) return
 

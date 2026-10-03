@@ -64,7 +64,7 @@ object ExpressRelay {
     const val ACTION_COOKIE_REQUEST = "io.github.YGHFv.ReaPressExtend.COOKIE_REQUEST"
 
     /**
-     * 模块 → 宿主：把本地包裹表重查一遍。与唤醒销互补缺一不可：宿主不在时只有唤醒销（清单接收者）
+     * 模块 → 宿主：重查本地表；附 packageSyncId 时再做受限联网同步。与唤醒销互补：宿主不在时只有唤醒销（清单接收者）
      * 能拉起进程；宿主存活时（小米上常年以推送进程活着，唤醒销是空操作）只有这条能让它立刻查。
      */
     const val ACTION_REFRESH_REQUEST = "io.github.YGHFv.ReaPressExtend.REFRESH_REQUEST"
@@ -93,6 +93,13 @@ object ExpressRelay {
 
     /** 宿主 → 模块：自查结论播报。MIUI / HyperOS 的 logcat 读不出来，宿主侧不落字就等于没发生，唯一可读处是模块的 files/module-log.txt。 */
     const val ACTION_HOST_QUERY_REPORT = "io.github.YGHFv.ReaPressExtend.HOST_QUERY_REPORT"
+    const val ACTION_PACKAGE_SYNC_REPORT = "io.github.YGHFv.ReaPressExtend.PACKAGE_SYNC_REPORT"
+    const val EXTRA_PACKAGE_SYNC_ID = "packageSyncId"
+    const val EXTRA_PACKAGE_SYNC_STATUS = "packageSyncStatus"
+    const val EXTRA_PACKAGE_SYNC_RETRY_AT = "packageSyncRetryAt"
+    const val EXTRA_PACKAGE_SYNC_RISK_UNTIL = "packageSyncRiskUntil"
+    const val EXTRA_PICKUP_OBSERVED_AT = "pickupCodeObservedAt"
+    const val EXTRA_PACKAGE_SNAPSHOT = "packageSnapshot"
 
     /**
      * 宿主 → 模块：新接平台探针结论。不复用 [ACTION_HOST_QUERY_REPORT]：那条的接收侧会调
