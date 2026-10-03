@@ -20,9 +20,7 @@ package io.github.YGHFv.ReaPressExtend.logging
 import android.content.Context
 import android.util.Log
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import io.github.YGHFv.ReaPressExtend.core.LocalTimeFormatter
 import java.util.concurrent.Executors
 
 data class ModuleLogEntry(
@@ -45,7 +43,7 @@ object ModuleLogBuffer {
     }
 
     @Volatile private var logFile: File? = null
-    private val timeFormat = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.getDefault())
+    private val timeFormat = LocalTimeFormatter("MM-dd HH:mm:ss.SSS")
 
     fun attach(context: Context) {
         if (logFile != null) return
@@ -63,7 +61,7 @@ object ModuleLogBuffer {
             while (entries.size > MAX_MEMORY_ENTRIES) entries.removeFirst()
         }
         val target = logFile ?: return
-        val line = "${timeFormat.format(Date(entry.at))} $level/$tag: $message"
+        val line = "${timeFormat.format(entry.at)} $level/$tag: $message"
         runCatching { io.execute { appendLine(target, line) } }
     }
 
@@ -79,7 +77,7 @@ object ModuleLogBuffer {
 
     fun filePath(): String? = logFile?.takeIf { it.exists() }?.absolutePath
 
-    fun formatTime(at: Long): String = timeFormat.format(Date(at))
+    fun formatTime(at: Long): String = timeFormat.format(at)
 
     private fun appendLine(target: File, line: String) {
         runCatching {

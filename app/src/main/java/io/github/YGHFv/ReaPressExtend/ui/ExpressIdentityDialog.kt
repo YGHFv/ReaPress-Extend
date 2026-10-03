@@ -17,9 +17,7 @@
 
 package io.github.YGHFv.ReaPressExtend.ui
 
-import android.Manifest
 import android.content.Context
-import android.content.pm.PackageManager
 import android.location.LocationManager
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -267,14 +265,12 @@ private fun expiryLabel(identity: CainiaoIdentity): String {
 // ---------------------------------------------------------------- 最近取件点
 
 /** 用 getLastKnownLocation 而非等回调：用户站在驿站门口等不起；null 不是错误，pickSpot 会改按件数挑。 */
-private fun currentPosition(context: Context): GeoPoint? {
+internal fun currentPosition(context: Context): GeoPoint? {
     if (!hasLocationPermission(context)) return null
     val manager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
         ?: return null
     return runCatching {
-        LOCATION_PROVIDERS.asSequence()
-            .mapNotNull { runCatching { manager.getLastKnownLocation(it) }.getOrNull() }
-            .maxByOrNull { it.time }
+        LocationAccess.lastKnown(context, manager, LOCATION_PROVIDERS)
             ?.let { GeoPoint(it.latitude, it.longitude) }
     }.getOrNull()
 }
@@ -338,8 +334,7 @@ private fun spotPickTitle(reason: SpotPickReason): String = when (reason) {
 }
 
 private fun hasLocationPermission(context: Context): Boolean =
-    context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) ==
-        PackageManager.PERMISSION_GRANTED
+    LocationAccess.hasPermission(context)
 
 private val LOCATION_PROVIDERS = listOf(
     LocationManager.PASSIVE_PROVIDER,

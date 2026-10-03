@@ -103,7 +103,7 @@ class ExpressRelayReceiver : BroadcastReceiver() {
         // 先落结构化记录再发通知：通知可能发不出去，但包裹信息要留住。
         val changed = ExpressRecordStore.upsert(app, record)
         // 双链路去重只挡通知、不挡落库。
-        if (ExpressDeliveryLedger.claim(record)) {
+        ExpressDeliveryLedger.deliver(record) {
             ExpressNotificationPoster.post(
                 app,
                 record,
@@ -111,8 +111,6 @@ class ExpressRelayReceiver : BroadcastReceiver() {
                 intentUri = readIntentUri(intent),
                 intentToken = readIntentToken(intent),
             )
-        } else {
-            ModuleAndroidLog.legacy(LOG_TAG, "delivery deduped key=${record.dedupeKey}")
         }
         if (changed) ExpressChangeNotifier.notify(app)
     }

@@ -38,6 +38,7 @@ internal object BackupSettings {
     private const val KEY_ENCRYPT = "encrypt"
     private const val KEY_PASSWORD = "password"
     private const val KEY_LAST_AT = "lastBackupAt"
+    private const val KEY_LAST_ATTEMPT = "lastAttemptAt"
     private const val KEY_NEXT_DUE = "nextDueAt"
     private const val KEY_LAST_RESULT = "lastResult"
 
@@ -63,6 +64,7 @@ internal object BackupSettings {
 
     const val DEFAULT_RETENTION = 10
 
+    @Synchronized
     fun load(context: Context): BackupConfig {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         return BackupConfig(
@@ -73,13 +75,15 @@ internal object BackupSettings {
             encrypt = prefs.getBoolean(KEY_ENCRYPT, false),
             password = prefs.getString(KEY_PASSWORD, "").orEmpty(),
             lastBackupAt = prefs.getLong(KEY_LAST_AT, 0L),
+            lastAttemptAt = prefs.getLong(KEY_LAST_ATTEMPT, 0L),
             nextDueAt = prefs.getLong(KEY_NEXT_DUE, 0L),
             lastResult = prefs.getString(KEY_LAST_RESULT, "").orEmpty(),
         )
     }
 
+    @Synchronized
     fun save(context: Context, config: BackupConfig) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+        check(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString(KEY_DIR_URI, config.dirUri)
             .putBoolean(KEY_ON_DATA_CHANGE, config.onDataChange)
             .putLong(KEY_INTERVAL, config.intervalMs)
@@ -87,9 +91,50 @@ internal object BackupSettings {
             .putBoolean(KEY_ENCRYPT, config.encrypt)
             .putString(KEY_PASSWORD, config.password)
             .putLong(KEY_LAST_AT, config.lastBackupAt)
+            .putLong(KEY_LAST_ATTEMPT, config.lastAttemptAt)
             .putLong(KEY_NEXT_DUE, config.nextDueAt)
             .putString(KEY_LAST_RESULT, config.lastResult)
-            .apply()
+            .commit()) { "Cannot persist backup settings" }
+    }
+
+    @Synchronized
+    fun saveOptions(context: Context, config: BackupConfig) {
+        val current = load(context)
+        save(context, config.copy(
+            lastBackupAt = current.lastBackupAt,
+            lastAttemptAt = current.lastAttemptAt,
+            lastResult = current.lastResult,
+            nextDueAt = if (current.intervalMs == config.intervalMs) current.nextDueAt else 0L,
+        ))
+    }
+
+    @Synchronized
+    fun recordAttempt(context: Context, at: Long) {
+        val current = load(context)
+        save(context, current.copy(lastAttemptAt = at, nextDueAt = nextDue(at, current.intervalMs)))
+    }
+
+    @Synchronized
+    fun initializeDue(context: Context, now: Long): BackupConfig {
+        val current = load(context)
+        if (current.intervalMs <= INTERVAL_OFF || current.nextDueAt > 0L) return current
+        return current.copy(nextDueAt = nextDue(now, current.intervalMs)).also { save(context, it) }
+    }
+
+    @Synchronized
+    fun recordResult(context: Context, message: String, successAt: Long?, now: Long) {
+        val current = load(context)
+        save(context, current.copy(
+            lastBackupAt = successAt ?: current.lastBackupAt,
+            lastResult = message,
+            nextDueAt = nextDue(now, current.intervalMs),
+        ))
+    }
+
+    private fun nextDue(now: Long, interval: Long): Long = when {
+        interval <= INTERVAL_OFF -> 0L
+        now > Long.MAX_VALUE - interval -> Long.MAX_VALUE
+        else -> now + interval
     }
 }
 
@@ -102,6 +147,7 @@ internal data class BackupConfig(
     val encrypt: Boolean = false,
     val password: String = "",
     val lastBackupAt: Long = 0L,
+    val lastAttemptAt: Long = 0L,
     val nextDueAt: Long = 0L,
     val lastResult: String = "",
 ) {

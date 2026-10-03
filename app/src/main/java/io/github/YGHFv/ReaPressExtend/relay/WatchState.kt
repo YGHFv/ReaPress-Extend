@@ -18,6 +18,8 @@
 package io.github.YGHFv.ReaPressExtend.relay
 
 import android.content.Context
+import androidx.core.content.edit
+import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
 
 /**
  * 自动轮查的跨进程存续状态：节奏必须落盘 —— 模块进程重启是常态，否则每次重启都从头问一遍、不走间隔。
@@ -38,31 +40,35 @@ internal object WatchState {
 
     /** 下次允许发请求的时刻；没记录过（首次运行）返回 0 = 立刻可以开始。 */
     fun nextDueAt(context: Context): Long =
-        runCatching { prefs(context).getLong(KEY_NEXT_DUE_AT, 0L) }.getOrDefault(0L)
+        ExpressRecordStore.withTransaction {
+            runCatching { prefs(context).getLong(KEY_NEXT_DUE_AT, 0L) }.getOrDefault(0L)
+        }
 
-    fun setNextDueAt(context: Context, atMillis: Long) {
-        runCatching { prefs(context).edit().putLong(KEY_NEXT_DUE_AT, atMillis).apply() }
+    fun setNextDueAt(context: Context, atMillis: Long): Unit = ExpressRecordStore.withTransaction {
+        runCatching { prefs(context).edit { putLong(KEY_NEXT_DUE_AT, atMillis) } }
     }
 
     /** 换行拼的字符串。 */
     fun roundDone(context: Context): Set<String> =
-        runCatching {
-            prefs(context).getString(KEY_ROUND_DONE, null)
-                .orEmpty()
-                .lineSequence()
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .toSet()
-        }.getOrDefault(emptySet())
+        ExpressRecordStore.withTransaction {
+            runCatching {
+                prefs(context).getString(KEY_ROUND_DONE, null)
+                    .orEmpty()
+                    .lineSequence()
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .toSet()
+            }.getOrDefault(emptySet())
+        }
 
     /** 用 `apply()`：晚几毫秒落盘无所谓，不值得为它阻塞拉取循环。 */
-    fun markRoundDone(context: Context, tracking: String, already: Set<String>) {
-        val updated = (already + tracking).take(MAX_ROUND_DONE)
-        runCatching { prefs(context).edit().putString(KEY_ROUND_DONE, updated.joinToString("\n")).apply() }
+    fun markRoundDone(context: Context, tracking: String): Unit = ExpressRecordStore.withTransaction {
+        val updated = (roundDone(context) + tracking).take(MAX_ROUND_DONE)
+        runCatching { prefs(context).edit { putString(KEY_ROUND_DONE, updated.joinToString("\n")) } }
     }
 
-    fun clearRoundDone(context: Context) {
-        runCatching { prefs(context).edit().remove(KEY_ROUND_DONE).apply() }
+    fun clearRoundDone(context: Context): Unit = ExpressRecordStore.withTransaction {
+        runCatching { prefs(context).edit { remove(KEY_ROUND_DONE) } }
     }
 
     fun describe(context: Context): String =

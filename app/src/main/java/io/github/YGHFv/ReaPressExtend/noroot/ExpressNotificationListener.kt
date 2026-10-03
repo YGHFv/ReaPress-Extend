@@ -35,6 +35,7 @@ import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
 import io.github.YGHFv.ReaPressExtend.logging.ModuleLogBuffer
 import io.github.YGHFv.ReaPressExtend.notification.ExpressChangeNotifier
 import io.github.YGHFv.ReaPressExtend.notification.ExpressDeliveryLedger
+import io.github.YGHFv.ReaPressExtend.notification.DeliveryLedger
 import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationLog
 import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationPoster
 import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
@@ -125,18 +126,20 @@ class ExpressNotificationListener : NotificationListenerService() {
         if (changed) ExpressChangeNotifier.notify(app)
 
         // 双链路去重：hook 可能已经为同一条通知发过一次（反过来也一样）。
-        val firstDelivery = ExpressDeliveryLedger.claim(record)
-        if (firstDelivery) {
-            val posted = ExpressNotificationPoster.post(
+        val delivery = ExpressDeliveryLedger.deliver(record) {
+            ExpressNotificationPoster.post(
                 app,
                 record,
                 contentIntent = contentIntentOf(notification),
                 intentUri = intentUriOf(notification),
             )
-            if (posted && settings.isInterceptMode) suppress(sbn)
-        } else if (settings.isInterceptMode) {
-            // 「原通知该不该留」是两条链路各自的事。
-            suppress(sbn)
+        }
+        if (settings.isInterceptMode) {
+            // 旧成功可能已经被用户清除；重复事件只在替代通知仍存在时撤原通知。
+            if (delivery == DeliveryLedger.Result.POSTED ||
+                (delivery == DeliveryLedger.Result.ALREADY_POSTED &&
+                    ExpressNotificationPoster.isReplacementActive(app, record))
+            ) suppress(sbn)
         }
 
         if (changed) {

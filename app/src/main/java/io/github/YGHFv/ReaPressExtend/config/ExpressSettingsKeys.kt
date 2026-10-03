@@ -19,6 +19,7 @@ package io.github.YGHFv.ReaPressExtend.config
 
 import android.content.Context
 import android.content.SharedPreferences
+import java.util.UUID
 import io.github.YGHFv.ReaPressExtend.core.NotificationCategory
 import io.github.YGHFv.ReaPressExtend.core.WatchSchedule
 
@@ -47,10 +48,13 @@ object ExpressSettingsKeys {
 
     /**
      * 请求复位看门狗熔断。看门狗的 disabled 标记在 /data/system/，模块 App（uid 10xxx）写不了，
-     * 只能经 RemotePreferences 转给 system_server 下次开机安装 hook 时消费。一次性语义：
-     * 消费后必须清掉，否则熔断保护就永久失效了。
+     * 旧布尔标志只用于迁移；新请求使用稳定 ID，system_server 在自己的状态文件登记消费。
+     * 被注入进程的 RemotePreferences 只读，不能靠清除框架标志保证一次性。
      */
     const val KEY_HOOK_FORCE_ENABLED = "hook_force_enabled"
+    const val KEY_HOOK_RESET_REQUEST_ID = "hook_reset_request_id"
+
+    internal val HOOK_RESET_KEYS = setOf(KEY_HOOK_FORCE_ENABLED, KEY_HOOK_RESET_REQUEST_ID)
 
     // ---- 分源开关 ----
 
@@ -247,8 +251,11 @@ object ExpressSettingsKeys {
 
     fun joinKeywords(keywords: Set<String>): String = keywords.joinToString("\n")
 
-    /** 写回 prefs。不写 [KEY_HOOK_FORCE_ENABLED]：它是一次性请求，放进这里等于每次保存都重新激活、永久关掉看门狗保护。 */
-    fun writeTo(prefs: SharedPreferences, snapshot: ExpressSettingsSnapshot) {
+    /** 写回普通设置，复位请求单独生成和同步，不能随设置保存而轮换。 */
+    fun writeTo(prefs: SharedPreferences, snapshot: ExpressSettingsSnapshot): Boolean =
+        editorFor(prefs, snapshot).commit()
+
+    internal fun editorFor(prefs: SharedPreferences, snapshot: ExpressSettingsSnapshot): SharedPreferences.Editor =
         prefs.edit()
             .putBoolean(KEY_SOURCE_CAINIAO, snapshot.sourceCainiao)
             .putBoolean(KEY_SOURCE_PINDUODUO, snapshot.sourcePinduoduo)
@@ -274,21 +281,16 @@ object ExpressSettingsKeys {
                 KEY_INTERCEPTED_CATEGORIES,
                 joinKeywords(NotificationCategory.names(snapshot.interceptedCategories).toSet()),
             )
-            .apply()
-    }
 
-    fun requestHookForceEnable(prefs: SharedPreferences, enable: Boolean) {
-        prefs.edit().putBoolean(KEY_HOOK_FORCE_ENABLED, enable).apply()
-    }
+    fun requestHookForceEnable(prefs: SharedPreferences, enable: Boolean): Boolean =
+        prefs.edit()
+            .putBoolean(KEY_HOOK_FORCE_ENABLED, enable)
+            .putString(KEY_HOOK_RESET_REQUEST_ID, if (enable) UUID.randomUUID().toString() else null)
+            .commit()
 
-    /** system_server 侧消费复位请求（读一次并清零）。 */
-    fun consumeHookForceEnable(prefs: SharedPreferences): Boolean {
-        val requested = prefs.getBoolean(KEY_HOOK_FORCE_ENABLED, false)
-        if (requested) {
-            prefs.edit().putBoolean(KEY_HOOK_FORCE_ENABLED, false).apply()
-        }
-        return requested
-    }
+    fun hookResetRequest(prefs: SharedPreferences): String? =
+        prefs.getString(KEY_HOOK_RESET_REQUEST_ID, null)?.takeIf { it.isNotBlank() && it.length <= 128 }
+            ?: "legacy-force-enable".takeIf { prefs.getBoolean(KEY_HOOK_FORCE_ENABLED, false) }
 
     /** 模块 App 进程用。system_server 拿不到这个文件（跨 uid），走 RemotePreferences。 */
     fun localPrefs(context: Context): SharedPreferences =

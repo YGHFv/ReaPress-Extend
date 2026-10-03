@@ -20,7 +20,6 @@ package io.github.YGHFv.ReaPressExtend.ui
 import android.content.Context
 import android.webkit.CookieManager
 import android.webkit.WebView
-import android.webkit.WebViewClient
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -68,7 +67,7 @@ internal fun TaobaoLoginDialog(
     }
 
     // 普通持有格而非 Compose state：只在 factory 写一次，放 state 每次赋值都触发无意义重组。
-    val holder = remember { WebViewHolder() }
+    val holder = remember { LoginWebViewHolder() }
 
     // 轮询而不是 onPageFinished 判一次：登录跨好几个页面与重定向，sgcookie 与 cookie2
     // 也不是同一时刻到位；CookieManager 返回的就是「此刻的真实状态」。
@@ -89,15 +88,7 @@ internal fun TaobaoLoginDialog(
     }
 
     DisposableEffect(Unit) {
-        onDispose {
-            holder.view?.let { view ->
-                runCatching {
-                    view.stopLoading()
-                    view.destroy()
-                }
-            }
-            holder.view = null
-        }
+        onDispose { holder.release() }
     }
 
     OverlayDialog(
@@ -119,17 +110,16 @@ internal fun TaobaoLoginDialog(
                         .fillMaxWidth()
                         .height(LOGIN_WEB_HEIGHT),
                     factory = { ctx ->
+                        holder.release()
                         WebView(ctx).apply {
-                            // 淘宝登录页是前端应用，两样关掉连表单都渲染不出来。
-                            settings.javaScriptEnabled = true
-                            settings.domStorageEnabled = true
+                            LoginWebViewPolicy.configure(this)
                             // 默认 UA：与后面模块发 MTOP 请求用的那份保持一致——
                             // 改桌面 UA 会让风控把「登录」和「使用」判成两个环境。
-                            webViewClient = WebViewClient()
                             loadUrl(LOGIN_URL)
                             holder.view = this
                         }
                     },
+                    onRelease = { holder.release(it) },
                 )
             }
             Spacer(Modifier.height(12.dp))
@@ -164,10 +154,6 @@ internal fun TaobaoLoginDialog(
     }
 }
 
-private class WebViewHolder {
-    var view: WebView? = null
-}
-
 /**
  * 把当前 WebView 的淘宝登录态取出来落地。走模块自己进程的 CookieManager，与宿主完全隔离；
  * 落地用 [TraceCookieCache.put]（内存 + 模块私有目录），下一个拉取入口 attach 完立刻能用。
@@ -193,7 +179,7 @@ private const val PROBE_URL = "https://acs.m.taobao.com"
 /** 淘宝登录成功后必然出现的 cookie 名，只有它们能证明这是一份登录态。 */
 private val LOGIN_MARKERS = listOf("sgcookie=", "cookie2=")
 
-/** 登录页入口（比首页少绕一跳）。不做 URL 白名单——拦住用户去安全验证页只会让登录永远做不完。 */
+/** 保留跨域 HTTPS 安全验证跳转；本地文件、明文和原生 scheme 由 LoginWebViewPolicy 拒绝。 */
 private const val LOGIN_URL = "https://login.m.taobao.com/"
 
 private val LOGIN_WEB_HEIGHT = 380.dp

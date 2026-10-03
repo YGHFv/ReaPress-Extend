@@ -18,6 +18,7 @@
 package io.github.YGHFv.ReaPressExtend.notification
 
 import android.content.Context
+import androidx.core.content.edit
 import io.github.YGHFv.ReaPressExtend.core.Courier
 import io.github.YGHFv.ReaPressExtend.core.ExpressEnrichmentMatcher
 import io.github.YGHFv.ReaPressExtend.core.ExpressFormatter
@@ -415,9 +416,7 @@ object ExpressRecordStore {
             records.sortedByDescending { it.timestamp }.take(MAX_RECORDS)
         }
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .putString(KEY_RECORDS, serialize(trimmed))
-            .apply()
+            .edit { putString(KEY_RECORDS, serialize(trimmed)) }
     }
 
     internal fun serialize(records: List<ExpressRecord>): String {

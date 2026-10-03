@@ -33,6 +33,11 @@ import org.junit.Test
  */
 class ExpressDeliveryLedgerTest {
 
+    private val ledger = DeliveryLedger()
+
+    private fun claim(record: ExpressRecord): Boolean =
+        ledger.deliver(ExpressDeliveryLedger.keyOf(record)) { true } == DeliveryLedger.Result.POSTED
+
     private fun record(tracking: String?, code: String?, text: String) = ExpressRecord(
         sourcePackage = "com.cainiao.wireless",
         rawText = text,
@@ -44,22 +49,22 @@ class ExpressDeliveryLedgerTest {
     fun `同一条通知第二次不再投递`() {
         val first = record("773000000000001", null, "您的包裹已到站，请凭取件码 1-1-2001 取件")
         val second = record("773000000000001", null, "您的包裹已到站，请凭取件码 1-1-2001 取件")
-        assertTrue(ExpressDeliveryLedger.claim(first))
-        assertFalse(ExpressDeliveryLedger.claim(second))
+        assertTrue(claim(first))
+        assertFalse(claim(second))
     }
 
     @Test
     fun `同一个包裹的新动态照常投递`() {
         val arrived = record("773000000000001", null, "您的包裹已到站")
         val picked = record("773000000000001", null, "您的包裹已签收")
-        assertTrue(ExpressDeliveryLedger.claim(arrived))
-        assertTrue(ExpressDeliveryLedger.claim(picked))
+        assertTrue(claim(arrived))
+        assertTrue(claim(picked))
     }
 
     @Test
     fun `不同包裹互不影响`() {
-        assertTrue(ExpressDeliveryLedger.claim(record("773000000000001", null, "已到站")))
-        assertTrue(ExpressDeliveryLedger.claim(record("773000000000002", null, "已到站")))
+        assertTrue(claim(record("773000000000001", null, "已到站")))
+        assertTrue(claim(record("773000000000002", null, "已到站")))
     }
 
     @Test

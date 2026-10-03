@@ -57,6 +57,7 @@ internal object CainiaoTraceApi {
     private const val RISK_BACKOFF_MAX_MS = 60 * 60_000L
 
     @Volatile private var backoffLevel = 0
+    private val riskLock = Any()
 
     @Volatile
     var riskBlockedUntil = 0L
@@ -65,7 +66,7 @@ internal object CainiaoTraceApi {
     /** 退避必须持久化：只存内存的话进程被杀就归零，下次点详情立刻再撞一次线。 */
     @Volatile internal var onRiskMarked: ((Long) -> Unit)? = null
 
-    internal fun restoreRisk(until: Long) {
+    internal fun restoreRisk(until: Long): Unit = synchronized(riskLock) {
         if (until > riskBlockedUntil) riskBlockedUntil = until
     }
 
@@ -73,17 +74,25 @@ internal object CainiaoTraceApi {
         now < riskBlockedUntil
 
     private fun markRiskBlocked() {
-        val backoff = (RISK_BACKOFF_MS shl backoffLevel).coerceAtMost(RISK_BACKOFF_MAX_MS)
-        if (backoff < RISK_BACKOFF_MAX_MS) backoffLevel++
-        riskBlockedUntil = System.currentTimeMillis() + backoff
+        val until = synchronized(riskLock) {
+            val backoff = (RISK_BACKOFF_MS shl backoffLevel).coerceAtMost(RISK_BACKOFF_MAX_MS)
+            if (backoff < RISK_BACKOFF_MAX_MS) backoffLevel++
+            riskBlockedUntil = maxOf(riskBlockedUntil, System.currentTimeMillis() + backoff)
+            riskBlockedUntil
+        }
         cachedTokens.clear()
-        runCatching { onRiskMarked?.invoke(riskBlockedUntil) }
+        runCatching { onRiskMarked?.invoke(until) }
     }
 
     /** 预热拿到的 token 缓存，按 host 分开（不分开的失败与「没 token」同形、最容易查错方向）。 */
-    private val cachedTokens = java.util.concurrent.ConcurrentHashMap<String, Token>()
+    private val cachedTokens = java.util.concurrent.ConcurrentHashMap<String, SessionToken>()
+
+    internal fun clearCachedTokens() {
+        cachedTokens.clear()
+    }
 
     private data class Token(val raw: String, val enc: String?)
+    private data class SessionToken(val cookie: String, val token: Token)
 
     @Volatile
     var lastError: String? = null
@@ -108,7 +117,7 @@ internal object CainiaoTraceApi {
             )
             return null
         }
-        backoffLevel = 0
+        synchronized(riskLock) { backoffLevel = 0 }
         lastError = null
         return info
     }
@@ -129,8 +138,8 @@ internal object CainiaoTraceApi {
         val base = "$host$api/$version/"
         // token 来源：cookie 里现成的 → 内存缓存 → 预热；cookie 那份只在默认 host 用（分不出属于谁）。
         val token = (if (host == HOST) tokenFromCookie(cookie) else null)
-            ?: cachedTokens[host]
-            ?: warmUp(base, cookie)?.also { cachedTokens[host] = it }
+            ?: cachedTokens[host]?.takeIf { it.cookie == cookie }?.token
+            ?: warmUp(base, cookie)?.also { cachedTokens[host] = SessionToken(cookie, it) }
             ?: run {
                 XposedBridge.logAlways("cainiao h5: 预热没拿到 token，跳过 $api")
                 return fail(lastError ?: "预热没拿到 token（网络不通或被风控拦下）")

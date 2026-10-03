@@ -21,6 +21,7 @@ import android.app.Notification
 import android.app.PendingIntent
 import io.github.YGHFv.ReaPressExtend.BuildConfig
 import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsKeys
+import io.github.YGHFv.ReaPressExtend.core.WatchdogStateMachine
 import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsSnapshot
 import io.github.YGHFv.ReaPressExtend.core.ExpressClassifier
 import io.github.YGHFv.ReaPressExtend.core.ExpressParser
@@ -75,28 +76,25 @@ internal object SystemServerHook {
     @Volatile private var firstCallConfirmed = false
 
     fun install(classLoader: ClassLoader): Boolean {
-        val forceEnabled = runCatching {
+        val resetRequest = runCatching {
             XposedBridge.framework()?.let { framework ->
-                ExpressSettingsKeys.consumeHookForceEnable(
+                ExpressSettingsKeys.hookResetRequest(
                     framework.getRemotePreferences(ExpressSettingsKeys.GROUP),
                 )
-            } ?: false
+            }
         }.getOrElse {
             XposedBridge.log("cannot read force-enable flag: ${it.javaClass.simpleName}")
-            false
-        }
-        if (forceEnabled) {
-            XposedBridge.logAlways("watchdog: force-enable requested by user, bypassing trip state")
+            null
         }
 
-        val decision = Watchdog.beforeInstall(forceEnabled)
+        val decision = Watchdog.beforeInstall(resetRequest)
         when (decision) {
-            is Watchdog.Decision.Refuse -> {
+            is WatchdogStateMachine.Decision.Refuse -> {
                 XposedBridge.logError("system_server hook REFUSED by watchdog: ${decision.reason}")
                 reportBootState(installed = false)
                 return false
             }
-            is Watchdog.Decision.Install -> {
+            is WatchdogStateMachine.Decision.Install -> {
                 XposedBridge.log("watchdog: attempt #${decision.attempt} — proceeding to install")
             }
         }

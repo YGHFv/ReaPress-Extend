@@ -2,9 +2,8 @@
 <!--
   API 26+ 的自适应图标。
 
-  同名的 `mipmap-anydpi-v26/ic_launcher.xml` 优先级高于 `mipmap-*/ic_launcher.png`，
-  所以清单里的 `android:icon="@mipmap/ic_launcher"` 一个字都不用改：新系统走这里，
-  老系统（API < 26）继续用那五档 PNG。
+  minSdk 已为 26，所有受支持设备都使用此自适应图标，无需 v26 目录限定。
+  `mipmap-anydpi/ic_launcher.xml` 优先级高于各密度 PNG；图标内容与比例保持不变。
 
 ## 为什么整张图放在 background 而不是 foreground
 

@@ -57,14 +57,14 @@ object ExpressStationRuleStore {
     private const val FIELD_CAPTURED_AT = "at"
 
     /** 读规则。读坏了当没有规则，别让一条损坏的 JSON 把整个首页拦住。 */
-    fun load(context: Context): ExpressStationRules {
+    fun load(context: Context): ExpressStationRules = ExpressRecordStore.withTransaction {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         prefs.getString(KEY_RULES, null)?.let { raw ->
-            return runCatching { parse(raw) }.getOrDefault(ExpressStationRules.EMPTY)
+            return@withTransaction runCatching { parse(raw) }.getOrDefault(ExpressStationRules.EMPTY)
         }
         val legacy = prefs.getString(LEGACY_KEY_RENAMES, null)
-            ?: return ExpressStationRules.EMPTY
-        return runCatching {
+            ?: return@withTransaction ExpressStationRules.EMPTY
+        runCatching {
             ExpressStationRules(renames = table(JSONObject(legacy)))
         }.getOrDefault(ExpressStationRules.EMPTY)
     }
@@ -120,14 +120,14 @@ object ExpressStationRuleStore {
     }
 
     /** 清掉全部规则（驿站回到「靠自动归一化分组」的状态）。两个键都要删 —— 旧格式也读得到。 */
-    fun clear(context: Context) {
+    fun clear(context: Context): Unit = ExpressRecordStore.withTransaction {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .remove(KEY_RULES)
             .remove(LEGACY_KEY_RENAMES)
             .commit()
     }
 
-    private fun write(context: Context, transform: (ExpressStationRules) -> ExpressStationRules) {
+    private fun write(context: Context, transform: (ExpressStationRules) -> ExpressStationRules): Unit = ExpressRecordStore.withTransaction {
         save(context, transform(load(context)))
     }
 
@@ -245,7 +245,7 @@ object ExpressStationRuleStore {
             )
             put(FIELD_FINGERPRINTS, fingerprintJson(rules.fingerprints))
         }
-        // commit 而非 apply（调用方改完立刻重读）；顺手删旧键，只留一份准的。
+        // 保留同步落盘边界；apply 也会立即更新内存，区别在于不等待磁盘写入。
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString(KEY_RULES, json.toString())
             .remove(LEGACY_KEY_RENAMES)

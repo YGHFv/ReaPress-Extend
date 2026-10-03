@@ -21,7 +21,7 @@ import android.app.AlarmManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
+import androidx.core.net.toUri
 import android.os.Handler
 import android.os.Looper
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
@@ -50,23 +50,24 @@ internal object BackupScheduler {
     /** 自动备份最小间隔：挡的是读全部 prefs + 序列化，以及上限裁剪把当天备份删光。 */
     private const val AUTO_MIN_INTERVAL_MS = 10 * 60_000L
 
-    private val executor = Executors.newSingleThreadExecutor { runnable ->
+    private var executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "reapress-backup").apply { isDaemon = true }
     }
 
     private val handler = Handler(Looper.getMainLooper())
 
     /** 同一时刻只跑一次备份：定时闹钟与「有变更」撞在一起是常态。 */
-    @Volatile private var running = false
+    private val gate = BackupTaskGate()
 
     private val debounced = Runnable {
         val context = applicationContext ?: return@Runnable
-        val config = BackupSettings.load(context)
-        if (!config.onDataChange) return@Runnable
-        val now = System.currentTimeMillis()
-        // 刚备过就不必再备 —— 定时那份、或者用户手动点的那份同样能顶。
-        if (now - config.lastBackupAt < AUTO_MIN_INTERVAL_MS) return@Runnable
-        runAsync("有变更") { backupNow(context, "有变更", now, config) }
+        runAsync {
+            val config = BackupSettings.load(context)
+            val now = System.currentTimeMillis()
+            if (config.onDataChange && canRunOnChange(config, now)) {
+                performBackup(context, "有变更", now, config)
+            }
+        }
     }
 
     /** 只留 application context：备份与界面无关（闹钟那条路没有界面），持 Activity 会泄漏。 */
@@ -78,7 +79,7 @@ internal object BackupScheduler {
 
     /** 按配置挑出这次要用的目录。URI 解析失败时退回默认目录 —— 宁可放在默认位置，也别丢一次备份。 */
     fun storeOf(context: Context, config: BackupConfig): BackupStore {
-        val parsed = config.dirUri?.let { runCatching { Uri.parse(it) }.getOrNull() }
+        val parsed = config.dirUri?.let { runCatching { it.toUri() }.getOrNull() }
         return if (parsed == null) {
             AppDirBackupStore(defaultDir(context))
         } else {
@@ -93,17 +94,33 @@ internal object BackupScheduler {
         at: Long,
         config: BackupConfig = BackupSettings.load(context),
     ): BackupResult {
+        if (!gate.acquire()) return BackupResult(false, "已有备份正在执行，请稍后再试。")
+        return try {
+            performBackup(context, reason, at, config)
+        } finally {
+            gate.release()
+        }
+    }
+
+    private fun performBackup(context: Context, reason: String, at: Long, config: BackupConfig): BackupResult {
+        // 先确认冷却已落盘；进程被杀或存储失败时不能让每次入口都重新开始 IO。
+        try {
+            BackupSettings.recordAttempt(context, at)
+        } catch (error: Exception) {
+            ModuleAndroidLog.error(TAG, "save backup attempt failed", error)
+            return BackupResult(false, "无法保存备份尝试状态，本次未开始备份。")
+        }
         if (!config.encryptionReady) {
             // 开了加密却没设密码不能退回明文——用户勾那个开关图的就是别留明文。
             val message = "开了加密备份但还没设置密码，这次没有备份。"
-            remember(context, config, message, now = System.currentTimeMillis())
+            remember(context, message, now = maxOf(at, System.currentTimeMillis()))
             ModuleAndroidLog.info(TAG, "backup skipped (no password): reason=$reason")
             return BackupResult(ok = false, message = message)
         }
 
-        val store = storeOf(context, config)
         val password = config.password.takeIf { config.encrypt }
         return runCatching {
+            val store = storeOf(context, config)
             val text = ExpressBackup.export(context, at, password)
             val name = ExpressBackup.suggestFileName(at)
             store.write(name, text)
@@ -115,7 +132,7 @@ internal object BackupScheduler {
                 append("。")
                 if (pruned > 0) append("按上限清掉了 $pruned 份最旧的。")
             }
-            BackupScheduler.remember(context, config, message, lastAt = at, now = at)
+            remember(context, message, lastAt = at, now = maxOf(at, System.currentTimeMillis()))
             ModuleAndroidLog.info(
                 TAG,
                 "backup ok: reason=$reason name=$name kb=$sizeKb pruned=$pruned encrypted=${config.encrypt}",
@@ -124,7 +141,7 @@ internal object BackupScheduler {
         }.getOrElse { e ->
             ModuleAndroidLog.error(TAG, "backup failed: reason=$reason", e)
             val message = "备份失败：${e.message ?: e::class.java.simpleName}"
-            remember(context, config, message, now = System.currentTimeMillis())
+            remember(context, message, now = maxOf(at, System.currentTimeMillis()))
             BackupResult(ok = false, message = message)
         }
     }
@@ -143,20 +160,34 @@ internal object BackupScheduler {
      */
     fun maybeRunDue(context: Context, reason: String) {
         applicationContext = context.applicationContext
-        val config = BackupSettings.load(context)
-        if (config.intervalMs <= BackupSettings.INTERVAL_OFF) return
         val now = System.currentTimeMillis()
-        if (config.nextDueAt <= 0L) {
-            BackupSettings.save(context, config.copy(nextDueAt = now + config.intervalMs))
-            return
-        }
+        val config = BackupSettings.initializeDue(context, now)
+        if (config.intervalMs <= BackupSettings.INTERVAL_OFF) return
         if (now < config.nextDueAt) return
-        runAsync(reason) { backupNow(context, reason, now) }
+        if (!BackupJobService.schedule(context)) {
+            ModuleAndroidLog.error(TAG, "backup job not scheduled: reason=$reason")
+        }
+    }
+
+    /** JobService 的完成回调覆盖实际写盘；占位发生在入队前，到工作线程再检查到期。 */
+    fun runDueAsync(context: Context, shouldRun: () -> Boolean = { true }, finished: () -> Unit): Boolean = runAsync(finished) {
+        if (!shouldRun()) return@runAsync
+        val now = System.currentTimeMillis()
+        val config = BackupSettings.initializeDue(context, now)
+        if (config.intervalMs > BackupSettings.INTERVAL_OFF && config.nextDueAt > 0L && now >= config.nextDueAt) {
+            performBackup(context, "定时备份", now, config)
+        }
+    }
+
+    internal fun canRunOnChange(config: BackupConfig, now: Long): Boolean {
+        val last = maxOf(config.lastBackupAt, config.lastAttemptAt)
+        return last <= 0L || (now >= last && now - last >= AUTO_MIN_INTERVAL_MS)
     }
 
     /** 把定时闹钟摆到与设置一致。用重复闹钟：ROM 吞掉一次后，不重复的话就再没有下一次。 */
     fun ensureScheduled(context: Context) {
         val config = BackupSettings.load(context)
+        if (config.intervalMs <= BackupSettings.INTERVAL_OFF) BackupJobService.cancel(context)
         val manager = context.getSystemService(AlarmManager::class.java) ?: return
         val pending = alarmIntent(context)
         if (config.intervalMs <= BackupSettings.INTERVAL_OFF) {
@@ -164,9 +195,10 @@ internal object BackupScheduler {
             return
         }
         runCatching {
+            val now = System.currentTimeMillis()
             manager.setInexactRepeating(
                 AlarmManager.RTC_WAKEUP,
-                System.currentTimeMillis() + config.intervalMs,
+                maxOf(now, config.nextDueAt.takeIf { it > 0L } ?: (now + config.intervalMs)),
                 config.intervalMs,
                 pending,
             )
@@ -190,40 +222,22 @@ internal object BackupScheduler {
     /** 把结果写进设置，让界面下次打开就能看到（自动备份没有界面可以即时回报）。 */
     private fun remember(
         context: Context,
-        config: BackupConfig,
         message: String,
-        lastAt: Long = config.lastBackupAt,
+        lastAt: Long? = null,
         now: Long,
     ) {
-        val next = when {
-            config.intervalMs <= BackupSettings.INTERVAL_OFF -> 0L
-            // 成功与否都往前推：否则一次失败会让「到期」永远成立，每次打开模块都重试。
-            // lastAt 为 0 时以「现在」起算，否则下次到期落在一九七零年。
-            lastAt > 0L -> lastAt + config.intervalMs
-            else -> now + config.intervalMs
-        }
         runCatching {
-            BackupSettings.save(
-                context,
-                config.copy(lastBackupAt = lastAt, lastResult = message, nextDueAt = next),
-            )
+            BackupSettings.recordResult(context, message, lastAt, now)
         }.onFailure { ModuleAndroidLog.error(TAG, "save backup state failed", it) }
+        // 完成时刻通常晚于原闹钟锚点；对齐新到期时间，避免下个闹钟早到而多等一个周期。
+        runCatching { ensureScheduled(context) }
+            .onFailure { ModuleAndroidLog.error(TAG, "reschedule backup result failed", it) }
     }
 
-    private fun runAsync(reason: String, block: () -> Unit) {
-        executor.execute {
-            if (running) {
-                ModuleAndroidLog.info(TAG, "backup skipped (already running): reason=$reason")
-                return@execute
-            }
-            running = true
-            try {
-                block()
-            } finally {
-                running = false
-            }
-        }
-    }
+    private fun runAsync(finished: () -> Unit = {}, block: () -> Unit): Boolean =
+        gate.submit(executor, {
+            runCatching(block).onFailure { ModuleAndroidLog.error(TAG, "backup task failed", it) }
+        }, finished)
 
     private fun alarmIntent(context: Context): PendingIntent {
         val intent = Intent(context.applicationContext, BackupAlarmReceiver::class.java)

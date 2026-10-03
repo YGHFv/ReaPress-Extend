@@ -17,6 +17,7 @@
 
 package io.github.YGHFv.ReaPressExtend.hook
 
+import android.app.Application
 import android.content.Context
 import io.github.YGHFv.ReaPressExtend.xposed.XC_MethodHook
 import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
@@ -48,15 +49,18 @@ internal object HostContextHolder {
     }
 
     /** 先落缓存再快照执行回调；执行期间新挂的不会被这轮吞掉（会当场走已就绪路径）。 */
-    private fun publish(context: Context) {
-        cached = context
+    private fun publish(context: Context): Context? {
+        val app = runCatching { context.applicationContext }.getOrNull()
+            ?: (context as? Application) ?: return null
+        cached = app
         val pending = synchronized(readyLock) {
             readyListeners.toList().also { readyListeners.clear() }
         }
         pending.forEach { listener ->
-            runCatching { listener(context) }
+            runCatching { listener(app) }
                 .onFailure { XposedBridge.logError("HostContextHolder: onReady listener failed", it) }
         }
+        return app
     }
 
     /** 须在 Application 创建前装才有意义，装晚只相当于没装。 */
@@ -97,8 +101,7 @@ internal object HostContextHolder {
             }
             return null
         }
-        publish(context)
-        return context
+        return publish(context)
     }
 
     fun upgrade(context: Context?) {

@@ -20,6 +20,7 @@ package io.github.YGHFv.ReaPressExtend.ui
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.res.Configuration
+import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
 
 /**
  * 界面偏好：只影响模块自己的界面，被注入侧完全不需要知道 —— 这是与 ExpressSettings 的分界线
@@ -29,37 +30,40 @@ import android.content.res.Configuration
 internal class ExpressUiPrefs private constructor(private val prefs: SharedPreferences) {
 
     var themeMode: Int
-        get() = prefs.getInt(KEY_THEME_MODE, THEME_FOLLOW_SYSTEM)
-            .coerceIn(THEME_FOLLOW_SYSTEM, THEME_DARK)
+        get() = ExpressRecordStore.withTransaction {
+            prefs.getInt(KEY_THEME_MODE, THEME_FOLLOW_SYSTEM).coerceIn(THEME_FOLLOW_SYSTEM, THEME_DARK)
+        }
         set(value) {
-            prefs.edit()
-                .putInt(KEY_THEME_MODE, value.coerceIn(THEME_FOLLOW_SYSTEM, THEME_DARK))
-                .commit()
+            ExpressRecordStore.withTransaction {
+                prefs.edit()
+                    .putInt(KEY_THEME_MODE, value.coerceIn(THEME_FOLLOW_SYSTEM, THEME_DARK))
+                    .commit()
+            }
         }
 
     var blurBars: Boolean
-        get() = prefs.getBoolean(KEY_BLUR_BARS, false)
+        get() = readBoolean(KEY_BLUR_BARS, false)
         set(value) {
-            prefs.edit().putBoolean(KEY_BLUR_BARS, value).commit()
+            writeBoolean(KEY_BLUR_BARS, value)
         }
 
     var floatingNavBar: Boolean
-        get() = prefs.getBoolean(KEY_FLOATING_NAV_BAR, false)
+        get() = readBoolean(KEY_FLOATING_NAV_BAR, false)
         set(value) {
-            prefs.edit().putBoolean(KEY_FLOATING_NAV_BAR, value).commit()
+            writeBoolean(KEY_FLOATING_NAV_BAR, value)
         }
 
     var liquidGlass: Boolean
-        get() = prefs.getBoolean(KEY_LIQUID_GLASS, true)
+        get() = readBoolean(KEY_LIQUID_GLASS, true)
         set(value) {
-            prefs.edit().putBoolean(KEY_LIQUID_GLASS, value).commit()
+            writeBoolean(KEY_LIQUID_GLASS, value)
         }
 
     /** 双击到站卡片上的取件码那行 = 确认取件，再双击撤销；默认开。撤销通道完整：卡片移出「到站包裹」后仍能在「已签收 / 异常」里双击退回。 */
     var doubleTapPickup: Boolean
-        get() = prefs.getBoolean(KEY_DOUBLE_TAP_PICKUP, true)
+        get() = readBoolean(KEY_DOUBLE_TAP_PICKUP, true)
         set(value) {
-            prefs.edit().putBoolean(KEY_DOUBLE_TAP_PICKUP, value).commit()
+            writeBoolean(KEY_DOUBLE_TAP_PICKUP, value)
         }
 
     /**
@@ -68,10 +72,18 @@ internal class ExpressUiPrefs private constructor(private val prefs: SharedPrefe
      * 启动期 flag 都是一次性的，装完改不了，做不成开关。
      */
     var hideFromRecents: Boolean
-        get() = prefs.getBoolean(KEY_HIDE_FROM_RECENTS, false)
+        get() = readBoolean(KEY_HIDE_FROM_RECENTS, false)
         set(value) {
-            prefs.edit().putBoolean(KEY_HIDE_FROM_RECENTS, value).commit()
+            writeBoolean(KEY_HIDE_FROM_RECENTS, value)
         }
+
+    private fun readBoolean(key: String, default: Boolean): Boolean = ExpressRecordStore.withTransaction {
+        prefs.getBoolean(key, default)
+    }
+
+    private fun writeBoolean(key: String, value: Boolean) = ExpressRecordStore.withTransaction {
+        prefs.edit().putBoolean(key, value).commit()
+    }
 
     fun resolveDark(context: Context): Boolean = when (themeMode) {
         THEME_LIGHT -> false

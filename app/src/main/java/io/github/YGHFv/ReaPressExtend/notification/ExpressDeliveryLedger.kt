@@ -18,19 +18,58 @@
 package io.github.YGHFv.ReaPressExtend.notification
 
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
-import io.github.YGHFv.ReaPressExtend.core.NotifyDedupe
 
-/** 两条链路（system_server hook / NotificationListenerService）的公共去重账本：先到者发通知，后到者只落库不发通知，去重只挡通知、不挡落库；键 = dedupeKey + 正文哈希，只压同一条事件的重复投递，不压同一包裹的下一次更新。进程级内存，不落盘，重启即失效 —— 代价是多一条通知。 */
+/** 两条链路共用的进程内账本：只去重通知，不挡落库；失败释放，只有成功才进入时间窗。 */
 object ExpressDeliveryLedger {
 
-    private val dedupe = NotifyDedupe()
+    private val ledger = DeliveryLedger()
 
-    /** 占一次坑：true = 该你投递；false = 已有人投递过，落库即可。 */
-    fun claim(record: ExpressRecord, now: Long = System.currentTimeMillis()): Boolean =
-        dedupe.claim(keyOf(record), now)
+    fun deliver(record: ExpressRecord, post: () -> Boolean): DeliveryLedger.Result =
+        ledger.deliver(keyOf(record), post)
 
     fun keyOf(record: ExpressRecord): String =
-        record.dedupeKey + "|" + record.rawText.trim().hashCode()
+        record.dedupeKey + "|" + record.rawText.trim()
 
-    fun size(): Int = dedupe.size()
+    fun size(): Int = ledger.size()
+}
+
+class DeliveryLedger(
+    private val windowMs: Long = 60_000L,
+    private val maxEntries: Int = 64,
+    private val clock: () -> Long = System::currentTimeMillis,
+) {
+    init {
+        require(windowMs > 0L)
+        require(maxEntries > 0)
+    }
+
+    enum class Result { POSTED, ALREADY_POSTED, IN_FLIGHT, FAILED }
+
+    private val inFlight = mutableSetOf<String>()
+    private val delivered = LinkedHashMap<String, Long>()
+
+    fun deliver(key: String, post: () -> Boolean): Result {
+        synchronized(this) {
+            val now = clock()
+            delivered.entries.removeAll { now < it.value || now - it.value >= windowMs }
+            if (key in delivered) return Result.ALREADY_POSTED
+            if (!inFlight.add(key)) return Result.IN_FLIGHT
+        }
+        var success = false
+        try {
+            success = post()
+            return if (success) Result.POSTED else Result.FAILED
+        } finally {
+            synchronized(this) {
+                inFlight.remove(key)
+                if (success) {
+                    delivered[key] = clock()
+                    while (delivered.size > maxEntries) delivered.remove(delivered.keys.first())
+                }
+            }
+        }
+    }
+
+    @Synchronized
+    fun size(): Int = delivered.size + inFlight.size
 }

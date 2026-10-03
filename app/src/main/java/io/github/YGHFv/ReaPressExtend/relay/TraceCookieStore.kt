@@ -19,6 +19,7 @@ package io.github.YGHFv.ReaPressExtend.relay
 
 import android.content.Context
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
+import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
 
 /**
  * 淘宝 cookie 的模块侧落盘（MODE_PRIVATE，不离开模块 / 不进日志 / 不上传），作为 [TraceCookieCache]
@@ -40,31 +41,31 @@ object TraceCookieStore {
     /** [syncedAt] 是宿主同步过来的时刻，不是 cookie 的签发时间。 */
     data class Stored(val cookie: String, val ua: String?, val syncedAt: Long)
 
-    fun read(context: Context): Stored? {
+    fun read(context: Context): Stored? = ExpressRecordStore.withTransaction {
         val prefs = runCatching {
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        }.getOrNull() ?: return null
-        val cookie = prefs.getString(KEY_COOKIE, null)?.takeIf { it.isNotBlank() } ?: return null
+        }.getOrNull() ?: return@withTransaction null
+        val cookie = prefs.getString(KEY_COOKIE, null)?.takeIf { it.isNotBlank() } ?: return@withTransaction null
         val at = prefs.getLong(KEY_AT, 0L)
-        if (at <= 0L || System.currentTimeMillis() - at > MAX_AGE_MS) return null
-        return Stored(cookie, prefs.getString(KEY_UA, null)?.takeIf { it.isNotBlank() }, at)
+        if (at <= 0L || System.currentTimeMillis() - at > MAX_AGE_MS) return@withTransaction null
+        Stored(cookie, prefs.getString(KEY_UA, null)?.takeIf { it.isNotBlank() }, at)
     }
 
-    fun write(context: Context, cookie: String, ua: String?) {
-        if (cookie.isBlank()) return
+    fun write(context: Context, cookie: String, ua: String?): Unit = ExpressRecordStore.withTransaction {
+        if (cookie.isBlank()) return@withTransaction
         runCatching {
             val editor = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .putString(KEY_COOKIE, cookie)
                 .putLong(KEY_AT, System.currentTimeMillis())
-            if (!ua.isNullOrBlank()) editor.putString(KEY_UA, ua)
-            // commit：同步完马上就要拿来发请求，异步落盘会让「同步了但这次还是没用上」。
+            editor.putString(KEY_UA, ua?.takeIf { it.isNotBlank() })
+            // commit 等待磁盘写入，减少登录态在进程退出时丢失的窗口；apply 也会同步更新内存。
             editor.commit()
         }.onFailure {
             ModuleAndroidLog.error(LOG_TAG, "cookie persist failed", it)
         }
     }
 
-    fun clear(context: Context) {
+    fun clear(context: Context): Unit = ExpressRecordStore.withTransaction {
         runCatching {
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .remove(KEY_COOKIE)

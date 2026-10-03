@@ -23,7 +23,6 @@ import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsKeys
 import io.github.YGHFv.ReaPressExtend.core.BackupBundle
 import io.github.YGHFv.ReaPressExtend.core.BackupCrypto
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
-import io.github.YGHFv.ReaPressExtend.notification.ExpressChangeNotifier
 import io.github.YGHFv.ReaPressExtend.notification.ExpressNotificationLog
 import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
 import io.github.YGHFv.ReaPressExtend.notification.ExpressStationRuleStore
@@ -133,9 +132,19 @@ internal object ExpressBackup {
             return RestoreOutcome(ok = false, message = "备份文件无法识别：${e.message ?: e::class.java.simpleName}")
         }
 
-        val outcome = ExpressRecordStore.withTransaction { restorePayload(context, payload, at) }
-        if (outcome.snapshotName != null) ExpressChangeNotifier.notify(context)
-        return outcome
+        val outcome = ExpressRecordStore.withTransaction {
+            val restored = restorePayload(context, payload, at)
+            if (restored.changedPrefs.isNotEmpty()) {
+                restored.withWarnings(BackupRestoreRuntime.refreshCaches(context, restored.changedPrefs))
+            } else {
+                restored
+            }
+        }
+        return if (outcome.dataChanged) {
+            outcome.withWarnings(BackupRestoreRuntime.resume(context, outcome.changedPrefs))
+        } else {
+            outcome
+        }
     }
 
     private fun restorePayload(context: Context, payload: BackupBundle.Payload, at: Long): RestoreOutcome {
@@ -147,29 +156,36 @@ internal object ExpressBackup {
             return RestoreOutcome(ok = false, message = "无法写入恢复前快照，已取消恢复（原数据未改动）")
         }
 
-        var restoredPrefs = 0
-        var restoredEntries = 0
-        var failedPrefs = 0
-        val skipped = mutableListOf<String>()
-
-        payload.prefs.forEach { (name, values) ->
-            if (name !in PREFS_NAMES) {
-                skipped += name
-                return@forEach
-            }
-            if (writeBack(context, name, values)) {
-                restoredPrefs++
-                restoredEntries += values.size
-            } else {
-                failedPrefs++
-            }
+        val targets = payload.prefs.filterKeys { it in PREFS_NAMES }
+        val previous = try {
+            targets.keys.associateWith { name -> snapshotOf(context, name) }
+        } catch (_: Exception) {
+            return RestoreOutcome(ok = false, message = "无法读取恢复前状态，已取消恢复", snapshotName = snapshot)
         }
-        val message = buildString {
-            if (failedPrefs > 0) {
-                append("恢复未完全成功：$restoredPrefs 份已写入，$failedPrefs 份写入失败")
-            } else {
-                append("已恢复 $restoredPrefs 份数据、共 $restoredEntries 项")
+        val attempted = linkedSetOf<String>()
+        var restoredEntries = 0
+        for ((name, values) in targets) {
+            attempted.add(name)
+            if (!writeBack(context, name, values)) {
+                val rollbackFailures = attempted.filterNot { writeBack(context, it, previous.getValue(it)) }.toSet()
+                val message = if (rollbackFailures.isEmpty()) {
+                    "恢复写入失败，已回滚原数据（已有风控退避不缩短）。恢复前快照为 $snapshot"
+                } else {
+                    "恢复写入失败，${rollbackFailures.size} 份数据未能确认回滚；请从恢复前快照 $snapshot 重试恢复"
+                }
+                return RestoreOutcome(
+                    ok = false,
+                    message = message,
+                    snapshotName = snapshot,
+                    dataChanged = rollbackFailures.isNotEmpty(),
+                    changedPrefs = attempted,
+                )
             }
+            restoredEntries += values.keys.count { name != ExpressSettingsKeys.LOCAL_PREFS || it !in ExpressSettingsKeys.HOOK_RESET_KEYS }
+        }
+        val skipped = payload.prefs.keys - targets.keys
+        val message = buildString {
+            append("已恢复 ${targets.size} 份数据、共 $restoredEntries 项")
             if (skipped.isNotEmpty()) {
                 append("；跳过 ${skipped.size} 份不认识的存储")
             }
@@ -178,27 +194,46 @@ internal object ExpressBackup {
 
         ModuleAndroidLog.info(
             TAG,
-            "backup restored: prefs=$restoredPrefs entries=$restoredEntries failed=$failedPrefs snapshot=$snapshot",
+            "backup restored: prefs=${targets.size} entries=$restoredEntries snapshot=$snapshot",
         )
 
         return RestoreOutcome(
-            ok = failedPrefs == 0,
+            ok = true,
             message = message,
-            restoredPrefs = restoredPrefs,
+            restoredPrefs = targets.size,
             restoredEntries = restoredEntries,
             snapshotName = snapshot,
+            dataChanged = targets.isNotEmpty(),
+            changedPrefs = targets.keys,
         )
     }
 
     private fun snapshotOf(context: Context, name: String): Map<String, Any?> =
-        context.getSharedPreferences(name, Context.MODE_PRIVATE).all.toMap()
+        context.getSharedPreferences(name, Context.MODE_PRIVATE).all.filterKeys {
+            name != ExpressSettingsKeys.LOCAL_PREFS || it !in ExpressSettingsKeys.HOOK_RESET_KEYS
+        }
 
     /** 整体替换（先 clear）：留着备份里没有的键会变成两份数据的混合体。 */
     private fun writeBack(context: Context, name: String, values: Map<String, Any?>): Boolean =
         runCatching {
-            val editor = context.getSharedPreferences(name, Context.MODE_PRIVATE).edit()
+            val prefs = context.getSharedPreferences(name, Context.MODE_PRIVATE)
+            val kept = if (name == ExpressSettingsKeys.LOCAL_PREFS) {
+                prefs.all.filterKeys { it in ExpressSettingsKeys.HOOK_RESET_KEYS }
+            } else {
+                emptyMap()
+            }
+            var restored = values.filterKeys { name != ExpressSettingsKeys.LOCAL_PREFS || it !in ExpressSettingsKeys.HOOK_RESET_KEYS } + kept
+            if (name == ModuleTraceFetcher.PREFS) {
+                val key = ModuleTraceFetcher.KEY_RISK_UNTIL
+                restored = restored + (key to maxOf(
+                    (restored[key] as? Long) ?: 0L,
+                    prefs.getLong(key, 0L),
+                    io.github.YGHFv.ReaPressExtend.hook.CainiaoTraceApi.riskBlockedUntil,
+                ))
+            }
+            val editor = prefs.edit()
             editor.clear()
-            values.forEach { (key, value) ->
+            restored.forEach { (key, value) ->
                 when (value) {
                     is String -> editor.putString(key, value)
                     is Long -> editor.putLong(key, value)
@@ -244,11 +279,19 @@ internal object ExpressBackup {
  *
  * @param snapshotName 恢复前自动快照的文件名（在 files/ 下）
  */
-internal class RestoreOutcome(
+internal data class RestoreOutcome(
     val ok: Boolean,
     val message: String,
     val restoredPrefs: Int = 0,
     val restoredEntries: Int = 0,
     val snapshotName: String? = null,
     val needsPassword: Boolean = false,
-)
+    val dataChanged: Boolean = false,
+    internal val changedPrefs: Set<String> = emptySet(),
+    val runtimeWarnings: List<String> = emptyList(),
+) {
+    fun withWarnings(warnings: List<String>): RestoreOutcome = if (warnings.isEmpty()) this else copy(
+        message = message + "。运行状态提示：" + warnings.joinToString("；"),
+        runtimeWarnings = runtimeWarnings + warnings,
+    )
+}

@@ -19,6 +19,7 @@ package io.github.YGHFv.ReaPressExtend.relay
 
 import android.content.Context
 import io.github.YGHFv.ReaPressExtend.hook.CainiaoTraceApi
+import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
 
 /**
  * 淘宝登录态 cookie 的模块进程缓存：cookie 只存在菜鸟私有目录（模块不同 uid 读不到），
@@ -40,12 +41,13 @@ object TraceCookieCache {
     @Volatile private var restored = false
 
     /** 绑定落盘位置并把上次同步的登录态读回内存（幂等）；必须在 [get] 之前调用一次。存 applicationContext 防泄漏。 */
-    fun attach(context: Context) {
+    fun attach(context: Context): Unit = ExpressRecordStore.withTransaction {
         val app = context.applicationContext
         store = app
-        if (restored) return
+        if (restored) return@withTransaction
+        val stored = TraceCookieStore.read(app)
         restored = true
-        val stored = TraceCookieStore.read(app) ?: return
+        if (stored == null) return@withTransaction
         if (cookie == null) {
             cookie = stored.cookie
             syncedAt = stored.syncedAt
@@ -55,17 +57,38 @@ object TraceCookieCache {
     }
 
     /** 当前可用的 cookie；从未同步过返回 null。 */
-    fun get(): String? = cookie
+    fun get(): String? = ExpressRecordStore.withTransaction { cookie }
 
-    /** 这份登录态是多久以前同步的；没有登录态返回 null。[now] 由调用方传（不依赖系统时钟）。 */
-    fun ageMs(now: Long = System.currentTimeMillis()): Long? {
-        val value = cookie ?: return null
-        if (value.isBlank() || syncedAt <= 0L) return null
-        return (now - syncedAt).coerceAtLeast(0L)
+    internal fun reloadAfterRestore(context: Context): Unit = ExpressRecordStore.withTransaction {
+        val app = context.applicationContext
+        store = app
+        restored = false
+        cookie = null
+        syncedAt = 0L
+        hostUa = null
+        CainiaoTraceApi.preferredUa = null
+        CainiaoTraceApi.clearCachedTokens()
+        val stored = TraceCookieStore.read(app)
+        cookie = stored?.cookie
+        syncedAt = stored?.syncedAt ?: 0L
+        hostUa = stored?.ua
+        CainiaoTraceApi.preferredUa = hostUa
+        restored = true
     }
 
-    fun put(value: String, ua: String? = null) {
-        if (value.isBlank()) return
+    /** 这份登录态是多久以前同步的；没有登录态返回 null。[now] 由调用方传（不依赖系统时钟）。 */
+    fun ageMs(now: Long = System.currentTimeMillis()): Long? = ExpressRecordStore.withTransaction {
+        val value = cookie ?: return@withTransaction null
+        if (value.isBlank() || syncedAt <= 0L) return@withTransaction null
+        (now - syncedAt).coerceAtLeast(0L)
+    }
+
+    fun put(value: String, ua: String? = null): Unit = ExpressRecordStore.withTransaction {
+        if (value.isBlank()) return@withTransaction
+        if (cookie != value) {
+            CainiaoTraceApi.clearCachedTokens()
+            hostUa = null
+        }
         cookie = value
         if (!ua.isNullOrBlank()) hostUa = ua
         syncedAt = System.currentTimeMillis()
@@ -82,9 +105,12 @@ object TraceCookieCache {
      * 风控时清 cookie 只会把下一轮也搭进去。该调的场景是确证过期 —— 轨迹与身份码同时被服务端
      * 以登录态为由拒绝、且重新索要来的那份也不管用。在那之前，留着旧的总比什么都没有强。
      */
-    fun invalidate(context: Context) {
+    fun invalidate(context: Context): Unit = ExpressRecordStore.withTransaction {
         cookie = null
         syncedAt = 0L
+        hostUa = null
+        CainiaoTraceApi.preferredUa = null
+        CainiaoTraceApi.clearCachedTokens()
         TraceCookieStore.clear(context.applicationContext)
     }
 

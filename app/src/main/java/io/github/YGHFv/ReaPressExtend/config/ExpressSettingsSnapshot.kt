@@ -25,7 +25,7 @@ import io.github.YGHFv.ReaPressExtend.core.WatchSchedule
 /**
  * 某一时刻生效的设置快照：system_server 一次事件处理里要判好几次（来源白名单、关键词、阈值），
  * 中途用户改设置会让同一次判定用上不一致的规则——读一次、判一次。
- * 刻意不含看门狗状态：熔断标记存在 system_server 的地盘，复位走 [KEY_HOOK_FORCE_ENABLED] 单向请求，
+ * 刻意不含看门狗状态：熔断标记存在 system_server 的地盘，复位走独立请求 ID，
  * 状态由 system_server 每次开机广播回来。
  */
 data class ExpressSettingsSnapshot(
@@ -37,7 +37,7 @@ data class ExpressSettingsSnapshot(
     val extraKeywords: Set<String> = emptySet(),
     val excludeKeywords: Set<String> = emptySet(),
     val confidenceThreshold: Int = ExpressSettingsKeys.DEFAULT_CONFIDENCE_THRESHOLD,
-    /** 界面请求复位看门狗熔断。system_server 消费后清回 false（一次性语义）。 */
+    /** 旧版布尔复位标志，仅用于迁移；普通设置保存不写回。 */
     val hookForceEnabled: Boolean = false,
     val traceFetchMode: String = ExpressSettingsKeys.DEFAULT_TRACE_FETCH_MODE,
     val archiveMode: String = ExpressSettingsKeys.DEFAULT_ARCHIVE_MODE,

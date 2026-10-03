@@ -18,7 +18,7 @@
 package io.github.YGHFv.ReaPressExtend.notification
 
 import android.content.Context
-import android.net.Uri
+import androidx.core.net.toUri
 import android.os.Bundle
 import android.provider.Settings
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
@@ -37,7 +37,7 @@ object FocusNotificationCapability {
 
     private const val PROP_ISLAND = "persist.sys.feature.island"
 
-    private val FOCUS_URI = Uri.parse("content://miui.statusbar.notification.public")
+    private val FOCUS_URI = "content://miui.statusbar.notification.public".toUri()
 
     /**
      * 一次探测的结果。[protocol] 0 = 不支持（非小米 / 老系统）；[islandSupported] OS3 才为 true；

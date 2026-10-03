@@ -17,10 +17,12 @@
 
 package io.github.YGHFv.ReaPressExtend.hook
 
+import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.Process
+import android.os.Binder
 import io.github.YGHFv.ReaPressExtend.relay.ExpressRelay
 import io.github.YGHFv.ReaPressExtend.relay.HostWakePin
 import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
@@ -42,6 +44,7 @@ internal object SystemWakeRelay {
 
     /** 幂等；拿不到 context 或注册失败返回 false（调用方稍后重试）。 */
     fun ensureRegistered(context: Context?): Boolean {
+        if (Process.myUid() != Process.SYSTEM_UID) return false
         if (registered) return true
         val resolved = context ?: return false
         synchronized(this) {
@@ -49,7 +52,7 @@ internal object SystemWakeRelay {
             val receiver = object : BroadcastReceiver() {
                 override fun onReceive(receiverContext: Context, intent: Intent) {
                     runCatching { relay(receiverContext, intent) }.onFailure {
-                        XposedBridge.logError("system wake relay failed (fail-soft)", it)
+                        runCatching { XposedBridge.logError("system wake relay failed (fail-soft)", it) }
                     }
                 }
             }
@@ -72,12 +75,13 @@ internal object SystemWakeRelay {
     }
 
     private fun relay(context: Context, intent: Intent) {
+        if (Process.myUid() != Process.SYSTEM_UID || intent.action != ExpressRelay.ACTION_WAKE_REQUEST) return
         val label = intent.getStringExtra(ExpressRelay.EXTRA_WAKE_REASON)
-            ?.takeIf { it.isNotBlank() } ?: "未标注用途"
+            ?.take(256)?.takeIf { it.isNotBlank() } ?: "未标注用途"
         val ok = runCatching {
             // 优先用 system context；onReceive 给的那个被包装过但发广播也能用，拿不到 holder 时兜底。
             val sender = SystemContextHolder.acquire() ?: context
-            sender.sendBroadcastAsUser(HostWakePin.pinIntent(), Process.myUserHandle())
+            sendPinFromSystem(sender)
             true
         }.getOrElse {
             XposedBridge.logError("relaying wake pin failed", it)
@@ -87,6 +91,18 @@ internal object SystemWakeRelay {
             "wake request from module ($label) — pin relayed as system uid=$ok",
         )
         report(context, if (ok) "系统代发唤醒销（$label）" else "系统代发失败（$label）")
+    }
+
+    // This endpoint only sends the fixed pin in system_server, never a caller-supplied Intent/user.
+    @SuppressLint("MissingPermission")
+    private fun sendPinFromSystem(context: Context) {
+        check(Process.myUid() == Process.SYSTEM_UID)
+        val identity = Binder.clearCallingIdentity()
+        try {
+            context.sendBroadcastAsUser(HostWakePin.pinIntent(), Process.myUserHandle())
+        } finally {
+            Binder.restoreCallingIdentity(identity)
+        }
     }
 
     private fun report(context: Context, text: String) {

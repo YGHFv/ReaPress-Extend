@@ -20,6 +20,7 @@ package io.github.YGHFv.ReaPressExtend.config
 import android.content.Context
 import android.content.SharedPreferences
 import io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog
+import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
 
 /**
  * 模块 App 进程侧的设置读写。
@@ -60,25 +61,32 @@ object ExpressSettings {
      * `implementation` 依赖（会打进 APK），但把它写进签名会让这个类在缺少该依赖的场景下
      * 直接 `NoClassDefFoundError`。用 Any + 反射调用，把依赖软化成可选。
      */
-    fun attachService(xposedService: Any?) {
+    fun attachService(context: Context, xposedService: Any?): Unit = ExpressRecordStore.withTransaction {
         service = xposedService
+        if (xposedService != null) syncToFrameworkNow(context)
+    }
+
+    fun detachService(xposedService: Any): Unit = ExpressRecordStore.withTransaction {
+        if (service === xposedService) service = null
     }
 
     fun isServiceAvailable(): Boolean = service != null
 
     /** 读设置（本地权威副本）。 */
     fun read(context: Context): ExpressSettingsSnapshot =
-        ExpressSettingsKeys.readFrom(ExpressSettingsKeys.localPrefs(context))
+        ExpressRecordStore.withTransaction {
+            ExpressSettingsKeys.readFrom(ExpressSettingsKeys.localPrefs(context))
+        }
 
     /**
      * 写设置：先落本地，再尽力同步给框架。
      *
      * @return true 表示本地已写入（同步失败不影响返回值，只记日志）
      */
-    fun write(context: Context, snapshot: ExpressSettingsSnapshot): Boolean {
-        val local = ExpressSettingsKeys.localPrefs(context)
-        return runCatching {
-            ExpressSettingsKeys.writeTo(local, snapshot)
+    fun write(context: Context, snapshot: ExpressSettingsSnapshot): Boolean = ExpressRecordStore.withTransaction {
+        runCatching {
+            val local = ExpressSettingsKeys.localPrefs(context)
+            check(ExpressSettingsKeys.writeTo(local, snapshot)) { "local settings commit failed" }
             syncToFramework(context, snapshot)
             true
         }.getOrElse {
@@ -89,17 +97,19 @@ object ExpressSettings {
 
     /** 局部更新：读出来改一个字段再写回。 */
     fun update(context: Context, block: (ExpressSettingsSnapshot) -> ExpressSettingsSnapshot): Boolean =
-        write(context, block(read(context)))
+        ExpressRecordStore.withTransaction { write(context, block(read(context))) }
 
-    /**
-     * 只重投影当前的本地设置到框架。
-     *
-     * 用于「复位看门狗」这类**直接改了本地 prefs 里的单个一次性标志**的场景 ——
-     * 它不在 [ExpressSettingsSnapshot] 里（见 [ExpressSettingsKeys.writeTo] 的注释），
-     * 所以不能通过 [write] 投影，只能整个快照重投一遍。
-     */
-    fun syncToFrameworkNow(context: Context) {
-        runCatching { syncToFramework(context, read(context)) }
+    fun requestHookReset(context: Context): Boolean = ExpressRecordStore.withTransaction {
+        runCatching {
+            val saved = ExpressSettingsKeys.requestHookForceEnable(ExpressSettingsKeys.localPrefs(context), true)
+            if (saved) syncToFrameworkNow(context)
+            saved
+        }.getOrDefault(false)
+    }
+
+    /** 将本地完整设置和稳定的复位请求 ID 重新提交到框架。 */
+    fun syncToFrameworkNow(context: Context): Boolean = ExpressRecordStore.withTransaction {
+        runCatching { syncToFramework(context, read(context)) }.getOrDefault(false)
     }
 
     /**
@@ -108,38 +118,46 @@ object ExpressSettings {
      * 走反射而不是直接调 `XposedService.getRemotePreferences`：见 [attachService] 的注释。
      * 失败只记日志 —— 界面上的设置已经存好了，只是被注入侧暂时读不到新值。
      */
-    private fun syncToFramework(context: Context, snapshot: ExpressSettingsSnapshot) {
+    private fun syncToFramework(context: Context, snapshot: ExpressSettingsSnapshot): Boolean {
         val target = service
         if (target == null) {
             ModuleAndroidLog.legacy(
                 TAG,
                 "framework service unavailable — settings saved locally but not propagated",
             )
-            return
+            return false
         }
-        runCatching {
+        return runCatching {
             val prefs = target.javaClass
                 .getMethod("getRemotePreferences", String::class.java)
                 .invoke(target, ExpressSettingsKeys.GROUP) as? SharedPreferences
             if (prefs == null) {
                 ModuleAndroidLog.error(TAG, "framework returned null RemotePreferences")
-                return
+                return false
             }
-            ExpressSettingsKeys.writeTo(prefs, snapshot)
-            // 复位请求是独立的一次性标志（不在 snapshot 里），必须单独带过去 ——
-            // 少了这行，用户点「复位」后 system_server 永远收不到请求。
-            val forceEnabled = ExpressSettingsKeys.localPrefs(context)
-                .getBoolean(ExpressSettingsKeys.KEY_HOOK_FORCE_ENABLED, false)
-            if (forceEnabled) {
-                ExpressSettingsKeys.requestHookForceEnable(prefs, true)
+            val local = ExpressSettingsKeys.localPrefs(context)
+            var requestId = local.getString(ExpressSettingsKeys.KEY_HOOK_RESET_REQUEST_ID, null)
+                ?.takeIf { it.isNotBlank() && it.length <= 128 }
+            if (requestId == null && local.getBoolean(ExpressSettingsKeys.KEY_HOOK_FORCE_ENABLED, false)) {
+                requestId = ExpressSettingsKeys.hookResetRequest(local)
             }
+            check(ExpressSettingsKeys.editorFor(local, snapshot)
+                .putString(ExpressSettingsKeys.KEY_HOOK_RESET_REQUEST_ID, requestId)
+                .putBoolean(ExpressSettingsKeys.KEY_HOOK_FORCE_ENABLED, false)
+                .commit()) { "reset request persistence failed" }
+            check(ExpressSettingsKeys.editorFor(prefs, snapshot)
+                .putString(ExpressSettingsKeys.KEY_HOOK_RESET_REQUEST_ID, requestId)
+                .putBoolean(ExpressSettingsKeys.KEY_HOOK_FORCE_ENABLED, false)
+                .commit()) { "remote settings commit failed" }
             ModuleAndroidLog.legacy(TAG, "settings propagated to framework")
-        }.onFailure {
+            true
+        }.getOrElse {
             ModuleAndroidLog.error(
                 TAG,
                 "propagate settings to framework failed (local copy is intact)",
                 it,
             )
+            false
         }
     }
 

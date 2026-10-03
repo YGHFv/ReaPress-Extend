@@ -18,6 +18,7 @@
 package io.github.YGHFv.ReaPressExtend.relay
 
 import android.content.Context
+import androidx.core.content.edit
 import android.content.Intent
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
 import io.github.YGHFv.ReaPressExtend.core.ExpressStatus
@@ -80,7 +81,7 @@ object ModuleTraceFetcher {
 
     /** 本地存储文件名。`internal` 是为了让备份清单引用同一份来源（同 `ExpressRecordStore.PREFS`）。 */
     internal const val PREFS = "trace_fetch"
-    private const val KEY_RISK_UNTIL = "riskBlockedUntil"
+    internal const val KEY_RISK_UNTIL = "riskBlockedUntil"
 
     @Volatile private var riskRestored = false
 
@@ -93,14 +94,23 @@ object ModuleTraceFetcher {
     }
 
     /** 把风控退避接上持久化：进程被杀退避就归零、退避期内照发不误（15:32 实证）。hook 进程不走这里（无模块 prefs 可写）。 */
-    private fun ensureRiskPersisted(context: Context) {
-        if (riskRestored) return
-        riskRestored = true
+    private fun ensureRiskPersisted(context: Context): Boolean = ExpressRecordStore.withTransaction {
+        if (riskRestored) return@withTransaction true
+        runCatching { reloadRiskAfterRestore(context) }.onFailure {
+            XposedBridge.logError("trace risk persistence unavailable; fetch skipped")
+        }.isSuccess
+    }
+
+    internal fun reloadRiskAfterRestore(context: Context) = ExpressRecordStore.withTransaction {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         CainiaoTraceApi.restoreRisk(prefs.getLong(KEY_RISK_UNTIL, 0L))
+        check(prefs.edit().putLong(KEY_RISK_UNTIL, CainiaoTraceApi.riskBlockedUntil).commit())
         CainiaoTraceApi.onRiskMarked = { until ->
-            prefs.edit().putLong(KEY_RISK_UNTIL, until).apply()
+            ExpressRecordStore.withTransaction {
+                prefs.edit { putLong(KEY_RISK_UNTIL, maxOf(until, prefs.getLong(KEY_RISK_UNTIL, 0L))) }
+            }
         }
+        riskRestored = true
     }
 
     /** 详情页点开/下拉拉当前单号。@return false 表示本地没有 cookie，调用方应改发 `ACTION_TRACE_REQUEST` 给菜鸟进程兜底。 */
@@ -113,7 +123,7 @@ object ModuleTraceFetcher {
             HostCredentialRequester.requestFromHosts(context)
             return false
         }
-        ensureRiskPersisted(context)
+        if (!ensureRiskPersisted(context)) return true
         CainiaoTraceFetcher.requestFetch(
             cookieProvider = { TraceCookieCache.get() },
             tracking = tracking,
@@ -131,7 +141,7 @@ object ModuleTraceFetcher {
             noteSkip("保底拉取跳过：模块手里没有登录态")
             return
         }
-        ensureRiskPersisted(context)
+        if (!ensureRiskPersisted(context)) return
         val now = System.currentTimeMillis()
         // 占坑在判断之后：间隔未到不更新时刻，否则批内第一条之后的永远没机会。
         if (now - lastBackstopAt < BACKSTOP_MIN_INTERVAL_MS) return
@@ -150,7 +160,7 @@ object ModuleTraceFetcher {
             noteSkip("轮查跳过：模块手里没有登录态（等一次宿主回执，或先在关于页确认菜鸟里登录过淘宝）")
             return
         }
-        ensureRiskPersisted(context)
+        if (!ensureRiskPersisted(context)) return
         CainiaoTraceFetcher.requestFetch(
             cookieProvider = { TraceCookieCache.get() },
             tracking = tracking,
@@ -194,7 +204,7 @@ object ModuleTraceFetcher {
             )
             return 0
         }
-        ensureRiskPersisted(context)
+        if (!ensureRiskPersisted(context)) return 0
 
         val now = System.currentTimeMillis()
         // 批次闸门排在 per-单号 节流之前：先决定这批做不做。被挡时不占单号的坑，
@@ -242,7 +252,7 @@ object ModuleTraceFetcher {
             noteSkip("自动更新跳过：模块手里没有登录态")
             return
         }
-        ensureRiskPersisted(context)
+        if (!ensureRiskPersisted(context)) return
         CainiaoTraceFetcher.requestFetch(
             cookieProvider = { TraceCookieCache.get() },
             tracking = tracking,

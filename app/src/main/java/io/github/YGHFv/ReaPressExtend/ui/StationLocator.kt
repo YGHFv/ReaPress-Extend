@@ -25,6 +25,7 @@ import android.location.Location
 import android.location.LocationManager
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.CancellationSignal
 import io.github.YGHFv.ReaPressExtend.core.GeoPoint
 import io.github.YGHFv.ReaPressExtend.core.StationFingerprint
 import kotlinx.coroutines.Dispatchers
@@ -49,11 +50,14 @@ internal object StationLocator {
         if (!hasFineLocation(context)) return@withContext Capture.needsPermission()
 
         val location = currentLocation(context)
+        if (!hasFineLocation(context)) return@withContext Capture.needsPermission()
+        val wifi = nearbyWifi(context)
+        if (!hasFineLocation(context)) return@withContext Capture.needsPermission()
         Capture(
             fingerprint = StationFingerprint(
                 position = location?.let { GeoPoint(it.latitude, it.longitude) },
                 accuracyMeters = location?.accuracy,
-                wifi = nearbyWifi(context),
+                wifi = wifi,
                 capturedAt = System.currentTimeMillis(),
             ),
             addressText = location?.let { reverseGeocode(context, it) },
@@ -68,33 +72,35 @@ internal object StationLocator {
      * 优先 getCurrentLocation（真的去测一次）再退最后已知位置——用户是站在驿站门口点的按钮，
      * 最后已知位置可能几十分钟前在家里。超时退旧位置而非 null：带时间戳的旧坐标仍比没有强。
      */
-    private suspend fun currentLocation(context: Context): Location? {
+    internal suspend fun currentLocation(context: Context, timeoutMs: Long = LOCATE_TIMEOUT_MS): Location? {
+        if (!hasFineLocation(context)) return null
         val manager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
             ?: return null
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val provider = bestProvider(manager)
             if (provider != null) {
-                val fresh = withTimeoutOrNull(LOCATE_TIMEOUT_MS) {
+                val fresh = withTimeoutOrNull(timeoutMs) {
                     suspendCancellableCoroutine { cont ->
+                        val cancellation = CancellationSignal()
+                        cont.invokeOnCancellation { cancellation.cancel() }
                         // provider 在挑选与调用之间被关掉、或权限刚被撤时 getCurrentLocation 会抛——正是退旧位置的时刻。
-                        runCatching {
-                            manager.getCurrentLocation(provider, null, DIRECT_EXECUTOR) { found ->
+                        try {
+                            manager.getCurrentLocation(provider, cancellation, DIRECT_EXECUTOR) { found ->
                                 if (cont.isActive) cont.resume(found)
                             }
-                        }.onFailure { if (cont.isActive) cont.resume(null) }
+                        } catch (_: SecurityException) {
+                            if (cont.isActive) cont.resume(null)
+                        } catch (_: RuntimeException) {
+                            if (cont.isActive) cont.resume(null)
+                        }
                     }
                 }
                 if (fresh != null) return fresh
             }
         }
-        return lastKnown(manager)
+        return LocationAccess.lastKnown(context, manager, PROVIDER_PREFERENCE, precise = true)
     }
-
-    private fun lastKnown(manager: LocationManager): Location? =
-        PROVIDER_PREFERENCE.asSequence()
-            .mapNotNull { runCatching { manager.getLastKnownLocation(it) }.getOrNull() }
-            .maxByOrNull { it.time }
 
     /** fused 排最前（系统自选 GPS/WiFi/基站，室内硬试 GPS 会白耗超时）；PASSIVE 只被动接收，取当前值给不出。 */
     private fun bestProvider(manager: LocationManager): String? =
@@ -126,17 +132,18 @@ internal object StationLocator {
      * 系统限流，不能每次都扫。
      */
     private suspend fun nearbyWifi(context: Context): List<String> {
+        if (!hasFineLocation(context)) return emptyList()
         val manager = runCatching {
             context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
         }.getOrNull() ?: return emptyList()
 
         val out = LinkedHashSet<String>()
         connectedBssid(manager)?.let { out += it }
-        out += scannedBssids(manager)
+        out += scannedBssids(context, manager)
 
-        if (out.isEmpty() && requestScan(manager)) {
+        if (out.isEmpty() && hasFineLocation(context) && requestScan(manager)) {
             delay(SCAN_SETTLE_MS)
-            out += scannedBssids(manager)
+            out += scannedBssids(context, manager)
         }
         return out.toList()
     }
@@ -149,9 +156,16 @@ internal object StationLocator {
         manager.connectionInfo?.bssid?.normalizeBssid()
     }.getOrNull()
 
-    private fun scannedBssids(manager: WifiManager): List<String> = runCatching {
-        manager.scanResults.orEmpty().mapNotNull { it.BSSID?.normalizeBssid() }
-    }.getOrDefault(emptyList())
+    internal fun scannedBssids(context: Context, manager: WifiManager): List<String> {
+        if (!hasFineLocation(context)) return emptyList()
+        return try {
+            manager.scanResults.orEmpty().mapNotNull { it.BSSID?.normalizeBssid() }
+        } catch (_: SecurityException) {
+            emptyList()
+        } catch (_: RuntimeException) {
+            emptyList()
+        }
+    }
 
     private fun requestScan(manager: WifiManager): Boolean =
         runCatching { manager.startScan() }.getOrDefault(false)
@@ -165,13 +179,13 @@ internal object StationLocator {
 
     private const val UNAVAILABLE_BSSID = "02:00:00:00:00:00"
 
-    /** FUSED_PROVIDER 是 API 31 加的编译期内联字符串常量，低版本取到也只是没用到的 provider 名，不会崩。 */
-    private val PROVIDER_PREFERENCE = listOf(
-        LocationManager.FUSED_PROVIDER,
-        LocationManager.GPS_PROVIDER,
-        LocationManager.NETWORK_PROVIDER,
-        LocationManager.PASSIVE_PROVIDER,
-    )
+    private val PROVIDER_PREFERENCE: List<String>
+        get() = buildList {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) add(LocationManager.FUSED_PROVIDER)
+            add(LocationManager.GPS_PROVIDER)
+            add(LocationManager.NETWORK_PROVIDER)
+            add(LocationManager.PASSIVE_PROVIDER)
+        }
 
     private val DIRECT_EXECUTOR = java.util.concurrent.Executor { it.run() }
 }

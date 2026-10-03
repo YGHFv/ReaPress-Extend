@@ -50,7 +50,7 @@ class ExpressApplication : Application() {
         runCatching {
             XposedServiceHelper.registerListener(object : XposedServiceHelper.OnServiceListener {
                 override fun onServiceBind(service: XposedService) {
-                    ExpressSettings.attachService(service)
+                    ExpressSettings.attachService(this@ExpressApplication, service)
                     runCatching {
                         check(
                             RelayCredentialStore.publish(
@@ -69,7 +69,7 @@ class ExpressApplication : Application() {
                 }
 
                 override fun onServiceDied(service: XposedService) {
-                    ExpressSettings.attachService(null)
+                    ExpressSettings.detachService(service)
                     ModuleAndroidLog.error(LOG_TAG, "xposed service died — settings sync disabled")
                 }
             })

@@ -21,21 +21,13 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 
-/** 定时备份的闹钟接收器：onReceive 跑在主线程，读全部 prefs 并序列化是几十毫秒 IO，用 goAsync() 把这条广播的存活期交给自己、做完再 finish()。 */
+/** 广播只提交系统 Job；文件与 SAF IO 不占用广播的有限存活窗口。 */
 class BackupAlarmReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != BackupScheduler.ACTION_BACKUP_ALARM) return
-        val app = context.applicationContext
-        val pending = goAsync()
-        Thread {
-            try {
-                BackupScheduler.maybeRunDue(app, "定时备份")
-                BackupScheduler.ensureScheduled(app)
-            } finally {
-                // 必须在所有路径上调用 —— 漏了系统会一直以为这条广播没处理完。
-                pending.finish()
-            }
-        }.apply { isDaemon = true }.start()
+        if (!BackupJobService.schedule(context.applicationContext)) {
+            io.github.YGHFv.ReaPressExtend.logging.ModuleAndroidLog.error("ReaPress", "backup alarm job not scheduled")
+        }
     }
 }

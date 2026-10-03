@@ -18,9 +18,11 @@
 package io.github.YGHFv.ReaPressExtend.relay
 
 import android.content.Context
+import androidx.core.content.edit
 import android.content.Intent
 import io.github.YGHFv.ReaPressExtend.config.ExpressSettingsKeys
 import io.github.YGHFv.ReaPressExtend.hook.AuthenticatedRelaySender
+import io.github.YGHFv.ReaPressExtend.notification.ExpressRecordStore
 import io.github.YGHFv.ReaPressExtend.xposed.XposedBridge
 
 /**
@@ -73,18 +75,18 @@ internal object WatchdogReporter {
      * 不写 `KEY_HOOK_DISABLED_BY_WATCHDOG`：广播分不清看门狗熔断与 ROM 不兼容，
      * 后者被标成熔断会让用户去复位一个没熔断的东西；真熔断由 describe 里的 `disabled=true` 体现。
      */
-    fun persistLocally(context: Context, intent: Intent) {
-        if (intent.action != ACTION_WATCHDOG_STATUS) return
+    fun persistLocally(context: Context, intent: Intent): Unit = ExpressRecordStore.withTransaction {
+        if (intent.action != ACTION_WATCHDOG_STATUS) return@withTransaction
         val installed = intent.getBooleanExtra(EXTRA_INSTALLED, false)
         val reason = intent.getStringExtra(EXTRA_REASON).orEmpty()
         val describe = intent.getStringExtra(EXTRA_DESCRIBE).orEmpty()
         runCatching {
-            ExpressSettingsKeys.localPrefs(context).edit()
-                .putBoolean(KEY_LAST_BOOT_HOOK_INSTALLED, installed)
-                .putString(KEY_LAST_BOOT_REASON, reason)
-                .putString(KEY_LAST_BOOT_DESCRIBE, describe)
-                .putLong(KEY_LAST_BOOT_AT, System.currentTimeMillis())
-                .apply()
+            ExpressSettingsKeys.localPrefs(context).edit {
+                putBoolean(KEY_LAST_BOOT_HOOK_INSTALLED, installed)
+                putString(KEY_LAST_BOOT_REASON, reason)
+                putString(KEY_LAST_BOOT_DESCRIBE, describe)
+                putLong(KEY_LAST_BOOT_AT, System.currentTimeMillis())
+            }
         }
     }
 

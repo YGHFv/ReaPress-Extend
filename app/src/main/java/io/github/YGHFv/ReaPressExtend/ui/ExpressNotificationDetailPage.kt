@@ -36,6 +36,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -75,7 +76,7 @@ internal fun NotificationDetailPage(
     val context = LocalContext.current
     val scrollBehavior = MiuixScrollBehavior()
     // 令牌是异步取回的，这两个判断不能只在进场时算一次：到货信号 +1，remember 跟着重算。
-    var tokenVersion by remember(entry) { mutableStateOf(0) }
+    var tokenVersion by remember(entry) { mutableIntStateOf(0) }
     val canOpen = remember(entry, tokenVersion) { NotificationIntentLauncher.canOpen(entry) }
     val faithful = remember(entry, tokenVersion) { NotificationIntentLauncher.isFaithful(entry) }
     val targetApp = remember(entry) { targetLabel(entry) }

@@ -71,18 +71,21 @@ object ExpressNotificationPoster {
 
         return runCatching {
             ensureChannel(manager)
+            val blocked = blockedReason(manager)
+            if (blocked != null) {
+                ExpressNotificationLog.record(
+                    context, record, delivered = false, detail = blocked,
+                    contentIntent = contentIntent, intentUri = intentUri, intentToken = intentToken,
+                )
+                return@runCatching false
+            }
 
             val title = ExpressFormatter.title(record)
             val summary = ExpressFormatter.summaryLine(record) ?: ExpressFormatter.body(record)
             val body = ExpressFormatter.body(record)
             val focus = FocusNotificationCapability.probe(context)
 
-            val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                Notification.Builder(context, CHANNEL_ID)
-            } else {
-                @Suppress("DEPRECATION")
-                Notification.Builder(context)
-            }
+            val builder = Notification.Builder(context, CHANNEL_ID)
 
             builder
                 .setSmallIcon(R.drawable.ic_notification_express)
@@ -98,6 +101,7 @@ object ExpressNotificationPoster {
             // 递归防护：给通知打上模块来源标记，system_server 的 hook 见到就放行，
             // 否则「拦截 → 重发 → 又被拦截」会无限循环。
             builder.extras.putBoolean(ExpressRelay.EXTRA_MODULE_ORIGIN, true)
+            builder.extras.putString(EXTRA_EVENT_KEY, ExpressDeliveryLedger.keyOf(record))
 
             if (focus.canAttachFocusParam) {
                 runCatching {
@@ -145,8 +149,28 @@ object ExpressNotificationPoster {
             ?.areNotificationsEnabled() == true
     }.getOrDefault(false)
 
+    private const val EXTRA_EVENT_KEY = "reapress.delivery.event"
+
+    fun isReplacementActive(context: Context, record: ExpressRecord): Boolean = runCatching {
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            ?: return@runCatching false
+        hasPermission(context) && blockedReason(manager) == null && manager.activeNotifications.any {
+            it.id == notificationId(record) && it.tag == null &&
+                it.notification.extras?.getString(EXTRA_EVENT_KEY) == ExpressDeliveryLedger.keyOf(record)
+        }
+    }.getOrDefault(false)
+
+    private fun blockedReason(manager: NotificationManager): String? {
+        if (!manager.areNotificationsEnabled()) return "应用通知已关闭"
+        val channel = manager.getNotificationChannel(CHANNEL_ID) ?: return "通知渠道不可用"
+        if (channel.importance == NotificationManager.IMPORTANCE_NONE) return "通知渠道已关闭"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && channel.group != null &&
+            manager.getNotificationChannelGroup(channel.group)?.isBlocked == true
+        ) return "通知渠道组已关闭"
+        return null
+    }
+
     private fun ensureChannel(manager: NotificationManager) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         manager.createNotificationChannel(
             NotificationChannel(
                 CHANNEL_ID,
@@ -162,8 +186,7 @@ object ExpressNotificationPoster {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             putExtra(ExpressRelay.EXTRA_TRACKING, record.trackingNumber)
         }
-        val flags = PendingIntent.FLAG_UPDATE_CURRENT or
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         // requestCode 用通知 ID：每条通知有独立的 PendingIntent，不会互相覆盖 extra。
         PendingIntent.getActivity(context, notificationId(record), intent, flags)
     }.getOrNull()

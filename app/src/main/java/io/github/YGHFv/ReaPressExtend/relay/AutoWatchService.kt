@@ -24,7 +24,6 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import android.os.IBinder
 import io.github.YGHFv.ReaPressExtend.R
 import io.github.YGHFv.ReaPressExtend.config.ExpressSettings
@@ -41,9 +40,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * 自动轮查。默认关——常驻前台通知是代价。节奏规则在 [WatchSchedule]（件间默认 3min±1、
@@ -56,6 +59,7 @@ class AutoWatchService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var loop: Job? = null
+    private val loopMutex = Mutex()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -70,8 +74,9 @@ class AutoWatchService : Service() {
         // startForeground 必须在 5 秒内调用，否则系统直接抛异常。
         runCatching { startForeground(NOTIFICATION_ID, buildNotification("正在准备")) }
             .onFailure { ModuleAndroidLog.error(TAG, "startForeground failed", it) }
-        if (loop?.isActive != true) {
-            loop = scope.launch { runLoop() }
+        if (intent?.action == ACTION_RELOAD || loop?.isActive != true) {
+            loop?.cancel()
+            loop = scope.launch { loopMutex.withLock { runLoop() } }
         }
         return START_STICKY
     }
@@ -84,7 +89,7 @@ class AutoWatchService : Service() {
 
     private suspend fun runLoop() {
         ModuleAndroidLog.legacy(TAG, "auto watch service started（${WatchState.describe(this)}）")
-        while (scope.isActive) {
+        while (currentCoroutineContext().isActive) {
             val settings = ExpressSettings.read(this)
             if (!settings.autoWatch) {
                 stopSelf()
@@ -145,6 +150,7 @@ class AutoWatchService : Service() {
             )
             var interrupted = false
             for ((index, tracking) in targets.withIndex()) {
+                currentCoroutineContext().ensureActive()
                 if (!ExpressSettings.read(this).autoWatch) {
                     stopSelf()
                     return
@@ -163,7 +169,7 @@ class AutoWatchService : Service() {
                 }
                 updateNotification("轮查中 ${index + 1}/${targets.size} · ${tracking.takeLast(4)}")
                 ModuleTraceFetcher.watchFetch(this, tracking)
-                WatchState.markRoundDone(this, tracking, WatchState.roundDone(this))
+                WatchState.markRoundDone(this, tracking)
                 // 先落盘再等：等待途中进程没了，重启后接着把这段间隔等完。
                 val gap = WatchSchedule.nextGapMillis(
                     jitter = Random.nextFloat() * 2f - 1f,
@@ -206,7 +212,7 @@ class AutoWatchService : Service() {
         remaining: (ExpressSettingsSnapshot) -> Long,
     ): Boolean {
         var label: String? = null
-        while (scope.isActive) {
+        while (currentCoroutineContext().isActive) {
             val settings = ExpressSettings.read(this)
             if (!settings.autoWatch) {
                 stopSelf()
@@ -270,7 +276,6 @@ class AutoWatchService : Service() {
     /** 渠道重要性只在首次创建时生效、之后改不了，只能换 id 切换；静默渠道用 IMPORTANCE_MIN（前台服务通知的下限）。 */
     private fun ensureChannel(channelId: String, quiet: Boolean) {
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         manager.createNotificationChannel(
             NotificationChannel(
                 channelId,
@@ -282,6 +287,8 @@ class AutoWatchService : Service() {
 
     companion object {
         private const val TAG = "ReaPress"
+
+        internal const val ACTION_RELOAD = "io.github.YGHFv.ReaPressExtend.action.RELOAD_AUTO_WATCH"
 
         const val NOTIFICATION_ID = 1001
 

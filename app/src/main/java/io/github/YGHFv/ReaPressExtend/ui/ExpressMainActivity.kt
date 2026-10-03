@@ -25,7 +25,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.Configuration
-import android.graphics.drawable.ColorDrawable
+import androidx.core.graphics.drawable.toDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -234,7 +234,7 @@ class ExpressMainActivity : ComponentActivity() {
             val manager = getSystemService(ActivityManager::class.java) ?: return
             val tasks = manager.appTasks
             // getTaskInfo() 标了 @Nullable（任务刚消失时给 null），认不到就退回单任务情形。
-            val task = tasks.firstOrNull { it.taskInfo?.taskId == taskId } ?: tasks.firstOrNull()
+            val task = RecentTaskCompat.findTask(tasks, taskId)
             if (task == null) {
                 if (changed) {
                     ModuleAndroidLog.legacy(LOG_TAG, "exclude from recents: 拿不到本应用的任务，跳过")
@@ -337,7 +337,7 @@ class ExpressMainActivity : ComponentActivity() {
             else -> isNightMode()
         }
         window?.setBackgroundDrawable(
-            ColorDrawable(if (dark) DARK_WINDOW_BG else LIGHT_WINDOW_BG),
+            (if (dark) DARK_WINDOW_BG else LIGHT_WINDOW_BG).toDrawable(),
         )
     }
 
@@ -685,6 +685,7 @@ private fun ExpressApp(
             liquidGlass = uiPrefs.liquidGlass
             doubleTapPickup = uiPrefs.doubleTapPickup
             hideFromRecents = uiPrefs.hideFromRecents
+            onHideFromRecentsChange(hideFromRecents)
             onThemeModeChange(uiPrefs.themeMode)
             stationRules = loadedRules
             homeRecords = loadedRecords
@@ -1600,18 +1601,17 @@ private fun RecordPage(
 /** 归档判据用的「一天」毫秒数。 */
 private const val DAY_MS = 24 * 60 * 60 * 1000L
 
-/** SimpleDateFormat 构造不便宜且非线程安全；所有调用都在重组（主线程）里，缓存成单例即可。 */
-private val recordDayFormat = java.text.SimpleDateFormat("MM-dd", java.util.Locale.getDefault())
-private val recordClockFormat = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+private val recordDayFormat = io.github.YGHFv.ReaPressExtend.core.LocalTimeFormatter("MM-dd")
+private val recordClockFormat = io.github.YGHFv.ReaPressExtend.core.LocalTimeFormatter("HH:mm")
 
 /** [todayStart] 由调用方在重组里 remember，避免每条记录重建 Calendar；跨天后下一次重组自然刷新。 */
 private fun dayLabel(at: Long, todayStart: Long): String = when {
     at >= todayStart -> "今天"
     at >= todayStart - DAY_MS -> "昨天"
-    else -> recordDayFormat.format(java.util.Date(at))
+    else -> recordDayFormat.format(at)
 }
 
-private fun clockLabel(at: Long): String = recordClockFormat.format(java.util.Date(at))
+private fun clockLabel(at: Long): String = recordClockFormat.format(at)
 
 // ---------------------------------------------------------------- 关于页（含诊断）
 
@@ -1687,15 +1687,10 @@ private fun AboutPage(settings: ExpressSettingsSnapshot, onOpenLog: () -> Unit) 
             CardActionRow("复位并重新启用") {
                 // 先写本地 prefs 再投影 RemotePreferences：框架未连接时直接写会静默失败，
                 // 而用户点这个按钮时框架多半就是有问题状态。
-                ExpressSettingsKeys.requestHookForceEnable(
-                    ExpressSettingsKeys.localPrefs(context),
-                    true,
-                )
-                ExpressSettings.syncToFrameworkNow(context)
-                hookForceRequested = true
+                hookForceRequested = ExpressSettings.requestHookReset(context)
             }
             if (hookForceRequested) {
-                HintText("已请求复位。重启设备后 system_server 会重新尝试安装 hook。")
+                HintText("已保存一次性复位请求。请先确保模块连上框架，再重启设备；同一请求不会反复解除保护。")
             }
         } else {
             HintText(

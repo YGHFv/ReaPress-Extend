@@ -158,9 +158,11 @@ internal fun BackupPage(
         noteIsError = isError
     }
 
-    fun saveConfig(next: BackupConfig) {
-        BackupSettings.save(context, next)
+    fun saveConfig(next: BackupConfig): Boolean {
+        val saved = runCatching { BackupSettings.saveOptions(context, next) }
+        saved.onFailure { report("备份设置未能写入磁盘，请重试。", true) }
         tick++
+        return saved.isSuccess
     }
 
     /** 恢复流程统一入口（三个来源收敛到这里，恢复逻辑只写一遍）：先确认，必要时再要密码。 */
@@ -186,8 +188,8 @@ internal fun BackupPage(
                 passwordOpen = true
             } else {
                 pending = null
-                report(outcome.message, !outcome.ok)
-                if (outcome.ok) onDataRestored()
+                report(outcome.message, !outcome.ok || outcome.runtimeWarnings.isNotEmpty())
+                if (outcome.dataChanged) onDataRestored()
                 tick++
             }
         }
@@ -345,7 +347,7 @@ internal fun BackupPage(
                     onSelectedIndexChange = { index ->
                         val ms = BackupSettings.INTERVAL_OPTIONS.getOrNull(index) ?: return@OverlayDropdownPreference
                         // 改间隔就把到期时刻清零重排。
-                        BackupSettings.save(context, config.copy(intervalMs = ms, nextDueAt = 0L))
+                        if (!saveConfig(config.copy(intervalMs = ms, nextDueAt = 0L))) return@OverlayDropdownPreference
                         BackupScheduler.reschedule(context)
                         BackupScheduler.maybeRunDue(context, "设置变更")
                         tick++

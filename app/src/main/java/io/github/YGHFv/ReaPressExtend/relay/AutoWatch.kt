@@ -34,19 +34,19 @@ private const val LOG_TAG = "ReaPress"
 object AutoWatch {
 
     /** 按用户选择把服务摆到正确状态；幂等。true = 这次调用把服务拉起来了。 */
-    fun sync(context: Context, reason: String): Boolean {
+    fun sync(context: Context, reason: String, restart: Boolean = false): Boolean {
         val enabled = ExpressSettings.read(context).autoWatch
         val intent = Intent(context, AutoWatchService::class.java)
-        return if (enabled) {
-            runCatching {
+        if (restart) intent.action = AutoWatchService.ACTION_RELOAD
+        return runCatching {
+            if (enabled) {
                 context.startForegroundService(intent)
-            }.onFailure {
-                ModuleAndroidLog.error(LOG_TAG, "auto watch start failed ($reason)", it)
-            }.isSuccess
-        } else {
-            context.stopService(intent)
-            true
-        }
+            } else {
+                context.stopService(intent)
+            }
+        }.onFailure {
+            ModuleAndroidLog.error(LOG_TAG, "auto watch sync failed ($reason)", it)
+        }.isSuccess
     }
 
     /** 用户改间隔后把落盘的下次时刻往前拉（否则旧的长等待不会自己醒）；规则在 [WatchSchedule.pullDueEarlier]。 */

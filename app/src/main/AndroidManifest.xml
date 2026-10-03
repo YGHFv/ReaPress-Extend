@@ -69,6 +69,8 @@
     <application
         android:name=".ExpressApplication"
         android:allowBackup="false"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:description="@string/module_description"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/module_name"
@@ -98,7 +100,6 @@
             android:name=".ui.ExpressMainActivity"
             android:enabled="true"
             android:exported="true"
-            android:label="@string/module_name"
             android:theme="@style/ModuleTheme">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -152,8 +153,8 @@
           定时备份的闹钟（BackupScheduler.ensureScheduled 排下）。
 
           exported=false + 无 intent-filter：这是给自己发的闹钟投递用的，别的应用既不需要
-          也不应该能触发它。用广播接收器而不是 WorkManager：这件事一秒内就做完，也没有
-          「必须做完」的语义（下一次到点、或用户打开模块时都会补），不值得引入一套调度框架。
+          也不应该能触发它。广播只提交系统 JobScheduler，实际备份写盘由 JobService 执行，
+          不假设 SAF 能在广播的有限窗口内完成。
 
           闹钟用的是**不精确**的那种（setInexactRepeating）：备份晚半小时没有任何后果，
           而精确闹钟要 SCHEDULE_EXACT_ALARM，还有被系统回收的风险。
@@ -162,6 +163,11 @@
             android:name=".backup.BackupAlarmReceiver"
             android:enabled="true"
             android:exported="false" />
+
+        <service
+            android:name=".backup.BackupJobService"
+            android:permission="android.permission.BIND_JOB_SERVICE"
+            android:exported="true" />
 
         <!--
           免 root 方案的通知来源：用户授予「通知使用权」后由系统绑定，模块进程内读宿主通知原文。

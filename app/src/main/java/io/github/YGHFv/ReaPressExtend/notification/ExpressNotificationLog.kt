@@ -19,12 +19,11 @@ package io.github.YGHFv.ReaPressExtend.notification
 
 import android.app.PendingIntent
 import android.content.Context
+import androidx.core.content.edit
 import io.github.YGHFv.ReaPressExtend.core.ExpressRecord
 import org.json.JSONArray
 import org.json.JSONObject
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import io.github.YGHFv.ReaPressExtend.core.LocalTimeFormatter
 import java.util.UUID
 
 /**
@@ -135,28 +134,30 @@ object ExpressNotificationLog {
     }
 
     /** 投递与拦截两条路共用的收尾。先存跳转再落记录，反了界面会看到灰的「打开原通知」。 */
-    private fun append(context: Context, entry: Entry, contentIntent: PendingIntent?) {
+    private fun append(context: Context, entry: Entry, contentIntent: PendingIntent?): Unit = ExpressRecordStore.withTransaction {
         contentIntent?.let { NotificationIntentCache.remember(entry.id, it) }
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val updated = trim(parse(prefs.getString(KEY_RECORDS, null)) + entry)
-        prefs.edit().putString(KEY_RECORDS, serialize(updated)).apply()
+        prefs.edit { putString(KEY_RECORDS, serialize(updated)) }
     }
 
     /** 全部记录，最新在前。 */
     fun snapshot(context: Context): List<Entry> = snapshot(context, null)
 
     fun snapshot(context: Context, kind: Kind?): List<Entry> =
-        runCatching {
-            parse(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_RECORDS, null))
-                .filter { kind == null || it.kind == kind }
-                .asReversed()
-        }.getOrDefault(emptyList())
+        ExpressRecordStore.withTransaction {
+            runCatching {
+                parse(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_RECORDS, null))
+                    .filter { kind == null || it.kind == kind }
+                    .asReversed()
+            }.getOrDefault(emptyList())
+        }
 
     /**
      * 清空记录（两类一起清）。用 `commit()`：用户点完可能立刻杀进程，异步落盘会让删除丢掉。
      * 目前没有界面入口，函数保留完整语义。
      */
-    fun clear(context: Context) {
+    fun clear(context: Context): Unit = ExpressRecordStore.withTransaction {
         runCatching {
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_RECORDS).commit()
             NotificationIntentCache.clear()
@@ -221,7 +222,7 @@ object ExpressNotificationLog {
         }.getOrDefault(emptyList())
     }
 
-    private val timeFormat = SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault())
+    private val timeFormat = LocalTimeFormatter("MM-dd HH:mm:ss")
 
-    fun formatTime(at: Long): String = timeFormat.format(Date(at))
+    fun formatTime(at: Long): String = timeFormat.format(at)
 }

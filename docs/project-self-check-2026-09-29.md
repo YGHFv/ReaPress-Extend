@@ -4,6 +4,8 @@
 
 第 1–8 节保留修复前的审计结论与基线代码定位，不代表当前修复状态；后续改动、测试结果及未完成事项见第 9 节。
 
+最新修复复核日期：2026-10-03；第六批结果见第 9 节末尾。
+
 ## 1. 结论与检查边界
 
 项目已经具备完整的 Android 应用与 Xposed 模块形态，解析、富化、分组等核心逻辑有较充分的单元测试，但不能据此判定所有功能正常。当前主要风险集中在跨进程信任边界、异步任务状态清理、并发持久化以及恢复后的运行状态同步。
@@ -317,4 +319,172 @@ adb devices
 2. 重启设备更新 `system_server` hook，并重新打开宿主；仅重启模块或宿主不足以更新旧系统侧代码。清除模块数据后需重新发布新凭据，旧凭据/旧无认证发送器不会被兼容放行。
 3. 真机验证系统与宿主十类回传、冷启动、服务重连、升级前后混用、清除数据后旧凭据拒绝、缺少凭据时保留原通知；结合第 8 节原有设备清单完成运行期验收。
 
-下一批优先 F05/F06/F07：看门狗人工复位状态机、框架重连后的完整配置投影、恢复后的缓存/服务/调度协调；之后处理 F08/F09/F10 与剩余 Lint 实质缺陷。当前不能表述为“所有功能已修复并验收”。
+第二批结束时的下一批目标为 F05/F06/F07；其后续实现与验证如下。
+
+### 第三批：F05 / F06 / F07
+
+状态：已完成实现与本机回归，未进行设备/真实账号验收。按用户要求，前两批已提交并推送 GitHub `origin/main`，提交为 `c88a023216affd9905792a85f080c911d67f146e`；本批为推送后的继续修复。
+
+| 问题 | 改动 | 验证 |
+| --- | --- | --- |
+| F05 人工复位仍被旧失败计数拒绝 | 提取 `WatchdogStateMachine`；新复位开启受监控的新尝试，旧失败清零；系统侧 `WatchdogStateStore` 持久化已消费请求 ID，重复配置同步不能再次复位 | 状态机 9 项、真实文件存储/入口 8 项，覆盖连续失败、正常存活、新旧请求、重启后去重、写盘失败、旧格式、损坏文件与计数溢出 |
+| F06 框架重连不补同步 | 绑定时完整重投影本地设置，校验本地/远端同步提交结果；旧服务的迟到死亡回调不清除新连接；局部更新与恢复同锁 | 13 项设置同步测试，覆盖离线修改、首绑、死亡重连、完整字段、提交失败重试、复位迁移与不重复消费 |
+| F07 恢复后运行态仍旧 | `BackupRestoreRuntime` 重载 Cookie/UA/风控、投影配置、请求轮查重启、重排备份闹钟并通知 UI；写回失败回滚；相关偏好存储加入统一事务锁 | 恢复运行态 17 项、恢复并发 7 项、Cookie 缓存 4 项、真实会话 Token 路径 2 项、轮查重载 1 项 |
+
+复现与关键边界：
+
+- 实现前 3 个正式回归用例均失败：离线配置首次绑定未同步、复位标志消费后又被普通同步激活、已绑定进程恢复 Cookie 后仍读旧值。证据：`log/fix-batch3-reproduction.log`。
+- 核对所用 libxposed API 102.0.0 源码，`getRemotePreferences` 明确说明 **hooked apps 中只读**。旧逻辑在系统进程调用 `edit()` 消费标志既不符合契约，也不能解决本地布尔值重发；新实现仅在系统自己的看门狗文件记录消费。源码归档：<https://repo.maven.apache.org/maven2/io/github/libxposed/api/102.0.0/api-102.0.0-sources.jar>。
+- 每次人工点击生成新的 UUID，本地落盘后与普通设置一起提交；重连不轮换。旧布尔请求统一映射到稳定的迁移 ID，系统先消费、模块后迁移也不会获得第二次复位。复位键不进入导出/恢复前快照，导入保留本机请求，不能用旧备份重新解除保护。
+- 看门狗状态先写临时文件并同步，再替换同目录目标；已有状态位置后续保持一致，防止读旧主文件、写新备用文件的不一致。无法读取或持久化保护状态时拒绝本次系统 hook，保留原通知；损坏/截断文件不会被当作全新状态。存活窗口仍为 90 秒，连续两次失败仍熔断。
+- 记录、设置、Cookie、驿站规则、通知审计、UI 偏好和轮查状态的关键读写与恢复共用模块进程内事务锁；测试直接确认第二线程等待同一个监视器。恢复前快照失败则不写；提交失败会回滚所有已尝试存储，包括“返回 false 但内存已变”的失败项。
+- 回滚成功不启动/停止服务或发恢复变更通知；无法确认回滚时如实报告，UI 重新读取当前状态。缓存与框架同步使用回滚后的实际值。更严格的风控退避是保护性例外，不因恢复失败而缩短。
+- 恢复新 Cookie 清除旧 UA/预热 Token；Token 缓存同时按登录态匹配，不能把旧会话的预热凭据直接套到新 Cookie 上。网络测试全部替换 URL/HttpURLConnection，只执行合成响应，不访问远端。
+- 轮查重载取消旧任务，并用协程互斥保证同一服务没有重叠循环；检查当前协程取消状态，而非仅检查父 scope。系统拒绝前台服务时保留已恢复数据，返回运行态警告；不会高频重试。备份目录授权、密码、定时间隔沿用本机配置。
+- 风控恢复只取更晚时间；后续风险回执同样不能把较长退避缩短。风控持久化失败时请求入口安全停止，不借宿主广播绕过该状态。
+- 这不是跨文件崩溃安全事务：断电/进程被杀发生在多文件写回中间仍依赖恢复前快照；已经发出的网络请求不会被回滚，迟到回执仍可能作为后续写入。锁等待、SAF、服务启动、真实开机保护仍需真机测试。
+
+验证命令：
+
+```powershell
+.\gradlew.bat :app:testDebugUnitTest --tests '*SettingsSyncTest' --tests '*WatchdogStateMachineTest' --tests '*WatchdogStateStoreTest' --tests '*BackupRestoreRuntimeTest' --tests '*RestoreConcurrencyTest' --tests '*TraceCookieCacheTest' --tests '*CainiaoSessionTokenTest' --tests '*AutoWatchReloadTest' --tests '*ExpressRecordConcurrencyTest' --console=plain
+.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease :app:lintDebug --console=plain
+```
+
+- 定向 **73 项通过**（本批新增 61 + 原有记录并发 12）；日志：`log/fix-batch3-targeted.log`。
+- 全量 **669 项通过，55 个测试类，失败/错误/跳过均为 0**（第二批 608 + 本批 61）；Debug / Release 构建成功，Release 仍未签名。
+- Lint 仍未通过：**7 个错误、60 个警告、1 个提示**。7 个错误与第二批相同；未添加全局抑制或 baseline。组合日志：`log/fix-batch3-validation.log`。
+- 未新增生产或测试依赖。`git diff --check` 通过；ADB 无设备，所有新增测试使用临时目录/合成数据，未访问真实账号与平台接口。
+
+后续继续 F08/F09/F10：备份任务生命周期、失败重试调度与通知投递成功确认。尚不能宣称“所有功能已修复并验收”。
+
+### 第四批：F08 / F09 / F10
+
+状态：已完成本批实现与本机回归，未进行设备/真实账号验收；第三、四批改动均未新增提交或推送。
+
+接续基线：第三批全量 669 项通过，Debug / Release 构建成功；Lint 仍有 7 个错误，不能把组合命令的失败解释为单测或构建失败。第三批改动保留在工作区，本批不回退或重新提交已有改动。
+
+先复现再修复：工作区已有 `BackupRetryTest` 与 `NotificationFailureTest` 两个正式回归用例；前次执行日志 `log/fix-batch4-reproduction.log` 记录 **2 项执行、2 项失败**，不计入第三批的 669 项通过数。
+
+- F09：调用真实 `BackupScheduler.backupNow`，过去成功、本次因未设置加密密码而失败，最后成功时刻保留，但下次到期仍在过去。
+- F10：调用真实免 root 监听入口，同一原通知连续到达两次，替代通知未成功投递，第二次仍调用撤销原通知。这里未配置 NotificationManager，复现的是不可投递路径，不冒充设备通知权限测试。
+- 本次重跑仍为 **2 项失败**，分别是下次重试必须晚于当前尝试的断言失败、以及监听器不应撤原通知的 Mockito 验证失败。证据：`log/fix-batch4-reproduction-rerun.log`。修复后原始两用例转绿。
+
+实现与回归范围：
+
+| 问题 | 改动 | 验证 |
+| --- | --- | --- |
+| F08 广播生命周期未覆盖实际写盘 | 闹钟仅提交平台 JobScheduler，非导出广播与需 `BIND_JOB_SERVICE` 的 JobService 配合；只有实际工作结束才 `jobFinished`，无需新依赖 | 真实 Receiver/JobService 入口 10 项，覆盖提交去重、首次排期、成功/失败完成、排队取消、关闭重查、读存储异常与执行器拒绝 |
+| F09 失败重试仍停在过去及重复排队 | 保存独立 `lastAttemptAt`，先同步落盘冷却再做备份；结果按完成时刻加间隔，保留最后成功时间；入队前原子占位覆盖手动/自动/定时；闹钟对齐新到期时间 | BackupRetry 12 项、任务闸门 3 项，覆盖原始复现、首次失败、实际写文件失败/成功、自动十分钟冷却、提交失败、排期溢出、闹钟锚点与设置竞态 |
+| F10 未成功也占用去重并撤原通知 | 两入口共用成功确认账本；进行中不代表成功，失败/异常释放；投递前检查权限、应用开关、渠道/渠道组；重复事件撤销前查询同一事件替代通知是否仍活跃 | 监听/真实发送器/认证 Relay 17 项、账本 8 项，加原有键语义 4 项；覆盖 SDK 26/35 分支、权限拒绝后恢复、渠道关闭、异常、双链路顺序与进行中重入 |
+
+关键边界：
+
+- 定时备份不再依赖 `goAsync` 里嵌套普通 executor 保活。系统拒绝安排 Job 会记错并由后续闹钟/打开模块再尝试；不回退到无生命周期保障的广播线程。调度仍不精确，受 ROM/Doze/系统配额影响，未宣称能强行保活或准点完成。
+- `onStopJob` 后排队但未开始的工作不执行，迟到完成不调用已停止任务的 `jobFinished`；已经进入的同步文件/SAF IO 不强制中断，进程终止仍可能留下不完整文件。持久化尝试时刻用于避免立即重复，**尚未实现备份文件原子替换、SAF 部分文件清理或崩溃后完整性恢复**。有变更去抖仍是尽力而为的进程内任务。
+- 备份配置自己的锁不覆盖耗时文件 IO；结果只合并运行字段，不能把旧快照里的目录、密码、保留数或开关重新覆盖回去。UI 保存配置保留最新尝试/成功状态，同步提交失败提示错误；`commit=false` 仍可能改变内存，本次不声称磁盘事务回滚。
+- 结果保存后重排闹钟，避免备份完成略晚于原闹钟锚点，导致下次闹钟早于 `nextDueAt` 而再多等一整轮；普通重排沿用已存到期时间，不随每次打开页面向后漂移。
+- 通知成功账本时间窗从实际 `post` 成功返回计起，为 60 秒、最多 64 个成功键；进行中不受成功缓存淘汰影响。正文使用完整键而非 Java 32 位哈希，避免不同文本同哈希被误判成同一事件。
+- 重复事件不再仅凭历史成功撤销原通知：还须查询当前活跃的相同通知 ID、无 tag、同事件标记。通知已清除、ID 被其他事件覆盖、权限撤销或查询异常，均保留原通知。初次 `notify()` 无异常仍只是系统接受投递，不是 ROM 展示回执；查询与撤销也不是跨系统原子操作。
+- root 的 system_server 仍在广播交出后决定是否拦截，**未增加模块到系统侧的端到端确认协议**；分类“直接吞掉”属于用户明确选择的另一分支，本批不改变其语义。以上修复不能等同所有 root/ROM 场景均不会丢提醒。
+- Android 测试用局部 Mockito 替代 Binder/通知/调度 API，真实调用业务入口；权限/渠道用合成返回值，SDK 版本仅在 JVM 桩中临时调整并恢复。没有真实账号调用，不把这些测试当作设备通知展示或系统进程保活验收。
+
+验证命令：
+
+```powershell
+.\gradlew.bat :app:testDebugUnitTest --tests '*BackupRetryTest' --tests '*BackupTaskGateTest' --tests '*BackupJobServiceTest' --tests '*DeliveryLedgerTest' --tests '*NotificationFailureTest' --console=plain
+.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease :app:lintDebug --console=plain
+```
+
+- 最终定向 **54 项通过**（本批新增 50 + 原有账本键语义 4）；日志：`log/fix-batch4-targeted.log`，分类计数：`log/fix-batch4-targeted-count.txt`。
+- 最终全量 **719 项通过，60 个测试类，失败/错误/跳过均为 0**（第三批 669 + 本批 50）。逐类统计：`log/fix-batch4-full-test-count.csv`，汇总：`log/fix-batch4-full-test-summary.txt`。
+- Debug / Release 构建成功；产物为 `app/build/outputs/apk/debug/app-debug.apk` 与 `app/build/outputs/apk/release/app-release-unsigned.apk`，Release 仍未签名。
+- Lint **仍未通过：7 个错误、60 个警告、1 个提示**，与第三批相同；错误仍是定位权限 4、跨用户发送 1、旧系统 API 1、本机 properties 转义 1。未新增全局抑制、baseline 或依赖。组合命令日志：`log/fix-batch4-validation.log`。
+- `git diff --check` 通过；`adb devices` 仍无设备。下一阶段可收敛这 7 项 Lint 错误，并在设备上验证冷启动/Doze/Job 停止、失效 SAF 授权、通知权限/渠道开关与双链路；备份原子写入和 root 端到端确认仍是明确的后续可靠性工作。
+
+### 第五批：Lint 错误初步处理
+
+范围：处理第四批留下的 7 项 Lint 错误，不扩大到清理全部 60 项警告；保留第三、四批工作区改动，不新增提交或推送。
+
+| 原错误 | 处理 | 回归 |
+| --- | --- | --- |
+| 定位/WiFi 权限检查 4 项 | 缓存位置读取集中到 `LocationAccess`，保留粗/精确权限差异，敏感调用显式处理 `SecurityException`；精确采集与 WiFi 读取重查权限，撤销时返回缺权限；当前位置超时/协程取消时取消平台请求 | `LocationPermissionTest` 16 项，覆盖未授权、仅粗定位、读取时撤销、采集中撤销、缺 provider、SDK 26 缓存路径、SDK 35 新定位/超时/取消/迟到回调及 WiFi 失败与过滤 |
+| 系统代发跨用户权限 1 项 | 注册与接收限制 system UID，接收仅认固定 action；固定唤醒 Intent 在清除 Binder 身份后发给进程所属用户，`finally` 恢复身份；说明性 `MissingPermission` 抑制只放在这一受限私有方法 | `SystemWakeRelayTest` 10 项，覆盖普通 UID 拒绝、SDK 26/35 注册参数、signature 权限、幂等/重试、错误 action、固定目标、身份顺序、发送/日志同时失败与系统 Context 优先；原有认证发送器 13 项一并重跑 |
+| 低版本 `TaskInfo.taskId` 1 项 | 提取 `RecentTaskCompat`，API 29+ 使用 `taskId`，26–28 使用旧 `id`；单个任务信息失效不阻断其他任务匹配，只有单任务才允许兜底，避免误隐藏其他卡片 | `RecentTaskCompatTest` 7 项，覆盖 SDK 26/28/29/35、任务消失、缺信息、空列表及多任务歧义 |
+| 本机 properties 转义 1 项 | 将 SDK 路径写为 `C\:/Users/...`；只修改 Git 忽略的 `local.properties`，不把本机路径加入仓库 | Gradle 正常定位 SDK，Lint 不再报 `PropertyEscape` |
+
+关键边界：
+
+- 定位告警原本已有外层检查与通用异常捕获，本批不是声称发现或修复了 4 个必崩点；主要明确调用边界、补回归，并在取消时释放定位请求。驿站采集仍要求精确定位，身份码附近排序仍接受粗定位，不扩大授权或主动联网。
+- 系统 UID 检查限定执行身份，不代替发送者认证。发送者限制仍由 `HostReceiverRegistrar` 的模块 signature 权限承担，测试验证注册参数；没有在设备上模拟恶意发送者，也没有给普通 APK 申请系统跨用户权限。目标仍是 system_server 所属用户，本批不扩展工作资料/多用户路由。
+- Android 版本和权限/Binder/定位结果使用 JVM 桩与 Mockito 模拟；未宣称在 Android 8–9 真机运行过任务卡片功能，平台回调/权限对话框、WiFi 硬件、ROM 唤醒效果仍需设备验证。未新增生产/测试依赖，未加全局 Lint 抑制或 baseline。
+
+验证命令：
+
+```powershell
+.\gradlew.bat :app:testDebugUnitTest --tests '*RecentTaskCompatTest' --tests '*LocationPermissionTest' --tests '*SystemWakeRelayTest' --tests '*AuthenticatedRelaySenderTest' --console=plain
+.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease :app:lintDebug --console=plain
+```
+
+- 定向 **46 项通过**（新增 33 + 原有认证发送器 13）。日志：`log/fix-batch5-targeted.log`；计数：`log/fix-batch5-targeted-count.txt`。
+- 全量 **752 项通过，63 个测试类，失败/错误/跳过均为 0**（第四批 719 + 本批 33）。逐类统计：`log/fix-batch5-full-test-count.csv`；汇总：`log/fix-batch5-full-test-summary.txt`。
+- **Debug / Release / Lint 均通过**，组合命令结果为 `BUILD SUCCESSFUL`；日志：`log/fix-batch5-validation.log`。APK 路径不变，Release 仍未签名。
+- 最终 Lint 为 **0 个错误、62 个警告、1 个提示**；7 个错误已消除。第一轮仅生产改动检查为 60 个警告；加入测试后，`SystemWakeRelayTest` 的 SDK 26 旧版 `registerReceiver` 验证/桩配置新增 2 项 `UnspecifiedRegisterReceiverFlag`，Lint 无法检查 Mockito 模拟过滤器，未为压低数字扩大抑制。报告：`app/build/reports/lint-results-debug.html`。
+- `git diff --check` 通过，ADB 仍无设备。本批完成本机初步处理，不等于硬件、系统注入、多用户与 ROM 行为已验收。
+
+### 第六批：警告核查与低风险清理（2026-10-03）
+
+接续基线：第五批 752 项测试通过，Lint 为 0 错误、62 警告、1 提示。本批按实际风险处理，不以所有警告归零为目标；未升级 Gradle、依赖或 targetSdk，未改动已有图标像素/比例，也未提交或推送。
+
+已完成的核查与修复：
+
+| 类别 | 改动与边界 | 验证 |
+| --- | --- | --- |
+| 时间格式与并发 | 4 处静态 `SimpleDateFormat` 改为共享不可变 `DateTimeFormatter` 的 `LocalTimeFormatter`；每次调用重读 Locale/时区，避免设置变更后仍使用旧值，也消除日志工作线程和 UI 共享可变格式器的问题 | 4 项测试：语言/数字样式变化、时区变化、8 线程 6000 次格式化、实际日志/审计入口 |
+| Context 生命周期 | `HostContextHolder` 发布前归一化为 application Context；无法取得时不缓存 Activity，也不丢待执行监听器。`TraceCookieCache` 已只存 `applicationContext`；`SystemContextHolder` 仅来自 NMS 的系统 Context/ActivityThread 系统入口，不能机械替换成普通应用 Context | 8 项真实入口测试，覆盖宿主缓存/回调、Application 启动期、缺应用 Context、Cookie attach/restore 与 NMS Context 来源；6 项静态引用警告保留，未全局抑制 |
+| WebView 安全与释放 | 新增 `LoginWebViewPolicy`：保留登录所需 JS/DOM storage；禁止 file/content 访问、明文混合内容与非 HTTPS 导航，不启动原生 scheme；启用 Safe Browsing，证书错误取消，不新增 JS bridge；AndroidView 释放与弹窗退出均销毁视图，并防迟到释放误伤新视图 | 12 组 URL 策略、7 项实际配置/回调/释放测试。JS 告警只在已审查配置方法局部说明性抑制，不宣称消除第三方页面风险 |
+| 系统备份/迁移 | 保留 `allowBackup=false`，增加旧版 `fullBackupContent` 与 Android 12+ `dataExtractionRules`，云备份和设备迁移分别排除全部 9 类域，包括设备保护存储；不影响模块自己的手动导出/恢复 | 3 项 XML 契约测试；AAPT2 检查实际 Debug APK 的合并 Manifest 及编译后排除规则均已打包 |
+| 低风险清理 | 清理通知/轮查的 API 26 以下分支，FUSED_PROVIDER 按 API 31 门禁；整数 Compose 状态改为 `mutableIntStateOf`；移除重复 Activity label、未引用主题；消除中文拆行拼接提示；图标 XML 移至无冗余限定目录，像素保持不变 | 原有通知 SDK 26/35、位置 SDK 26/35 回归；Debug/Release 资源编译与 Lint |
+| KTX 风格 | 仅转换 3 处 URI/Drawable 与 7 处原本使用 `apply()` 的写入；备份、凭据、恢复等同步提交与返回值检查维持原样。修正旧注释：`apply()` 同样立即更新内存，区别是磁盘提交时机 | 3 项实际存储入口测试确认仍调用 `apply()` 而非 `commit()`；原有 12 项记录并发和 7 项恢复并发回归通过 |
+
+保留的警告（最终 39 项）：
+
+| 数量 | 类型 | 处置依据 |
+| --- | --- | --- |
+| 14 | `UseKtx` | 剩余均是同步提交/编辑器路径的风格建议；KTX `edit(commit=true)` 不返回磁盘成功值，尤其不能替代凭据发布和恢复的提交检查。本批统一保留，避免风格清理改变持久化语义 |
+| 6 | `StaticFieldLeak` | 已核查 3 个进程级 Context 持有器并补测试；保留检测提示，不能把“不持有 Activity”扩大成整个应用绝无泄漏 |
+| 2 | `ApplySharedPref` | 保留通知清空/驿站规则的同步落盘边界；不为了告警数改成异步，提交失败处理也不在本批重构 |
+| 3 | `PrivateApi` | 宿主/系统 Context 反射兜底及小米能力探测依赖平台内部接口；已有失败降级，仍需 ROM/系统版本实测 |
+| 1 | `ExportedReceiver` | 合法宿主需要导出入口，接收前已有框架凭据认证和载荷检查；不改成仅允许模块签名而挡住宿主，也不删除认证 |
+| 2 | `UnspecifiedRegisterReceiverFlag` | Android 26 旧 API 的测试验证/桩配置，Lint 无法识别模拟过滤器；生产 API 33+ 分支已有导出标志与 signature 权限 |
+| 5 + 1 | 图标形状、缺单色图标 | 现有图标是用户提供的成品栅格，自适应背景故意铺满；单色版需要独立形状设计与视觉验收，不能将全透明前景直接当单色图标 |
+| 1 | `ObsoleteSdkInt` | 唯一残留是本机旧空 `mipmap-anydpi-v26` 目录；XML 已迁往 `mipmap-anydpi`，Git 不跟踪空目录。尝试移除空目录被执行环境策略拒绝，未绕过，也未通过抑制隐藏该提示 |
+| 1 + 2 + 1 | Gradle、依赖、targetSdk 版本建议 | 需独立升级与兼容验证，不混入此次可靠性清理 |
+
+安全与验收说明：
+
+- Android 官方文档明确指出部分 Android 12+ 厂商设备即使 `allowBackup=false` 仍可能允许 D2D 迁移，因此分别写出云/设备迁移规则；只承诺标准 Android 规则配置，不保证厂商私有工具、root 复制也遵循。参考：<https://developer.android.com/identity/data/autobackup>；本地归档 `log/android-autobackup-reference.html`。
+- WebView 仍允许任意正常 HTTPS 跨域页面，以免直接切断淘宝跨域安全验证；没有域名白名单或第三方页面可信证明。HTTP、外部应用 scheme、文件选择等受限流程可能影响部分登录验证，真实账号/验证码链路未验收；不通过放开文件访问或证书错误来兜底。
+- 登录视图 `onRelease` 销毁，整个弹窗退出再兜底；重建前释放旧视图。CookieManager 的登录数据不因销毁 WebView 自动删除，本次未清除用户登录态。
+- 首次 Lint 在新增文件分析时触发 Kotlin FIR/ExperimentalDetector 内部异常，日志保留在 `log/fix-batch6-initial.log`；后续完整重跑通过，未按工具建议关闭 UnsafeOptIn 检查或增设全局 baseline。
+- 最后检查时 ADB 已发现一台 API 37 设备。本次仅查询连接与 SDK，没有安装覆盖、触碰登录态、主动迁移或做 UI/ROM 验收；不能沿用上一批“无设备”的结论，也不能把连接成功写成验收通过。
+
+验证命令：
+
+```powershell
+.\gradlew.bat :app:testDebugUnitTest --tests '*LocalTimeFormatterTest' --tests '*LoginWebViewPolicyTest' --tests '*LoginNavigationTest' --tests '*PlatformBackupPolicyTest' --tests '*ContextLifetimeTest' --tests '*AsyncPreferenceSemanticsTest' --tests '*LocationPermissionTest' --tests '*NotificationFailureTest' --tests '*ExpressRecordConcurrencyTest' --tests '*RestoreConcurrencyTest' --console=plain
+.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease :app:lintDebug --console=plain
+```
+
+- 最终定向 **89 项通过**（新增 37 + 原有 52）。日志：`log/fix-batch6-targeted.log`；分类计数：`log/fix-batch6-targeted-count.txt`。
+- 最终全量 **789 项通过，69 个测试类，失败/错误/跳过均为 0**（第五批 752 + 本批 37）。逐类统计：`log/fix-batch6-full-test-count.csv`；汇总：`log/fix-batch6-full-test-summary.txt`。
+- **Debug / Release / Lint 均通过**，组合日志：`log/fix-batch6-validation.log`。最终 Lint **0 错误、39 警告、0 提示**，比上一批少 23 项警告并消除唯一提示；分类统计：`log/fix-batch6-lint-count.csv`。
+- APK 路径不变，Release 仍未签名；包内规则检查日志：`log/fix-batch6-packaged-manifest.txt`、`log/fix-batch6-packaged-backup-rules.txt`。`git diff --check` 通过，无新增依赖和全局抑制。
+
+### 安装与提交记录（2026-10-03）
+
+- 按用户要求，将第六批已验证的 `app/build/outputs/apk/debug/app-debug.apk` 安装到当前连接的 API 37 设备；`apksigner verify` 通过，使用 Android Debug 证书。
+- 使用 `adb install -r` 覆盖安装，返回 `Success`；包版本仍为 `0.1.0` / versionCode 1，最后更新时间变为 `2026-10-03 19:50:33`，首次安装时间保持 `2026-09-26 04:58:53`。未卸载、未清数据、未自动重启，也未将安装成功写成所有功能真机验收通过。
+- 已安装 APK 的 SHA-256：`24628A7742C1ABBBD1C993A162F84DBA0A86D103173D2D1E3C437DA4D4E13734`。本机安装日志：`log/install-batch6.log`；安装前后包信息和哈希也只保留在 Git 忽略的 `log/`。
+- 本次提交汇集第三至第六批源码、资源、正式测试、README 与审计报告；各批“未提交/推送”的表述是当时状态。APK、签名材料、本机 `local.properties` 和日志不进入源码仓库。
+- 更新系统与宿主 hook 仍需重启设备，并在框架连接正常时打开模块；安装未主动操作登录态、触发恢复/迁移或做完整 UI 验收。
