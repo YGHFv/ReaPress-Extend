@@ -100,6 +100,7 @@ object ExpressRelay {
     const val EXTRA_PACKAGE_SYNC_RISK_UNTIL = "packageSyncRiskUntil"
     const val EXTRA_PICKUP_OBSERVED_AT = "pickupCodeObservedAt"
     const val EXTRA_PACKAGE_SNAPSHOT = "packageSnapshot"
+    const val EXTRA_PICKUP_MAIL_TAIL = "pickupMailTail"
 
     /**
      * 宿主 → 模块：新接平台探针结论。不复用 [ACTION_HOST_QUERY_REPORT]：那条的接收侧会调

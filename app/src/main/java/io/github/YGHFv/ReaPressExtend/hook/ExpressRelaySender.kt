@@ -224,6 +224,7 @@ internal object ExpressRelaySender {
             putExtra(ExpressRelay.EXTRA_TRACKING, record.trackingNumber)
             putExtra(ExpressRelay.EXTRA_COURIER, record.courier.name)
             putExtra(ExpressRelay.EXTRA_PICKUP_CODE, record.pickupCode)
+            putExtra(ExpressRelay.EXTRA_PICKUP_MAIL_TAIL, record.pickupMailTail)
             putExtra(ExpressRelay.EXTRA_PICKUP_OBSERVED_AT, record.pickupCodeObservedAt)
             putExtra(ExpressRelay.EXTRA_STATION, record.station)
             putExtra(ExpressRelay.EXTRA_STATUS, record.status.name)

@@ -144,6 +144,13 @@ object HostRefreshRequester {
             "not_ready" -> "菜鸟取件码：宿主同步库未就绪，稍后再试"
             "risk", "blocked" -> "菜鸟取件码：风控退避中，保留已有数据"
             "cooling" -> "菜鸟取件码：请求冷却中，保留已有数据"
+            "abi_mismatch" -> "菜鸟取件码：宿主方法签名不匹配，未完成同步"
+            "schema_changed" -> "菜鸟取件码：服务端结构变化，未完成同步"
+            "session_changed" -> "菜鸟取件码：同步期间账号或游标变化，请稍后再试"
+            "invalid_response" -> "菜鸟取件码：响应格式不符，保留已有数据"
+            "apply_unconfirmed" -> "菜鸟取件码：宿主落库未确认，保留已有数据"
+            "timeout" -> "菜鸟取件码：联网请求超时，保留已有数据"
+            "request_failed" -> "菜鸟取件码：宿主请求失败，保留已有数据"
             else -> "菜鸟取件码：同步未完成，保留已有数据"
         }
         update(context, text + if (persisted) "" else "；冷却状态未能保存")

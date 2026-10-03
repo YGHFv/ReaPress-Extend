@@ -60,7 +60,16 @@ data class ExpressRecord(
     val timestamp: Long = 0L,
     /** Code freshness established by a confirmed snapshot (or a later replacing notification); zero for legacy input. */
     val pickupCodeObservedAt: Long = 0L,
+    val pickupMailTail: String? = null,
 ) {
+    /** A pickup instruction, never a parcel identity or a shared station code. */
+    val visiblePickupMailTail: String?
+        get() = pickupMailTail?.takeIf {
+            it.length == 5 && it.matches(Regex("[A-Za-z0-9]+")) &&
+                trackingNumber?.endsWith(it) == true &&
+                status in setOf(ExpressStatus.ARRIVED_STATION, ExpressStatus.READY_FOR_PICKUP) &&
+                (pickupCode.isNullOrBlank() || pickupCode == it)
+        }
     val isPickedUp: Boolean get() = pickedUpAt != null
 
     /** 有强标识（运单号/取件码至少其一）。存储层把它当准入条件：没有强标识的是噪音通知。 */
@@ -129,6 +138,10 @@ data class ExpressRecord(
             station = station?.takeIf { ExpressStationName.hasLocation(it) } ?: other.station,
             pickupCode = if (replaceCode) other.pickupCode else pickupCode ?: other.pickupCode,
             pickupCodeObservedAt = if (replaceCode) other.pickupCodeObservedAt else pickupCodeObservedAt,
+            pickupMailTail = if (replaceCode) other.pickupMailTail else pickupMailTail ?: other.pickupMailTail?.takeIf {
+                other.sourcePackage == "com.cainiao.wireless" && other.origin == ExpressOrigin.ENRICHMENT &&
+                    mergedTracking == other.trackingNumber && mergedTracking?.endsWith(it) == true
+            },
             platform = platform ?: other.platform,
             goodsName = goodsName ?: other.goodsName,
             arrivalAt = arrivalAt ?: other.arrivalAt,

@@ -161,12 +161,20 @@ internal class CainiaoPackageSyncClient(
     private fun invoke(owner: Any, name: String, vararg args: Any?): Any? =
         method(owner.javaClass, name, args).invoke(owner, *args)
 
-    private fun method(owner: Class<*>, name: String, args: Array<out Any?>) = owner.methods.filter { candidate ->
+    private fun method(owner: Class<*>, name: String, args: Array<out Any?>): java.lang.reflect.Method {
+        val candidates = owner.methods.filter { candidate ->
         !candidate.isBridge && candidate.name == name && candidate.parameterCount == args.size && candidate.parameterTypes.zip(args).all { (type, arg) ->
             arg == null && !type.isPrimitive || arg != null && (type.isInstance(arg) ||
                 type == Integer.TYPE && arg is Int || type == java.lang.Boolean.TYPE && arg is Boolean)
         }
-    }.distinctBy { it.parameterTypes.toList() }.single()
+        }.distinctBy { it.parameterTypes.toList() }
+        // IRemoteListener extends MtopListener: both overloads accept the same proxy.
+        return candidates.singleOrNull { candidate ->
+            candidates.all { other -> other.parameterTypes.zip(candidate.parameterTypes).all { (broad, narrow) ->
+                broad.isAssignableFrom(narrow)
+            } }
+        } ?: throw Failure("abi_mismatch")
+    }
 
     private fun field(owner: Any, name: String): Any? = owner.javaClass.getField(name).get(owner)
     private fun set(owner: Any, name: String, value: Any?) { owner.javaClass.getField(name).set(owner, value) }

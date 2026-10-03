@@ -132,7 +132,9 @@ private fun PackageSection(record: ExpressRecord, rules: ExpressStationRules) {
             InfoRow("快递公司", record.courier.displayName)
         }
         // 与首页卡片同源：记录的码优先，缺了用该站默认码——各读各的会出现「首页有码详情页没有」。
-        ExpressHomeGrouper.pickupCodeOf(record, rules)?.let { InfoRow("取件码", it) }
+        if (record.visiblePickupMailTail != null) {
+            InfoRow("取件方式", "凭运单尾号 ${record.visiblePickupMailTail} 取件")
+        } else ExpressHomeGrouper.pickupCodeOf(record, rules)?.let { InfoRow("取件码", it) }
         // 尾号只有 4 位可能认错件：原取件码紧跟取件码摆出来，用户在驿站念之前一眼能看出对不上。
         record.previousPickupCode?.takeIf { it.isNotBlank() }?.let { InfoRow("原取件码", it) }
         record.phoneTail?.takeIf { it.isNotBlank() }?.let { InfoRow("手机尾号", it) }

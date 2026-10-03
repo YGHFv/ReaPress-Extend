@@ -444,6 +444,7 @@ object ExpressRecordStore {
                     put("courier", record.courier.name)
                     put("pickup", record.pickupCode ?: JSONObject.NULL)
                     put("pickupObservedAt", record.pickupCodeObservedAt)
+                    put("pickupMailTail", record.pickupMailTail ?: JSONObject.NULL)
                     put("station", record.station ?: JSONObject.NULL)
                     put("status", record.status.name)
                     put("title", record.title ?: JSONObject.NULL)
@@ -487,6 +488,7 @@ object ExpressRecordStore {
                     courier = enumOr(obj.optString("courier"), Courier.UNKNOWN),
                     pickupCode = obj.optStringOrNull("pickup"),
                     pickupCodeObservedAt = obj.optLong("pickupObservedAt", 0L).coerceAtLeast(0L),
+                    pickupMailTail = obj.optStringOrNull("pickupMailTail"),
                     station = obj.optStringOrNull("station"),
                     status = enumOr(obj.optString("status"), ExpressStatus.UNKNOWN),
                     title = obj.optStringOrNull("title"),

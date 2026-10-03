@@ -422,7 +422,12 @@ private fun PickupColumn(record: ExpressRecord, pickup: String?) {
         MiuixTheme.colorScheme.onSurface
     }
     Column(modifier = Modifier.width(PICKUP_COLUMN_WIDTH)) {
-        if (code != null) {
+        val tail = record.visiblePickupMailTail
+        if (tail != null) {
+            Text("凭运单尾号", fontSize = 12.sp, color = color)
+            Text(tail, fontSize = 26.sp, fontWeight = FontWeight(600), color = color)
+            Text("取件", fontSize = 12.sp, color = color)
+        } else if (code != null) {
             Text(
                 text = code,
                 fontSize = 26.sp,

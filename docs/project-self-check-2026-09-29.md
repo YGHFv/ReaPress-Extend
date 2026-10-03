@@ -539,3 +539,22 @@ adb devices
 - 包版本仍为 `0.1.0` / versionCode 1，最后更新时间为 `2026-10-03 21:46:03`，首次安装时间仍为 `2026-09-26 04:58:53`。APK SHA-256：`CC97E77F51D51227CE914F28DF251792D413229ADCB1B3AF8592DDC98831AF50`。
 - 安装日志及前后包信息保留在 Git 忽略的 `log/install-batch7*.log`；APK、MT 原始分析和本机配置不纳入源码提交。此前“未安装/未提交”的文字保留为开发阶段状态。
 - 本次未自动重启菜鸟或启动模块，未主动发起真实账号同步；安装不等于功能验收。设备上仍需让菜鸟主进程重新加载 hook，再从模块首页检查后台同步结果。
+
+### 第八批：同步反射重载与尾号取件修复（2026-10-04）
+
+- 用户真机截图显示同步未完成、菜鸟“凭运单尾号取件”未在模块展示。读取模块已有日志确认多次请求在约 0.6–1 秒内失败；旧版本未记录失败阶段，不能仅由日志断言全部失败原因，也未通过密集重试探测账号。真实日志只保留在 Git 忽略的 `log/batch8-device-private.log`。
+- MT MCP 核实 `MtopBusiness.registerListener` 同时接受 `IRemoteListener` 和父接口 `MtopListener`。原反射逻辑会得到两个匹配方法，随后 `.single()` 抛异常；合成宿主原先只有一个重载，遗漏了此真实 ABI。改为选择参数类型最具体的唯一匹配，不按反射枚举顺序碰运气；缺失/无法消歧返回 `abi_mismatch`。测试桩新增父接口重载，要求必须调用子接口版本。
+- 首页状态细分为方法签名不匹配、响应格式不符、schema 变化、账号/游标变化、落库未确认、网络失败和超时；不再全部折叠为同一句“同步未完成”。错误提示不包含账号、Cookie、响应原文。
+- MT 定位首页资源后，对已安装同版本 APK 的 `assets/resource/pegasus_3086119/cubex_local_js_file_pegasus_3086119_02cd.js` 做本地静态读取，确认首页使用 `DUODUOMAICAI` 品牌标记以及 `mailNo.slice(-5)`，不是 `fetchType` 的猜测。原始脚本只存 `log/cn-asset-676.txt`，不提交第三方源码。
+- 新增 `pickupMailTail`，从 `packageStation.siteBrandCode` 或 feature 品牌字段识别多多买菜驿站；仅到站/待取件、没有独立可见码或码恰为运单尾号时生成五位提示。保留 `showAuthCode` 的普通码可见性约束，不把隐藏的货架码透出。尾号有独立 Relay 白名单、持久化字段及显示校验，不当作 `pickupCode`、`parcelTail` 或包裹身份，不进入驿站共享码。
+- 首页到站卡片与详情分别显示“凭运单尾号 / XXXXX / 取件”和“取件方式”；已签收、运单不符、后来有独立货架码时不再显示旧尾号提示。宿主去重指纹加入此字段，保证重新读取本地表时能够补发此前缺失的取件方式。
+- 当前实现是保守子集：未复制菜鸟远端配置中的货架码过滤词，也未扩展到待配送/清退等所有内部状态；未知品牌、未知类型不猜。旧模块数据未存品牌字段，不能仅凭历史运单自行补尾号，需要新 hook 再读菜鸟包裹表。
+- 本批尚未安装、提交或推送；未解除原风控冷却、未主动请求真实服务。重载缺陷已在离线测试修复，但真实同步是否还有服务端或热修复兼容问题，仍需安装后单次受控验收。
+- 验证命令：`.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease :app:lintDebug --console=plain`；结果 **BUILD SUCCESSFUL**。全量 **864 项测试通过，76 个测试类，失败/错误/跳过均为 0**（新增尾号测试 10 项，原同步反射测试增加真实重载形态）；Lint **0 错误、43 警告、0 提示**，Debug/Release 均构建成功，Release 仍未签名。
+- 日志：`log/fix-batch8-validation.log`；统计：`log/fix-batch8-full-test-count.csv`、`log/fix-batch8-full-test-summary.txt`。`git diff --check` 通过。产物仍为 `app/build/outputs/apk/debug/app-debug.apk`，尚未覆盖设备上的旧版。
+
+### 第八批安装与提交记录（2026-10-04）
+
+- 按用户要求覆盖安装第八批 Debug APK：签名验证通过，`adb install -r` 返回 `Success`，未卸载或清除数据。最后更新时间 `2026-10-04 01:48:14`，首次安装时间仍为 `2026-09-26 04:58:53`。
+- APK SHA-256：`F39B423A11D9910A7D114F80E1D0BFFC5EFC63995872836305EA0542AD2A61BF`。安装证据仅保留在被 Git 忽略的 `log/install-batch8*.log`；源码提交不包含 APK、真实设备日志或第三方反编译资源。
+- 本次未自动重启菜鸟或启动同步，未清除风控冷却。安装完成不等于后台联网功能已真机验收；此前“未安装”的描述为修复阶段状态。

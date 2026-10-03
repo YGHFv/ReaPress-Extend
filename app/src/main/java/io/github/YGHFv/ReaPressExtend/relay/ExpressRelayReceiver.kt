@@ -228,6 +228,11 @@ class ExpressRelayReceiver : BroadcastReceiver() {
                 Courier.valueOf(intent.getStringExtra(ExpressRelay.EXTRA_COURIER).orEmpty())
             }.getOrDefault(Courier.UNKNOWN),
             pickupCode = intent.getStringExtra(ExpressRelay.EXTRA_PICKUP_CODE)?.takeIf { it.isNotBlank() },
+            pickupMailTail = intent.getStringExtra(ExpressRelay.EXTRA_PICKUP_MAIL_TAIL)?.takeIf {
+                intent.action == ExpressRelay.ACTION_ENRICH && sourcePackage == ExpressRelay.HOST_PACKAGE &&
+                    it.matches(Regex("[A-Za-z0-9]{5}")) &&
+                    intent.getStringExtra(ExpressRelay.EXTRA_TRACKING)?.endsWith(it) == true
+            },
             pickupCodeObservedAt = if (intent.action == ExpressRelay.ACTION_ENRICH && sourcePackage == ExpressRelay.HOST_PACKAGE)
                 intent.getLongExtra(ExpressRelay.EXTRA_PICKUP_OBSERVED_AT, 0L).coerceIn(0L, System.currentTimeMillis()) else 0L,
             station = intent.getStringExtra(ExpressRelay.EXTRA_STATION)?.takeIf { it.isNotBlank() },

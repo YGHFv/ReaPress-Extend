@@ -17,6 +17,7 @@ internal object RelayPayloadPolicy {
         ExpressRelay.EXTRA_TRACKING to Field(Kind.STRING, 256),
         ExpressRelay.EXTRA_COURIER to Field(Kind.STRING, 128),
         ExpressRelay.EXTRA_PICKUP_CODE to Field(Kind.STRING, 256),
+        ExpressRelay.EXTRA_PICKUP_MAIL_TAIL to Field(Kind.STRING, 5),
         ExpressRelay.EXTRA_PICKUP_OBSERVED_AT to Field(Kind.LONG),
         ExpressRelay.EXTRA_STATION to Field(Kind.STRING),
         ExpressRelay.EXTRA_STATUS to Field(Kind.STRING, 128),
@@ -121,7 +122,7 @@ internal object RelayPayloadPolicy {
                     Regex("[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}")) == true &&
                 payload[ExpressRelay.EXTRA_PACKAGE_SYNC_STATUS] in setOf("busy", "synced", "unsupported", "login_required",
                     "not_ready", "risk", "blocked", "cooling", "failed", "schema_changed", "session_changed",
-                    "invalid_response", "apply_unconfirmed", "timeout", "request_failed")
+                    "invalid_response", "apply_unconfirmed", "timeout", "request_failed", "abi_mismatch")
             ExpressRelay.ACTION_DELIVER, ExpressRelay.ACTION_ENRICH, ExpressRelay.ACTION_INTERCEPTED ->
                 hasText(ExpressRelay.EXTRA_SOURCE_PACKAGE) && hasText(ExpressRelay.EXTRA_TEXT)
             ExpressRelay.ACTION_COOKIE_SYNC ->

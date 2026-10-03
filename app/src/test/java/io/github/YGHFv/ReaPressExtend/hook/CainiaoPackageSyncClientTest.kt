@@ -191,7 +191,8 @@ class CainiaoPackageSyncClientTest {
     class Transform { companion object { @JvmStatic fun vZ(body: String) = body } }
     class Request { @JvmField var requestContent = ""; @JvmField var utdid: String? = null }
     enum class Method { POST }
-    interface Listener {
+    interface BaseListener
+    interface Listener : BaseListener {
         fun onSuccess(type: Int, response: Error, out: Response, context: Any?)
         fun onError(type: Int, response: Error, context: Any?)
     }
@@ -201,6 +202,7 @@ class CainiaoPackageSyncClientTest {
     class Business(private val request: Request) {
         private lateinit var listener: Listener
         fun registerListener(value: Listener): Business { listener = value; return this }
+        fun registerListener(value: BaseListener): Business { error("Must select more specific listener overload") }
         fun reqMethod(method: Method): Business { assertEquals(Method.POST, method); return this }
         fun retryTime(times: Int): Business { retry = times; return this }
         fun showLoginUI(show: Boolean): Business { loginUi = show; return this }

@@ -544,6 +544,8 @@ internal object CainiaoPackageHook {
         val arrivalAt = row.optLong(FIELD_LOGISTICS_GMT_MODIFIED).takeIf { it > 0L }
 
         val logisticsDetail = stringOf(row, FIELD_LOGISTICS_DETAIL)
+        val resolvedStatus = resolveStatus(statusDesc, logisticsDetail)
+        val pickupTail = io.github.YGHFv.ReaPressExtend.core.CainiaoPickupInstruction.mailTail(row, resolvedStatus, pickupCode)
 
         return ExpressRecord(
             sourcePackage = CAINIAO,
@@ -551,6 +553,7 @@ internal object CainiaoPackageHook {
             trackingNumber = mailNo,
             courier = Courier.resolve(partnerName, partnerCode, mailNo),
             pickupCode = pickupCode,
+            pickupMailTail = pickupTail,
             station = station,
             platform = platform,
             goodsName = goodsName,
@@ -559,7 +562,7 @@ internal object CainiaoPackageHook {
             stationHours = stationHours,
             stationLat = stationPosition?.lat,
             stationLng = stationPosition?.lng,
-            status = resolveStatus(statusDesc, logisticsDetail),
+            status = resolvedStatus,
             origin = ExpressOrigin.ENRICHMENT,
             // 宿主库里读出来的不是推断，给满分：通知缺失时它是唯一来源。
             confidence = 100,
@@ -586,7 +589,7 @@ internal object CainiaoPackageHook {
 
     private fun deliver(record: ExpressRecord): Boolean {
         val fingerprint =
-            "${record.trackingNumber}|${record.pickupCode}|${record.station}|${record.status.name}"
+            "${record.trackingNumber}|${record.pickupCode}|${record.pickupMailTail}|${record.station}|${record.status.name}"
         if (!delivered.add(fingerprint)) return false
         if (delivered.size > MAX_DELIVERED) {
             delivered.clear()
